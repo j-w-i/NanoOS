@@ -15,14 +15,15 @@ NANO_STOR := $(NANOOS_DIR)/runtime/storage
 NANO_SDK := $(NANOOS_DIR)/sdk
 NANO_SRC := $(NANOOS_DIR)/src
 
-SDK_INCLUDES := -I$(NANO_SDK)/include -I$(NANO_GL2)/std -I$(NANO_GL2) -I$(NANO_STOR) -I$(NANO_SRC)
+SDK_LIBC_INCLUDES :=
 ifeq ($(APP_USE_LIBC),1)
-SDK_INCLUDES += -I$(NANO_SDK)/include/libc
+SDK_LIBC_INCLUDES := -I$(NANO_SDK)/include/libc
 endif
+SDK_INCLUDES := -I$(NANO_SDK)/include -I$(NANO_GL2)/std -I$(NANO_GL2) -I$(NANO_STOR) -I$(NANO_SRC) $(SDK_LIBC_INCLUDES)
 
 SDK_BASE_FLAGS := $(CPPFLAGS) $(APP_CPPFLAGS) $(ARCH) -std=c99 -Os -ffreestanding -fno-builtin -fno-common -fno-strict-aliasing -fno-pic -mword-relocations -ffunction-sections -fdata-sections -MMD -MP
 SDK_CFLAGS := $(SDK_BASE_FLAGS) -Wall -Wextra -Werror $(SDK_INCLUDES)
-APP_ALL_CFLAGS := $(SDK_BASE_FLAGS) $(APP_CFLAGS) $(SDK_INCLUDES)
+APP_ALL_CFLAGS := $(SDK_BASE_FLAGS) $(SDK_LIBC_INCLUDES) $(APP_CFLAGS) $(SDK_INCLUDES)
 
 GL2_PREFIX := -include $(NANO_GL2)/std/gl2prefix.h
 

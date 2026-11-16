@@ -36,6 +36,8 @@ void nano_app_poll_input(nano_input_t *out) {
     out->moved = 0;
     out->x = g_last_x;
     out->y = g_last_y;
+    out->prev_x = g_last_x;
+    out->prev_y = g_last_y;
     out->buttons = 0;
     out->home_pressed = 0;
 

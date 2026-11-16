@@ -18,6 +18,8 @@ typedef struct {
     int moved;         /* 1 when down and coordinates changed */
     int x;             /* Display X in [0, 239] */
     int y;             /* Display Y in [0, 431] */
+    int prev_x;        /* Previous display X in [0, 239] */
+    int prev_y;        /* Previous display Y in [0, 431] */
     uint32_t buttons;  /* Raw NGAME_* button bitmask */
     int home_pressed;  /* 1 if NGAME_HOME is currently pressed */
 } nano_input_t;
