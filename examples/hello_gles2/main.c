@@ -2,6 +2,18 @@
 #include "nano_app.h"
 #include "EGL/egl.h"
 #include "GLES2/gl2.h"
+#ifdef HELLO_BENCH
+#include "report.h"
+static char report[1024];
+static unsigned rused;
+static void rtext(const char *s) { while (*s && rused + 1 < sizeof report) report[rused++] = *s++; }
+static void rword(uint32_t x) {
+    if (rused + 10 >= sizeof report) return;
+    static const char h[] = "0123456789abcdef";
+    for (unsigned i = 0; i < 8; ++i) report[rused++] = h[(x >> (28 - i * 4)) & 15u];
+    report[rused++] = ' ';
+}
+#endif
 
 static GLuint compile_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
@@ -55,14 +67,14 @@ int nano_example_main(const struct nanoos_api *api) {
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
-    glBindAttribLocation(prog, 0, "aPos");
-    glBindAttribLocation(prog, 1, "aCol");
     glLinkProgram(prog);
     GLint linked = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &linked);
     if (!linked) return 7;
     glUseProgram(prog);
 
+    GLint a_pos = glGetAttribLocation(prog, "aPos");
+    GLint a_col = glGetAttribLocation(prog, "aCol");
     GLint u_offset = glGetUniformLocation(prog, "uOffset");
 
     static const float verts[12] = {
@@ -77,12 +89,13 @@ int nano_example_main(const struct nanoos_api *api) {
     };
 
     glViewport(0, 0, (GLsizei)NANO_SCREEN_W, (GLsizei)NANO_SCREEN_H);
-    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, verts);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 0, cols);
-    glEnableVertexAttribArray(1);
+    glVertexAttribPointer((GLuint)a_pos, 4, GL_FLOAT, GL_FALSE, 0, verts);
+    glEnableVertexAttribArray((GLuint)a_pos);
+    glVertexAttribPointer((GLuint)a_col, 4, GL_FLOAT, GL_FALSE, 0, cols);
+    glEnableVertexAttribArray((GLuint)a_col);
 
     float ox = 0.0f, oy = 0.0f;
+    uint32_t center_px = 0, glerr = 0, e0 = (uint32_t)glGetError(), e1 = 0, e2 = 0;
     for (unsigned frame = 0; ; ++frame) {
         nano_input_t in;
         nano_app_poll_input(&in);
@@ -100,12 +113,42 @@ int nano_example_main(const struct nanoos_api *api) {
         glClearColor(0.05f, 0.08f, 0.14f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+#ifdef HELLO_BENCH
+        if (frame == 0u) e1 = (uint32_t)glGetError();
+        if (frame == 29u) {
+            uint8_t px[4] = {0, 0, 0, 0};
+            glReadPixels(120, 216, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+            e2 = (uint32_t)glGetError();
+            center_px = ((uint32_t)px[3] << 24) | ((uint32_t)px[0] << 16) | ((uint32_t)px[1] << 8) | px[2];
+        }
+#endif
         eglSwapBuffers(dpy, sfc);
     }
 
+    glerr = (uint32_t)glGetError();
     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext(dpy, ctx);
     eglDestroySurface(dpy, sfc);
     eglTerminate(dpy);
+#ifdef HELLO_BENCH
+    {
+        uint32_t frames = 0, sw = 0, fault = 0;
+        nano_app_gfx_stats(&frames, &sw, &fault);
+        rtext("NANOOS GL2 GAME build " __DATE__ " " __TIME__ "\nHELLO1 status/frames/software/fault/glerr/px ");
+        rword(0u); rword(frames); rword(sw); rword(fault); rword(glerr); rword(center_px);
+        rtext("\nHELLO2 e0/e1/e2 "); rword(e0); rword(e1); rword(e2);
+        rtext("\n");
+        rtext((frames == 30u && sw == 0u && fault == 0u && glerr == 0u && (center_px & 0xffffffu) != 0u) ? "HELLO PASS\n" : "HELLO FAIL\n");
+        report[rused] = 0;
+        rpt_mirror_write(report, rused, rpt_sum(report, rused));
+        nano_app_dcache_clean();
+    }
+#else
+    (void)center_px;
+    (void)glerr;
+    (void)e0;
+    (void)e1;
+    (void)e2;
+#endif
     return 0;
 }
