@@ -793,6 +793,11 @@ __attribute__((noinline)) void mbx_begin(void) {
      * later scenes (#734..#742) select context slot 0 again instead. The
      * allocator is built once (trace #1-10); rebuilding it per scene made
      * the world preview fail at frame 12 instead of ~223 (round 6). */
+#ifdef MBX_PFX_EVERY_SCENE
+    /* Depth testing needs the first-launch prefix on every scene: without it
+     * frames after the first reject every fragment (physical runs 469-474). */
+    pfx_pending = 1;
+#endif
     if (pfx_pending) {
         pfx_pending = 0;
         submit_rec(mbx_prefix, MBX_PREFIX_WORDS, MBX_CK_PFX, 0);
@@ -940,6 +945,9 @@ static int fifo_room(void) {
 #endif
             return (int)(0x7bu-occ);
         }
+#ifdef MBX_FIFO_POLL_NOPS
+        for (volatile uint32_t nop_i = 0; nop_i < MBX_FIFO_POLL_NOPS; ++nop_i) ;
+#endif
         if (!spins) start = USEC;
         else if (USEC - start >= WAIT_US) break;
     }

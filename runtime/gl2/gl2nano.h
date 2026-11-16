@@ -30,7 +30,13 @@ typedef struct {
     uint32_t retired_width,retired_height,retired_stride;
     uint32_t presented;
     uint32_t fbo_texture,fbo_width,fbo_height,fbo_stride,fbo_surface;
+    uint32_t recoveries; /* faults cleared by gl2_nano_recover */
 } gl2_nano;
+/* Clear a fault (GPU completion timeout, display wait timeout, failed begin): halt and
+ * re-initialise the GPU and drop queued/open frame state. Textures, programs and buffers
+ * are kept. The frame in flight is lost; rendering resumes with the next frame instead of
+ * every later draw failing (which froze the screen while the app kept running). */
+int gl2_nano_recover(gl2_nano *b);
 typedef int (*gl2_nano_cpu_fn)(uint32_t *target,uint32_t width,uint32_t height,void *user);
 int gl2_nano_open(gl2_nano *b,const struct nanoos_api *api,gl2_ctx *c,
                   gl2_prog_obj *progs,uint32_t *segment,uint32_t cap);

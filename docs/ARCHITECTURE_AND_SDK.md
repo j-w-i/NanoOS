@@ -71,7 +71,8 @@ Include `<nano_app.h>`, `<nano_fs.h>`, `<nano_heap.h>`, `<EGL/egl.h>`, `<GLES2/g
 
 - **Lifecycle & Input (`nano_app.h`):**
   - `nano_app_init(api)` — binds `NGAME` API, initializes EGL platform & input state.
-  - `nano_app_poll_input(&in)` — polls buttons (`home_pressed` via `NGAME_HOME`) and maps landscape touch `(0..431, 0..239)` to portrait display `(239 - y, x)` with `pressed`/`moved`/`released` edges and `prev_x`/`prev_y` for drag deltas.
+  - `nano_app_set_orientation(NANO_ORIENT_LANDSCAPE)` (home button on the right) or `NANO_ORIENT_LANDSCAPE_LEFT` — call before `eglCreateWindowSurface`. The window surface becomes 432x240 and the default framebuffer (viewport, scissor, `glReadPixels`) is landscape; the GL2 runtime rotates `gl_Position` onto the portrait panel inside the GPU header (x/y swap on the output-0 writes + one negated viewport scale), so there is **no per-vertex cost**. FBOs are not rotated. `nano_app_screen_w()/_h()` give the logical size. Not supported: CPU-rasterised (software) window frames in landscape (they report `GL2_NANO_UNSUPPORTED`). Lower level: `gl2_egl_set_orientation()` in `gl2_egl.h`.
+  - `nano_app_poll_input(&in)` — polls buttons (`home_pressed` via `NGAME_HOME`) and maps the raw touch panel to display coordinates for the current orientation (portrait `(0..239, 0..431)`, landscape `(0..431, 0..239)`, top-left origin) with `pressed`/`moved`/`released` edges and `prev_x`/`prev_y` for drag deltas.
   - `nano_app_usec()`, `nano_app_dcache_clean()`, `nano_app_gfx_stats()`.
 - **Filesystem (`nano_fs.h`):**
   - `nano_fs_mount()`, `nano_fs_open(path)`, `nano_fs_read()`, `nano_fs_pread()`, `nano_fs_seek()`, `nano_fs_tell()`, `nano_fs_close()`, `nano_fs_read_all()`.
@@ -97,6 +98,79 @@ make -C NanoOS chainloader NANOAPPS=/path/to/nano7kit/nanoapps
 - **Mount time (`US[0]`):** `19.36 s` (`run401`) → `7.86 s` (`run402`, 1-bank `survey()`) → **`4.97 s`** (`run403`, + `nand.c` burst/DMA fix).
 - **SHMUP `act1.scene` load (`US[3]`):** `5.85 s` (`run400`, PNGs) → **`0.85 s`** (`run403`, offline `.ntx` PVRTC 4bpp + native formats).
 - **SHMUP `act1.scene` sustained frame rate (`run403`):** `1,505` GPU frames, `software=0`, `fault=0`, `glerr=0`, median `16.83 ms` (`~59.4 FPS`).
+
+## 7a. Performance playbook (READ BEFORE OPTIMISING; measured on hardware)
+
+1. **The reference result needs no overclocking.** `archive/gl2rt/gamebench` (release `run227`) renders 40,000 triangles
+   at **18.11 ms/frame (~55 FPS) at stock clocks**. It gets there through: (a) **queued frames** (`GAME_QUEUE`,
+   `GAME_QUEUE_DISPLAY`: three offscreen 240x432 buffers, `gl2_nano_end_queued()` + `gl2_nano_present_buffer()`, so CPU
+   submission of frame N+1 overlaps ISP rendering and display DMA of frame N; the synchronous path of the same scene is
+   52.6 ms), (b) **hardware back-face culling** (`glEnable(GL_CULL_FACE)` is honoured in the packet header, see `gl2api.c`),
+   (c) **triangle strips** (about 1 vertex per triangle) and (d) a **trivial vertex program**. See
+   `archive/gl2rt/QUEUED_BACKEND.md`.
+2. **Frame queuing is built into the EGL window path** (`runtime/gl2/std/egl_nano.c`): when the kernel reports
+   `mbx_queue_capacity()` and API table >= 23, `eglSwapBuffers` renders into three buffers placed after the texture
+   arena, queues the frame and presents the retired one by display DMA. Define `GL2_EGL_NO_QUEUE` to get the old
+   synchronous back-buffer path. **`glReadPixels` (and any FBO switch) ends the open frame synchronously**, so a bench that
+   reads pixels every frame never exercises the queue: runs 488-495 measured that, not queuing. The display push only
+   advances inside `lcd_service()`; `ensure_frame()` now steps it from draw calls (at most every 2 ms), otherwise the next
+   swap blocked ~13.6 ms on it (run495 swap 13.6 ms/frame -> run496 0.5 ms/frame).
+3. **Vertex-feed cost scales with the compiled vertex-program length, about 16 ns per VGP instruction per vertex.**
+   OpenLara room/entity programs are 135/146 instructions; position-only versions cost the same vertex data but the FIFO
+   submit time for 67.6k vertices fell from 213 ms to 71 ms (3.15 -> 1.05 microseconds per vertex, run487 vs run486).
+   Earlier claims that submit cost is "independent of vertex-shader length" were wrong (the test only trimmed ~20%).
+   Cheapest wins are therefore: fewer vertices (strips, culling, merged draws) and fewer VGP instructions
+   (`gl2vsc.c` copy-propagation/MAD fusion already shave 165 -> 135). Cache per-draw uniform-only work on the CPU.
+4. **Do not spend time on the GPU clock field.** CLKCON `+0x1c[29:16]` accepts PLL-B/1 (about 266 MHz, readback
+   `0x2000....`) with no change in any timing (run489 = run488). Slowing it to PLL-B/8 (`0x2007....`) did not slow the
+   frame either; that run failed NAND mount (-8), cause unknown, so treat the field as unrelated to the VGP rate. The
+   CPU MAX profile (PLL-A 532 vs stock 342, run487 vs run479) cut game update 10.8 -> 6.9 ms but left render time
+   unchanged (79.9 -> 78.9 ms): render is bound by GPU vertex consumption, not the CPU.
+5. **Backend changes that measurably helped OpenLara (image bit-identical, runs 492-495):** `cross()` compiled as a
+   vector expression (room VS 135 -> 115 instructions, submit time -12%, 78.5 -> 74.5 ms/frame), and unread uniform rows
+   are no longer sent in every draw header (`gl2_program_scan_constants`; entity VS declares 77 rows, reads ~15):
+   74.5 -> 71.4 ms/frame. `vsc_eq`-style emulator checks (old vs new compile, 2000 random vertices) must stay at 0 mismatches.
+6. **Superseded by 8.** Where 71 ms of render went (per frame, run495; whole frame was ~95 ms incl. update and swap): rooms ~26 ms (7.4k vertices, 5 draws; FIFO submit 2.6 us/vertex),
+   entities ~38 ms (5.5k vertices in 95 draws: submit ~16 ms, gather ~14 ms, app CPU ~14 ms, ~400 us per draw),
+   everything else ~7 ms. Per-draw overhead for small meshes is as important as vertex count: merging or culling entity
+   draws is the largest remaining lever, then fewer/cheaper VS instructions.
+7. Useful phase probes (`hw-reports/run487.txt` layout): rooms ~40% and entities+sky ~60% of the opaque phase;
+   opaque ~90% of the frame; ISP wait only ~4 ms per frame. Cull rooms by portal rectangle on the CPU: the backend
+   ignores partial scissors only because `GL2_SCISSOR_IGNORE_DRAWS` is set for OpenLara.
+8. **Submission is GPU-bound; keep the FIFO fed (run479 FIFO profile, runs 496-498).** Mean FIFO occupancy during
+   OpenLara submit is 119 of 123 words: the CPU waits for the GPU. Any CPU work between packets idles the GPU once the
+   ~25 us FIFO backlog drains. Converted triangle lists are therefore converted and submitted in `GL2_SUBMIT_CHUNK`
+   (default 12) vertex sub-packets instead of 256 (header cache resends only the two primitive words): frame
+   77.5 -> 68.5 ms, image bit-identical. Bench numbers (`LARA_BENCH`): frame 0 does all readbacks and is untimed;
+   frames 1-5 are timed. Per frame (run498): update 6.8 ms, render 60.9 ms (rooms 21.6, entities 35.4, transparent 3.1),
+   swap 0.5 ms; FIFO submit 27.9 ms for 13.5k vertices (indexed lists are expanded: 3 vertices per triangle). GL calls
+   outside draws cost ~0.3 ms; ~14 ms of the entity phase is OpenLara CPU (animation/joints), not the backend.
+   Next levers: fewer vertices per triangle (strips from static index buffers), then app-side entity CPU work.
+11. **Correction (2026-11-17): the 60 FPS result rendered OpenLara wrongly.** An ANGLE GLES 2.0 reference
+   (`openlara-nano7/tools/host_ref`) showed smeared textures, no lighting, black entities and missing UI that
+   the 30x27 grid check could not see. Six generic runtime bugs were fixed (`docs/PERFORMANCE.md` section 6);
+   correct rendering costs 31.4 ms/frame (32 FPS) at stock clocks (run522). Always diff against the reference.
+10. **OpenLara reaches 60 FPS at stock clocks (run514/517: 16.7 ms/frame, image bit-identical to run487)** after two more
+   generic steps: vertex inputs the pruned GPU code no longer reads are not sent (room vertex 15 -> 7 words, run513
+   25.2 ms), and static list draws stay lists (one cached packet per draw) unless real strips are cheaper: each packet
+   costs ~4 us, so per-quad strip packets lost once vertices got cheap (run514). Full guide: `docs/PERFORMANCE.md`.
+9. **OpenLara reaches 35 FPS at stock clocks (run512: 28.4 ms/frame, image bit-identical to run487).** Steps, each measured:
+   - **Clocks (run499):** stock clocks submit faster than CPU MAX (FIFO submit 20.1 vs 27.9 ms): MAX lowers the bus
+     dividers (133/66/133 vs stock 171/85/171 MHz) and vertex throughput follows the bus, not the GPU field.
+   - **Per-strip packets (`gl2strip.inc`, run500, 68.5 -> 63.1 ms):** static `GL_TRIANGLES` element draws (opaque, depth
+     written) are converted once to strips that keep each triangle's winding; each strip is its own primitive packet
+     (no joining vertices). OpenLara gives every face its own vertices, so a quad costs 4 vertex runs instead of 6.
+   - **GPU-only vertex-program pruning (`vsc_prune`, `native_outputs`, run504, -> 53.7 ms):** the native TSP reads only
+     the varyings of its combiner plan (slots 1/3, plus 4 with two stages); position and clip (0, 5) always. Everything
+     else (per-vertex lighting in slots 2/4/6/7) is removed from a GPU copy; the software path keeps the full code. Room VS
+     115 -> 29 instructions. **Output 4 must still be written** (zero-filled): leaving it unwritten hung the device (run501).
+   - **Converted-vertex cache (`GL2_VCACHE_WORDS`, opt-in, OpenLara 2 MB, runs 505/511):** native vertex words of static
+     draws are cached in strip order and submitted straight from memory.
+   - **SDK math (run508):** `sdk/src/nano_heap.c` was built soft-float and `sqrtf` ran 24 software-double Newton steps;
+     OpenLara animation spent 13.5 ms/frame there. It is now built with VFP and uses `vsqrt` (joints 13.5 -> 0.6 ms,
+     update 5.4 -> 0.6 ms, level load 6.2 -> 4.5 s).
+   Per frame now (stock): update 0.6 ms, render 26.8 ms (FIFO submit ~17.5 ms, GPU/bus-bound), swap 0.4 ms. CPU MAX is
+   no longer needed. Remaining lever: overlapping CPU work with FIFO feeding (needs an interrupt- or DMA-fed FIFO).
 
 ## 8. Key Bugs Resolved
 

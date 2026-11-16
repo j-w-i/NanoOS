@@ -37,6 +37,7 @@ SDK_OBJS := \
 	$(BUILD)/sdk/nano_app.o \
 	$(BUILD)/sdk/nano_fs.o \
 	$(BUILD)/sdk/nano_heap.o \
+	$(BUILD)/sdk/nano_flight.o \
 	$(BUILD)/sdk/nano_cpp.o \
 	$(BUILD)/sdk/memory.o \
 	$(BUILD)/sdk/gl2std.o \
@@ -66,6 +67,9 @@ $(BUILD)/sdk/nano_fs.o: $(NANO_SDK)/src/nano_fs.c | $(BUILD)/sdk
 	$(CC) $(SDK_CFLAGS) -I$(NANO_SDK)/src -I$(NANO_SDK)/include/libc -c $< -o $@
 
 $(BUILD)/sdk/nano_heap.o: $(NANO_SDK)/src/nano_heap.c | $(BUILD)/sdk
+	$(CC) $(SDK_CFLAGS) -O2 -mfpu=vfpv3-d16 -mfloat-abi=softfp -fno-math-errno -I$(NANO_SDK)/include/libc -c $< -o $@
+
+$(BUILD)/sdk/nano_flight.o: $(NANO_SDK)/src/nano_flight.c | $(BUILD)/sdk
 	$(CC) $(SDK_CFLAGS) -I$(NANO_SDK)/include/libc -c $< -o $@
 
 $(BUILD)/sdk/nano_cpp.o: $(NANO_SDK)/src/nano_cpp.cpp | $(BUILD)/sdk
@@ -84,7 +88,7 @@ $(BUILD)/sdk/gl2api.o: $(NANO_GL2)/gl2api.c | $(BUILD)/sdk
 	$(CC) $(SDK_CFLAGS) $(GL2_PREFIX) -O2 -mfpu=vfpv3-d16 -mfloat-abi=softfp -ffp-contract=off -c $< -o $@
 
 $(BUILD)/sdk/gl2rt.o: $(NANO_GL2)/gl2rt.c | $(BUILD)/sdk
-	$(CC) $(SDK_CFLAGS) $(GL2_PREFIX) -c $< -o $@
+	$(CC) $(SDK_CFLAGS) $(GL2_PREFIX) -O2 -mfpu=vfpv3-d16 -mfloat-abi=softfp -ffp-contract=off -c $< -o $@
 
 $(BUILD)/sdk/gl2vsc.o: $(NANO_GL2)/gl2vsc.c | $(BUILD)/sdk
 	$(CC) $(SDK_CFLAGS) $(GL2_PREFIX) -c $< -o $@

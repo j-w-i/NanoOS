@@ -180,6 +180,15 @@ void kernel_main(void) {
     /* A valid separate game image is an explicit loader request. Run it
      * instead of the lab suite, then return through the normal chainloader
      * reset. Without a game image, preserve unattended hardware validation. */
+#ifdef NANOOS_GAME_PROFILE
+    /* Optional clock profile for a loader-requested game image (0 STOCK,
+     * 1 SAFE, 2 MAX). clk_apply logs before/after to R86 and rolls back to
+     * stock if any step fails to read back. */
+#ifndef NANOOS_GAME_GPU
+#define NANOOS_GAME_GPU 0x20010000u   /* PLL-B/2 = 133 MHz: the STOCK selector's GPU rate */
+#endif
+    if (game_ready) { clk_apply(NANOOS_GAME_PROFILE, NANOOS_GAME_GPU); active_profile = NANOOS_GAME_PROFILE; }
+#endif
     if (game_ready) { game_run(); reset_stockos(); }
     mbx_autorun();
     reset_stockos();

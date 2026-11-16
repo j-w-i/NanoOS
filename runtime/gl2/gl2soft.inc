@@ -24,8 +24,9 @@ int gl2_soft_is_texture_cube(const gl2_soft_program *p){
  for(unsigned k=0;k<4;++k){const gl2_soft_insn *i=&p->code[p->output[k]];if(i->op!=GL2_SMUL||!((s_input_channel(p,i->a,k)&&s_square_channel(p,i->b,k))||(s_input_channel(p,i->b,k)&&s_square_channel(p,i->a,k))))return 0;}return 1;
 }
 int gl2_program_needs_software(const gl2_ctx *c,const gl2_prog_obj *p){
- if(c->scissor_enabled||c->color_mask!=0xfu)return 1;
+ if(GL2_DRAW_SCISSOR_BLOCKS(c)||c->color_mask!=0xfu)return 1;
  const gl2_soft_program *s=p&&p->fs?p->fs->software:0;if(!s)return 0;
+ if(p->fs->nplan&&p->sampler_unit[0]<2)return 0; /* a lowered combiner plan on texture unit 0/1 runs natively (OpenLara checked against the ANGLE reference) */
  /* A compiled combiner plan is an exact fixed-function lowering of the
   * fragment AST. If the sampler/state are in the verified GPU set, execute the
   * plan on hardware instead of forcing the float fallback. Blending, packed
@@ -210,7 +211,7 @@ static int s_draw(gl2_ctx *c,const gl2_prog_obj *p,unsigned mode,unsigned count,
  if(!c->soft_target||!c->soft_depth||!p->fs->software||gl2_soft_validate(p->fs->software)||c->vp_w>c->soft_width||c->vp_h>c->soft_height||c->soft_width>240||c->soft_height>432)return -1;
  const gl2_tex *t=&c->tex[0];if(p->fs->nsampler){if(!c->texture_cpu||t->log2size<3||t->log2size>6||t->va<c->texture_va||(t->storage&(GL2_TEX_MIP_NEAREST|GL2_TEX_MIP_LINEAR)))return -1;unsigned bytes=(1u<<(2*t->log2size))*((t->storage&~GL2_TEX_LINEAR)?2:4);if(t->va-c->texture_va>GL2_TEXTURE_ARENA_BYTES||bytes>GL2_TEXTURE_ARENA_BYTES-(t->va-c->texture_va))return -1;}
  float constants[128][4]={{0}};for(unsigned i=0;i<p->prog.nlit;++i){unsigned index=p->prog.lit_idx[i];if(index>=128)return -1;for(unsigned k=0;k<4;++k)constants[index][k]=p->prog.lit_val[i*4+k];}for(unsigned i=0;i<p->prog.nuni;++i)if(p->prog.uset[i])for(unsigned row=0;row<p->prog.uni_cnt[i];++row){unsigned index=p->prog.uni_idx[i]+row;if(index>=128)return -1;for(unsigned k=0;k<4;++k)constants[index][k]=p->prog.uval[i][row][k];}
- for(unsigned i=0;i<count;++i){float input[5][4];for(unsigned a=0;a<5;++a)for(unsigned k=0;k<4;++k)input[a][k]=k==3?1:0;for(unsigned k=0;k<4;++k){input[0][k]=pos[i*4+k];if(normal)input[1][k]=normal[i*4+k];if(col)input[2][k]=col[i*4+k];}for(unsigned k=0;k<2;++k){input[3][k]=uv0[i*2+k];input[4][k]=uv1[i*2+k];}if(s_vertex_execute(p,input,constants,&s_vertices[i]))return -1;}
+ for(unsigned i=0;i<count;++i){float input[5][4];for(unsigned a=0;a<5;++a)for(unsigned k=0;k<4;++k)input[a][k]=k==3?1:0;for(unsigned k=0;k<4;++k){input[0][k]=pos[i*4+k];if(normal)input[1][k]=normal[i*4+k];if(col)input[2][k]=col[i*4+k];}{unsigned w4=p->full_uv1_input>2?p->full_uv1_input:2u;for(unsigned k=0;k<2;++k)input[3][k]=uv0[i*2+k];for(unsigned k=0;k<w4;++k)input[4][k]=uv1[i*w4+k];}if(s_vertex_execute(p,input,constants,&s_vertices[i]))return -1;}
  if(c->st.depth_test&&!c->soft_depth_initialized){for(unsigned i=0;i<c->soft_width*c->soft_height;++i)c->soft_depth[i]=1;c->soft_depth_initialized=1;}
  int constant=1;for(unsigned i=1;p->fs->needs_colour&&i<count&&constant;++i)for(unsigned k=0;k<4;++k)if(s_vertices[i].v[1][k]!=s_vertices[0].v[1][k])constant=0;
  if(constant)for(unsigned i=0;i<S_CACHE_SIZE;++i)s_cache_valid[i]=s_cache_blend[i]=0;

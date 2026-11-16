@@ -19,4 +19,11 @@ typedef struct {
 } vsc_result;
 int gl2_preprocess(const char *src, char *out, uint32_t cap);
 int gl2vsc_compile(const char *src, vsc_result *out);   /* 0 ok, <0 error (message in out->err) */
+/* Remove lanes/instructions that cannot reach a live output (bit d = output d read). Returns the new count. */
+uint32_t vsc_prune(uint32_t (*code)[2], uint32_t n, uint32_t live_out);
+/* Copy propagation / retargeting on native code, then prune (see gl2vsc.c). allow_out: also
+ * let ops write output registers directly. Returns the new count. */
+uint32_t vsc_optimize(uint32_t (*code)[2], uint32_t n, uint32_t live_out, int allow_out);
+/* Specialise for constant-row lanes known to be zero (zero_rows[256]: lane mask per row), then optimize. */
+uint32_t vsc_fold_zero(uint32_t (*code)[2], uint32_t n, const uint8_t *zero_rows, uint32_t live_out, int allow_out);
 #endif

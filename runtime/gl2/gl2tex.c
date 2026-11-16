@@ -2,7 +2,8 @@
  * No register/clock access, allocation, or implicit GPU waits. Caller supplies
  * mapped GPU storage and a cache/upload hook; see gl2api.h for lifetime rules. */
 #include "gl2api.h"
-static void terr(gl2_ctx *c, uint32_t e) { if (!c->err) c->err = e; }
+static void terr_at(gl2_ctx *c, uint32_t e, uint32_t line) { if (!c->err) { c->err = e; c->err_site = 0x10000u | line; } }
+#define terr(c, e) terr_at((c), (e), __LINE__)
 static gl2_texture_obj *named(gl2_ctx *c, uint32_t name) {
     if (!name) return 0;
     for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i)
@@ -26,7 +27,8 @@ void gl2_texture_arena(gl2_ctx *c, void *cpu, uint32_t gpuva, uint32_t bytes, gl
         gpuva > 0x02000000u - GL2_TEXTURE_ARENA_BYTES ||
         (uintptr_t)cpu > UINTPTR_MAX - GL2_TEXTURE_ARENA_BYTES) { terr(c, GL_INVALID_VALUE); return; }
     for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) if (c->textures[i].defined) { terr(c, GL_INVALID_OPERATION); return; }
-    c->texture_cpu = cpu; c->texture_va = gpuva;
+    c->texture_cpu = cpu; c->texture_va = gpuva; c->texture_arena_used = 0;
+    for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) c->textures[i].arena_bytes = 0;
     c->texture_sync = sync; c->texture_sync_user = user;
     gl2_invalidate_state_cache(c);
 }
@@ -110,27 +112,67 @@ void glPixelStorei(gl2_ctx *c, uint32_t pname, int value) {
 /* Six coordinate bits suffice for this arena. Spread once per row; increment
  * the interleaved x lane by carry propagation instead of a bit loop per texel. */
 static uint32_t spread(uint32_t v) {
-    v = (v | (v << 4)) & 0x0f0fu;
-    v = (v | (v << 2)) & 0x3333u;
-    return (v | (v << 1)) & 0x5555u;
+    v &= 0xffffu;
+    v = (v | (v << 8)) & 0x00ff00ffu;
+    v = (v | (v << 4)) & 0x0f0f0f0fu;
+    v = (v | (v << 2)) & 0x33333333u;
+    return (v | (v << 1)) & 0x55555555u;
 }
-static uint32_t slot_offset(gl2_ctx *c, const gl2_texture_obj *t) { return (uint32_t)(t - c->textures) * GL2_TEXTURE_SLOT_BYTES; }
+static uint32_t rect_morton(uint32_t lw, uint32_t lh, uint32_t x, uint32_t y) {
+    uint32_t lm = lw < lh ? lw : lh;
+    uint32_t mask = (1u << lm) - 1u;
+    uint32_t tiles_x = (1u << lw) >> lm;
+    uint32_t tile = (x >> lm) + (y >> lm) * tiles_x;
+    return (tile << (2u * lm)) | (spread(x & mask) << 1) | spread(y & mask);
+}
+/* Texture storage is allocated from the arena by size (level 0 + the full mip chain,
+ * 128-byte aligned for the sampler address field). Fixed GL2_TEXTURE_SLOT_BYTES slots
+ * let a 1024x1024 RGBA16 atlas's mips (2.67 MB) spill into the next texture: OpenLara's
+ * distant room surfaces sampled another atlas. */
+static uint32_t slot_offset(gl2_ctx *c, const gl2_texture_obj *t) { (void)c; return t->arena_off; }
 static uint32_t storage_bytes(uint32_t storage);
-static uint32_t level_size(const gl2_texture_obj *t,uint32_t level){return t->size>>level;}
+static uint32_t chain_bytes(uint32_t w, uint32_t h, uint32_t storage) {
+    uint32_t total = 0;
+    for (;;) {
+        uint32_t sw = w, sh = h;
+        if (storage == GL2_TEX_PVRTC4_RGB || storage == GL2_TEX_PVRTC4_RGBA) { if (sw < 8u) sw = 8u; if (sh < 8u) sh = 8u; total += (sw * sh) >> 1; }
+        else total += sw * sh * storage_bytes(storage);
+        if (w == 1u && h == 1u) break;
+        if (w > 1u) w >>= 1;
+        if (h > 1u) h >>= 1;
+    }
+    return total;
+}
+static int tex_reserve(gl2_ctx *c, gl2_texture_obj *t, uint32_t bytes) {
+    bytes = (bytes + 127u) & ~127u;
+    if (t->arena_bytes >= bytes) return 0;
+    int others = 0;
+    for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) if (&c->textures[i] != t && c->textures[i].defined) others = 1;
+    if (!others) { c->texture_arena_used = 0; for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) c->textures[i].arena_bytes = 0; }
+    if (bytes > GL2_TEXTURE_ARENA_BYTES - c->texture_arena_used) return -1;
+    t->arena_off = c->texture_arena_used; t->arena_bytes = bytes; c->texture_arena_used += bytes;
+    return 0;
+}
+static uint32_t storage_bytes(uint32_t storage);
+static uint32_t level_w(const gl2_texture_obj *t,uint32_t level){uint32_t w=(t->width?t->width:t->size)>>level;return w?w:1u;}
+static uint32_t level_h(const gl2_texture_obj *t,uint32_t level){uint32_t h=(t->height?t->height:t->size)>>level;return h?h:1u;}
 static uint32_t level_bytes(const gl2_texture_obj *t,uint32_t level){
-    uint32_t s=level_size(t,level);
-    if(t->storage==GL2_TEX_PVRTC4_RGB||t->storage==GL2_TEX_PVRTC4_RGBA){if(s<8u)s=8u;return (s*s)>>1;}
-    return s*s*storage_bytes(t->storage);
+    uint32_t sw=level_w(t,level),sh=level_h(t,level);
+    if(t->storage==GL2_TEX_PVRTC4_RGB||t->storage==GL2_TEX_PVRTC4_RGBA){if(sw<8u)sw=8u;if(sh<8u)sh=8u;return (sw*sh)>>1;}
+    return sw*sh*storage_bytes(t->storage);
 }
 static uint32_t level_offset(const gl2_texture_obj *t,uint32_t level){uint32_t off=0;for(uint32_t l=0;l<level;++l)off+=level_bytes(t,l);return off;}
 static uint32_t defined_bytes(const gl2_texture_obj *t){uint32_t bytes=0;for(uint32_t l=0;l<=t->log2size;++l)if(t->level_mask&(1u<<l))bytes=level_offset(t,l)+level_bytes(t,l);if(!bytes)bytes=level_bytes(t,0);return bytes;}
 /* Source buffers may alias texture storage. Stage only overlapping uploads;
  * normal uploads have no temporary copy. API/compiler scratch is serialized. */
-static uint8_t alias_source[GL2_TEXTURE_SLOT_BYTES];
+#ifndef GL2_ALIAS_BYTES
+#define GL2_ALIAS_BYTES GL2_TEXTURE_SLOT_BYTES
+#endif
+static uint8_t alias_source[GL2_ALIAS_BYTES];
 static const void *stage_alias(gl2_ctx *c, gl2_texture_obj *t, uint32_t base, const void *pixels, uint32_t bytes, uint32_t output_bytes) {
     (void)t;
     uintptr_t src = (uintptr_t)pixels, dst = (uintptr_t)(c->texture_cpu + base);
-    if (pixels && src < dst + output_bytes && dst < src + bytes) {
+    if (pixels && src < dst + output_bytes && dst < src + bytes && bytes <= GL2_ALIAS_BYTES) {
         const uint8_t *p = pixels;
         for (uint32_t i=0;i<bytes;++i) alias_source[i]=p[i];
         return alias_source;
@@ -178,7 +220,7 @@ static void upload16_tiles(gl2_ctx *c,gl2_texture_obj *t,uint32_t base,uint32_t 
 #define TILES(expression) do { \
  for(uint32_t j=0;j<h;j+=2){const texture_word *r0=(const texture_word *)(src+j*pitch),*r1=(const texture_word *)(src+(j+1)*pitch);uint32_t mx=first_x,my=spread(y+j)>>1; \
   for(uint32_t i=0;i<w/2;++i){uint32_t v=r0[i],a=(expression);v=r1[i];uint32_t b=(expression),index=mx|my; \
-   dst[index]=(a&65535u)|(b<<16);dst[index+1]=(a>>16)|(b&0xffff0000u);mx=(mx-0x5554u)&0x5554u; \
+   dst[index]=(a&65535u)|(b<<16);dst[index+1]=(a>>16)|(b&0xffff0000u);mx=(mx-0x55555554u)&0x55555554u; \
   } \
  } \
 }while(0)
@@ -203,7 +245,7 @@ static void upload16(gl2_ctx *c,gl2_texture_obj *t,uint32_t base,uint32_t x,uint
 #define HALF_ROW(expression) do { \
     const uint8_t *row=src?src+j*pitch:0;uint32_t mx=first_x<<1,my=spread(y+j); \
     for(uint32_t i=0;i<w;++i) { const uint8_t *p=row?row+i*bpp:0;uint32_t v=packed16(p);(void)v; \
-        dst[mx|my]=(uint16_t)(expression);mx=(mx-0xaaaau)&0xaaaau; } \
+        dst[mx|my]=(uint16_t)(expression);mx=(mx-0xaaaaaaaau)&0xaaaaaaaau; } \
 } while(0)
 #define WRITE16(expression) do { \
     uint32_t j=0; \
@@ -214,7 +256,7 @@ static void upload16(gl2_ctx *c,gl2_texture_obj *t,uint32_t base,uint32_t x,uint
         for(uint32_t i=0;i<w;++i) { \
             const uint8_t *p=r0?r0+i*bpp:0;uint32_t v=packed16(p);(void)v; \
             uint32_t lo=(expression);p=r1?r1+i*bpp:0;v=packed16(p); \
-            uint32_t hi=(expression);words[mx|my]=lo|(hi<<16);mx=(mx-0x5555u)&0x5555u; \
+            uint32_t hi=(expression);words[mx|my]=lo|(hi<<16);mx=(mx-0x55555555u)&0x55555555u; \
         } \
     } \
     if(j<h) { HALF_ROW(expression); } \
@@ -226,7 +268,37 @@ static void upload16(gl2_ctx *c,gl2_texture_obj *t,uint32_t base,uint32_t x,uint
 #undef WRITE16
 #undef HALF_ROW
 }
-static void upload(gl2_ctx *c, gl2_texture_obj *t, uint32_t base, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t format, uint32_t type, uint32_t bpp, const void *pixels) {
+/* Rectangular textures twiddle by the level's own size (run520 emulator probe: the
+ * 1024x512 objects atlas wrote every mip with level-0 indices, so Lara and doors
+ * sampled garbage). Square levels are size-independent Morton order. */
+static uint32_t level_log2(uint32_t l2, uint32_t level) { return l2 > level ? l2 - level : 0u; }
+static void upload(gl2_ctx *c, gl2_texture_obj *t, uint32_t level, uint32_t base, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t format, uint32_t type, uint32_t bpp, const void *pixels) {
+    uint32_t lw = level_log2(t->log2w, level), lh = level_log2(t->log2h, level);
+    if (lw != lh) {
+        texture_half *dst16 = (texture_half *)(c->texture_cpu + base);
+        const uint8_t *src = pixels;
+        uint32_t pitch = (w * bpp + c->unpack_alignment - 1) & ~(c->unpack_alignment - 1);
+        for (uint32_t j = 0; j < h; ++j) {
+            const uint8_t *row = src ? src + j * pitch : 0;
+            for (uint32_t i = 0; i < w; ++i) {
+                const uint8_t *p = row ? row + i * bpp : 0;
+                uint32_t idx = rect_morton(lw, lh, x + i, y + j);
+                if (t->storage == GL2_TEX_ARGB8888) {
+                    uint32_t val = 0;
+                    if (format == GL_RGBA && type == GL_UNSIGNED_BYTE) val = p ? ((uint32_t)p[3]<<24 | (uint32_t)p[0]<<16 | (uint32_t)p[1]<<8 | p[2]) : 0;
+                    else val = rgba_pixel(p, format, type);
+                    ((texture_word *)(c->texture_cpu + base))[idx] = val;
+                } else {
+                    uint32_t v = type == GL_UNSIGNED_BYTE ? 0 : packed16(p);
+                    if ((t->storage == GL2_TEX_RGB565 && type == GL_UNSIGNED_SHORT_5_6_5) || t->storage == GL2_TEX_AL88) dst16[idx] = (uint16_t)v;
+                    else if (t->storage == GL2_TEX_ARGB4444 && type == GL_UNSIGNED_SHORT_4_4_4_4) dst16[idx] = (uint16_t)((v>>4)|(v&15)<<12);
+                    else if (t->storage == GL2_TEX_ARGB1555 && type == GL_UNSIGNED_SHORT_5_5_5_1) dst16[idx] = (uint16_t)((v>>1)|(v&1)<<15);
+                    else dst16[idx] = (uint16_t)native_pixel(rgba_pixel(p, format, type), t->storage);
+                }
+            }
+        }
+        return;
+    }
     if (t->storage!=GL2_TEX_ARGB8888) { upload16(c,t,base,x,y,w,h,format,type,bpp,pixels);return; }
     texture_word *dst = (texture_word *)(c->texture_cpu + base);
     const uint8_t *src = pixels;
@@ -239,7 +311,7 @@ static void upload(gl2_ctx *c, gl2_texture_obj *t, uint32_t base, uint32_t x, ui
             for (uint32_t i=0;i<w;++i) {
                 uint32_t v=row[i];
                 dst[mx|my]=(v&0xff00ff00u)|((v&255u)<<16)|((v>>16)&255u);
-                mx=(mx-0xaaaau)&0xaaaau;
+                mx=(mx-0xaaaaaaaau)&0xaaaaaaaau;
             }
         }
         return;
@@ -254,7 +326,7 @@ static void upload(gl2_ctx *c, gl2_texture_obj *t, uint32_t base, uint32_t x, ui
             const uint8_t *p=row ? row+i*bpp : 0; \
             uint32_t v=type==GL_UNSIGNED_BYTE ? 0 : packed16(p); (void)v; \
             dst[mx|my]=(expression); \
-            mx=(mx-0xaaaau)&0xaaaau; \
+            mx=(mx-0xaaaaaaaau)&0xaaaaaaaau; \
         } \
     } \
 } while (0)
@@ -307,25 +379,45 @@ void glTexImage2D(gl2_ctx *c, uint32_t target, int level, int internalformat, in
     if (source_range(c,(uint32_t)w,(uint32_t)h,bpp,pixels,&bytes)) return;
     if (c->texture_write_guard && c->texture_write_guard(c->texture_write_guard_user)) { terr(c, GL_INVALID_OPERATION); return; }
     if (level == 0) {
-        if (w<8 || w>GL2_MAX_TEXTURE_SIZE || w!=h || (w&(w-1))) { terr(c, GL_INVALID_VALUE); return; }
+        uint8_t up[8 * 8 * 4];
+        if ((w == 1 || w == 2 || w == 4) && w == h) {
+            uint32_t pitch = (uint32_t)w * bpp;
+            const uint8_t *src = (const uint8_t *)pixels;
+            for (uint32_t y = 0; y < 8u; ++y) {
+                for (uint32_t x = 0; x < 8u; ++x) {
+                    const uint8_t *sp = src + (y & ((uint32_t)h - 1u)) * pitch + (x & ((uint32_t)w - 1u)) * bpp;
+                    uint8_t *dp = up + (y * 8u + x) * bpp;
+                    for (uint32_t k = 0; k < bpp; ++k) dp[k] = src ? sp[k] : 0;
+                }
+            }
+            w = 8; h = 8; pixels = up;
+            bytes = 8u * 8u * bpp;
+        }
+        if (w<8 || w>GL2_MAX_TEXTURE_SIZE || h<8 || h>GL2_MAX_TEXTURE_SIZE || (w&(w-1)) || (h&(h-1))) { terr(c, GL_INVALID_VALUE); return; }
         gl2_invalidate_state_cache(c);
-        uint32_t storage=storage_for(format,type),base=slot_offset(c,t);
-        pixels=stage_alias(c,t,base,pixels,bytes,(uint32_t)w*(uint32_t)h*storage_bytes(storage));
-        t->size=(uint32_t)w; t->log2size=0; t->format=format; t->storage=storage; t->level_mask=1; t->mip_complete=0;
-        while ((1u<<t->log2size)<t->size) ++t->log2size;
+        uint32_t storage=storage_for(format,type);
+        uint32_t out_bytes=(uint32_t)w*(uint32_t)h*storage_bytes(storage);
+        if (tex_reserve(c,t,chain_bytes((uint32_t)w,(uint32_t)h,storage))) { terr(c, GL_OUT_OF_MEMORY); return; }
+        uint32_t base=slot_offset(c,t);
+        pixels=stage_alias(c,t,base,pixels,bytes,out_bytes);
+        t->width=(uint32_t)w; t->height=(uint32_t)h; t->size=(uint32_t)(w>h?w:h);
+        t->log2w=0; while ((1u<<t->log2w)<t->width) ++t->log2w;
+        t->log2h=0; while ((1u<<t->log2h)<t->height) ++t->log2h;
+        t->log2size=t->log2w>t->log2h?t->log2w:t->log2h;
+        t->format=format; t->storage=storage; t->level_mask=1; t->mip_complete=0;
         t->defined=0;
-        upload(c,t,base,0,0,(uint32_t)w,(uint32_t)h,format,type,bpp,pixels);
+        upload(c,t,0,base,0,0,(uint32_t)w,(uint32_t)h,format,type,bpp,pixels);
         if (!sync_image(c,t)) t->defined=1;
         return;
     }
     if (!t->defined || level > (int)t->log2size) { terr(c, GL_INVALID_VALUE); return; }
-    uint32_t expected=t->size>>level;
-    if (!expected || w != (int)expected || h != (int)expected) { terr(c, GL_INVALID_VALUE); return; }
+    uint32_t ew=level_w(t,(uint32_t)level), eh=level_h(t,(uint32_t)level);
+    if (!ew || !eh || w != (int)ew || h != (int)eh) { terr(c, GL_INVALID_VALUE); return; }
     if (storage_for(format,type) != t->storage) { terr(c, GL_INVALID_OPERATION); return; }
     gl2_invalidate_state_cache(c);
     uint32_t base=slot_offset(c,t)+level_offset(t,(uint32_t)level);
     pixels=stage_alias(c,t,base,pixels,bytes,level_bytes(t,(uint32_t)level));
-    upload(c,t,base,0,0,(uint32_t)w,(uint32_t)h,format,type,bpp,pixels);
+    upload(c,t,(uint32_t)level,base,0,0,(uint32_t)w,(uint32_t)h,format,type,bpp,pixels);
     t->level_mask |= 1u<<level;
     uint32_t all=(1u<<(t->log2size+1))-1u;
     t->mip_complete=(t->level_mask&all)==all;
@@ -343,10 +435,12 @@ void glCompressedTexImage2D(gl2_ctx *c, uint32_t target, int level, uint32_t int
     if (level == 0) {
         if (w<8 || w>GL2_MAX_TEXTURE_SIZE || w!=h || (w&(w-1))) { terr(c, GL_INVALID_VALUE); return; }
         gl2_invalidate_state_cache(c);
+        if (tex_reserve(c,t,chain_bytes((uint32_t)w,(uint32_t)w,storage))) { terr(c, GL_OUT_OF_MEMORY); return; }
         uint32_t base=slot_offset(c,t);
         data=stage_alias(c,t,base,data,expected_bytes,expected_bytes);
-        t->size=(uint32_t)w; t->log2size=0; t->format=internalformat; t->storage=storage; t->level_mask=1; t->mip_complete=0;
+        t->width=t->height=t->size=(uint32_t)w; t->log2size=0; t->format=internalformat; t->storage=storage; t->level_mask=1; t->mip_complete=0;
         while ((1u<<t->log2size)<t->size) ++t->log2size;
+        t->log2w=t->log2h=t->log2size;
         t->defined=0;
         uint8_t *dst=c->texture_cpu+base; const uint8_t *src=(const uint8_t *)data;
         for (uint32_t i=0;i<expected_bytes;++i) dst[i]=src[i];
@@ -371,9 +465,9 @@ void glTexSubImage2D(gl2_ctx *c, uint32_t target, int level, int x, int y, int w
     gl2_texture_obj *t=bound(c,target); if (!t) return;
     uint32_t bpp=image_format(c,level,format,type); if (!bpp) return;
     if (!t->defined || !c->texture_cpu || format!=t->format || level<0 || level>(int)t->log2size || !(t->level_mask&(1u<<level))) { terr(c, GL_INVALID_OPERATION); return; }
-    uint32_t lsize=t->size>>level;
-    if (x<0 || y<0 || w<0 || h<0 || (uint32_t)x>lsize || (uint32_t)y>lsize ||
-        (uint32_t)w>lsize-(uint32_t)x || (uint32_t)h>lsize-(uint32_t)y || (w && h && !pixels)) { terr(c, GL_INVALID_VALUE); return; }
+    uint32_t lw=level_w(t,(uint32_t)level), lh=level_h(t,(uint32_t)level);
+    if (x<0 || y<0 || w<0 || h<0 || (uint32_t)x>lw || (uint32_t)y>lh ||
+        (uint32_t)w>lw-(uint32_t)x || (uint32_t)h>lh-(uint32_t)y || (w && h && !pixels)) { terr(c, GL_INVALID_VALUE); return; }
     if (!w || !h) return;
     uint32_t bytes;
     if (source_range(c,(uint32_t)w,(uint32_t)h,bpp,pixels,&bytes)) return;
@@ -381,7 +475,7 @@ void glTexSubImage2D(gl2_ctx *c, uint32_t target, int level, int x, int y, int w
     gl2_invalidate_state_cache(c);
     uint32_t base=slot_offset(c,t)+level_offset(t,(uint32_t)level);
     pixels=stage_alias(c,t,base,pixels,bytes,level_bytes(t,(uint32_t)level));
-    upload(c,t,base,(uint32_t)x,(uint32_t)y,(uint32_t)w,(uint32_t)h,format,type,bpp,pixels);
+    upload(c,t,(uint32_t)level,base,(uint32_t)x,(uint32_t)y,(uint32_t)w,(uint32_t)h,format,type,bpp,pixels);
     (void)sync_image(c,t);
 }
 void glGenerateMipmap(gl2_ctx *c, uint32_t target) {
@@ -391,12 +485,15 @@ void glGenerateMipmap(gl2_ctx *c, uint32_t target) {
     gl2_invalidate_state_cache(c); gl2_soft_cache_flush();
     uint32_t slot=slot_offset(c,t);
     for (uint32_t level=1; level<=t->log2size; ++level) {
-        uint32_t dstn=t->size>>level;
+        /* each level has its own (possibly rectangular) size and twiddle */
+        uint32_t slw=level_log2(t->log2w,level-1),slh=level_log2(t->log2h,level-1),dlw=level_log2(t->log2w,level),dlh=level_log2(t->log2h,level);
+        uint32_t dw=1u<<dlw,dh=1u<<dlh,sw=1u<<slw,shh=1u<<slh;
         uint32_t src=slot+level_offset(t,level-1), dst=slot+level_offset(t,level);
-        for (uint32_t y=0;y<dstn;++y) for (uint32_t x=0;x<dstn;++x) {
+        for (uint32_t y=0;y<dh;++y) for (uint32_t x=0;x<dw;++x) {
             uint32_t rgba[4]; uint32_t sum[4]={0,0,0,0};
             for (uint32_t sy=0;sy<2;++sy) for (uint32_t sx=0;sx<2;++sx) {
-                uint32_t ix=(spread(x*2+sx)<<1)|spread(y*2+sy);
+                uint32_t qx=x*2+sx,qy=y*2+sy;if(qx>=sw)qx=sw-1u;if(qy>=shh)qy=shh-1u;
+                uint32_t ix=rect_morton(slw,slh,qx,qy);
                 uint32_t v;
                 if (t->storage==GL2_TEX_ARGB8888) v=((const uint32_t *)(c->texture_cpu+src))[ix];
                 else v=((const texture_half *)(c->texture_cpu+src))[ix];
@@ -405,7 +502,7 @@ void glGenerateMipmap(gl2_ctx *c, uint32_t target) {
                 sum[0]+=rgba[0]>>16&255; sum[1]+=rgba[0]>>8&255; sum[2]+=rgba[0]&255; sum[3]+=rgba[0]>>24;
             }
             uint32_t r=(sum[0]+2)>>2,g=(sum[1]+2)>>2,b=(sum[2]+2)>>2,a=(sum[3]+2)>>2;
-            uint32_t oix=(spread(x)<<1)|spread(y);
+            uint32_t oix=rect_morton(dlw,dlh,x,y);
             if (t->storage==GL2_TEX_ARGB8888) ((uint32_t *)(c->texture_cpu+dst))[oix]=(a<<24)|(r<<16)|(g<<8)|b;
             else ((texture_half *)(c->texture_cpu+dst))[oix]=(uint16_t)native_pixel((a<<24)|(r<<16)|(g<<8)|b,t->storage);
         }
@@ -439,7 +536,8 @@ int gl2_resolve_texture_units(gl2_ctx *c, uint32_t layers, uint32_t samplers, co
         }
         if ((t->wrap_s != GL_REPEAT && t->wrap_s != GL_CLAMP_TO_EDGE) ||
             (t->wrap_t != GL_REPEAT && t->wrap_t != GL_CLAMP_TO_EDGE)) { terr(c, GL_INVALID_OPERATION); return -1; }
-        resolved[layer].va = c->texture_va + slot_offset(c, t); resolved[layer].log2size = t->log2size;
+        resolved[layer].va = c->texture_va + slot_offset(c, t);
+        resolved[layer].log2size = (t->log2w == t->log2h) ? t->log2w : (t->log2w | (t->log2h << 8));
         resolved[layer].storage=t->storage|linear|mipflag|
             (t->wrap_s==GL_CLAMP_TO_EDGE?GL2_TEX_CLAMP_S:0u)|(t->wrap_t==GL_CLAMP_TO_EDGE?GL2_TEX_CLAMP_T:0u);
     }

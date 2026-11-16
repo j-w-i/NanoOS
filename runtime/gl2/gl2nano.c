@@ -15,8 +15,25 @@ static int display_busy(gl2_nano *b,const uint32_t *target,uint32_t bytes){
  return NGAME_API_TABLE(b->api)>=23&&b->api->lcd_buffer_busy&&b->api->lcd_buffer_busy(target,bytes);
 }
 static int nano_read(struct gl2_ctx *c,int x,int y,int w,int h,uint32_t format,uint32_t type,uint32_t pack,void *pixels,void *user){
- gl2_nano *b=user;(void)c;(void)type;
+ gl2_nano *b=user;(void)type;
  if(!owned(b)||b->fault||b->cpu_active||b->frame_open||b->pending_valid||!b->completed||!b->target)return -1;
+ if(c->landscape&&!c->fbo_active){
+  /* Rotated window surface: logical (x, y), bottom-left origin, on a panel target. */
+  const uint32_t lw=b->height,lh=b->width;
+  if(x<0||y<0||w<0||h<0||(uint32_t)x>lw||(uint32_t)y>lh||(uint32_t)w>lw-(uint32_t)x||(uint32_t)h>lh-(uint32_t)y)return -1;
+  uint32_t bpp=format==GL_RGBA?4u:3u,pitch=(uint32_t)w*bpp;if(pitch&(pack-1u))pitch=(pitch+pack-1u)&~(pack-1u);
+  uint8_t *out=(uint8_t *)pixels;
+  for(int gy=0;gy<h;++gy){
+   const uint32_t ly=(uint32_t)(y+gy);
+   for(int gx=0;gx<w;++gx){
+    const uint32_t lx=(uint32_t)(x+gx);
+    /* mode 1 (home right): panel col = ly, row = lx; mode 2 (home left): col = W-1-ly, row = H-1-lx */
+    const uint32_t col=c->landscape==1u?ly:b->width-1u-ly,row=c->landscape==1u?lx:b->height-1u-lx;
+    uint32_t v=b->target[row*b->stride+col];out[0]=(uint8_t)(v>>16);out[1]=(uint8_t)(v>>8);out[2]=(uint8_t)v;if(bpp==4)out[3]=(uint8_t)(v>>24);out+=bpp;}
+   if(pitch>(uint32_t)w*bpp)out+=(pitch-(uint32_t)w*bpp);
+  }
+  return 0;
+ }
  if(x<0||y<0||w<0||h<0||(uint32_t)x> b->width||(uint32_t)y>b->height||(uint32_t)w>b->width-(uint32_t)x||(uint32_t)h>b->height-(uint32_t)y)return -1;
  uint32_t bpp=format==GL_RGBA?4u:3u,pitch=(uint32_t)w*bpp;if(pitch&(pack-1u))pitch=(pitch+pack-1u)&~(pack-1u);
  uint8_t *out=(uint8_t *)pixels;
@@ -114,17 +131,23 @@ static void submit_clear(gl2_nano *b,uint32_t argb){
  gl2_invalidate_state_cache(b->ctx);
 }
 static int nano_clear(struct gl2_ctx *c,uint32_t mask,uint32_t argb,float depth,uint32_t color_mask,uint32_t scissor_enabled,const int32_t scissor[4],void *user){
- gl2_nano *b=user;(void)c;(void)scissor;
+ gl2_nano *b=user;(void)scissor;
  if(!owned(b)||b->fault||b->cpu_active)return -1;
  if(!b->frame_open||b->software_frame)return -1;
- if(mask!=(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)||color_mask!=0xfu||scissor_enabled||depth!=1.f)return -1;
- submit_clear(b,argb);return 0;
+ if(color_mask!=0xfu||depth!=1.f)return -1;
+ /* A scissor rectangle that covers the whole target is equivalent to no scissor. */
+ if(scissor_enabled&&gl2_scissor_blocks(c))return -1;
+ if(!(mask&(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)))return -1;
+ if(b->frame_draws==0){submit_clear(b,argb);return 0;}
+ return 0;
 }
 static int begin_target(gl2_nano *b,uint32_t *target,uint32_t w,uint32_t h,uint32_t stride,uint32_t clear_argb,int allow_lcd) {
     if (!owned(b) || b->cpu_active || b->frame_open) return GL2_NANO_STATE;
     if (b->fault) return GL2_NANO_FAULT;
     if(w<16||w>240||h<16||h>432||(w&15)||(h&15)||stride<w||stride>1024||(stride&3))return GL2_NANO_TARGET;
-    if(!b->ctx->vp_w||!b->ctx->vp_h||b->ctx->vp_w>w||b->ctx->vp_h>h)return GL2_NANO_TARGET;
+    /* Landscape window surfaces: the context works in rotated (logical) coordinates. */
+    const uint32_t rot=b->ctx->landscape&&!b->ctx->fbo_active,lw=rot?h:w,lh=rot?w:h;
+    if(!b->ctx->vp_w||!b->ctx->vp_h||b->ctx->vp_w>lw||b->ctx->vp_h>lh)return GL2_NANO_TARGET;
     uint32_t bytes=stride*h*4;
     int lcd=target==b->api->lcd_back();
     if (!target || (lcd ? (!allow_lcd||w!=240||h!=432||stride!=240) : !gpu_range((uintptr_t)target,bytes))) return GL2_NANO_TARGET;
@@ -133,10 +156,11 @@ static int begin_target(gl2_nano *b,uint32_t *target,uint32_t w,uint32_t h,uint3
     if(display_busy(b,target,bytes))return GL2_NANO_BUSY;
     if(b->pending_valid&&(lcd||overlaps((uintptr_t)target,bytes,(uintptr_t)b->pending_target,b->pending_bytes)))return GL2_NANO_BUSY;
     uint32_t use_software=!b->force_gpu&&b->ctx->cur&&gl2_program_needs_software(b->ctx,&b->ctx->pr[b->ctx->cur]);
+    if(rot)use_software=0;   /* the CPU rasteriser does not rotate: GPU frame, CPU-only draws are rejected individually */
     if(use_software&&b->pending_valid)return GL2_NANO_BUSY;
     if(use_software&&b->software_colour&&b->software_colour_bytes<w*h*4)return GL2_NANO_TARGET;
     if(b->retired_target&&overlaps((uintptr_t)target,bytes,(uintptr_t)b->retired_target,b->retired_stride*b->retired_height*4u))b->retired_target=0;
-    b->target=target;b->width=w;b->height=h;b->stride=stride;b->completed=0;b->frame_draws=0;
+    b->target=target;b->width=w;b->height=h;b->stride=stride;b->ctx->target_w=lw;b->ctx->target_h=lh;b->completed=0;b->frame_draws=0;
     b->ctx->soft_target=0;b->ctx->soft_depth=0;b->ctx->diagnostic_gpu=b->force_gpu;
     gl2_set_state_cache(b->ctx,0);
     b->software_frame=use_software;
@@ -175,6 +199,17 @@ int gl2_nano_end_fbo(gl2_nano *b){
  b->fbo_texture=b->fbo_width=b->fbo_height=b->fbo_stride=b->fbo_surface=0;
  if(gl2_texture_store_name(b->ctx,texture,0,0,(int)w,(int)h,surface,w,h,stride))return GL2_NANO_DRIVER;
  return GL2_NANO_OK;
+}
+int gl2_nano_recover(gl2_nano *b){
+ if(!owned(b)||b->cpu_active)return GL2_NANO_STATE;
+ if(!b->fault)return GL2_NANO_OK;
+ b->api->mbx_halt();
+ b->pending_valid=b->frame_open=b->completed=0;b->pending_target=b->retired_target=0;b->software_frame=0;
+ b->fbo_texture=b->fbo_width=b->fbo_height=b->fbo_stride=b->fbo_surface=0;
+ b->ctx->soft_target=0;b->ctx->soft_depth=0;
+ gl2_set_state_cache(b->ctx,0);gl2_invalidate_state_cache(b->ctx);
+ if(!b->api->mbx_init()){b->api->mbx_halt();return GL2_NANO_DRIVER;}
+ b->fault=0;++b->recoveries;return GL2_NANO_OK;
 }
 int gl2_nano_begin(gl2_nano *b,uint32_t *target,uint32_t colour){
     return begin_target(b,target,240,432,240,colour,1);

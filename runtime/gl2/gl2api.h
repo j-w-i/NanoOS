@@ -159,10 +159,15 @@
 #ifndef GL2_MAX_TEXTURE_SIZE
 #define GL2_MAX_TEXTURE_SIZE 64
 #endif
+#ifndef GL2_MAX_FBO_SIZE
+#define GL2_MAX_FBO_SIZE GL2_MAX_TEXTURE_SIZE
+#endif
 #ifndef GL2_TEXTURE_SLOT_BYTES
 #define GL2_TEXTURE_SLOT_BYTES 24576u /* level0 16KiB + full twiddled mip chain */
 #endif
+#ifndef GL2_TEXTURE_ARENA_BYTES /* textures are allocated from the arena by size; the default keeps the old total */
 #define GL2_TEXTURE_ARENA_BYTES (GL2_MAX_TEXTURES * GL2_TEXTURE_SLOT_BYTES)
+#endif
 #define GL2_FRAGMENT_UNIFORM_BASE (GL2_MAX_UNI+2)
 #ifndef GL2_MAX_BUFFERS
 #define GL2_MAX_BUFFERS 8
@@ -199,23 +204,46 @@ typedef struct {                     /* precompiled fragment shader */
     uint8_t nuniform;const char *uniform_names[16];uint8_t uniform_widths[16];
     const gl2_soft_program *software; /* owned executable for float rendering */
     uint8_t has_alpha; /* bit0 custom alpha; bit1 diagnostic DOT3 stage0 */ uint16_t alpha[2]; /* zero flag preserves legacy cached alpha */
+    uint8_t fold_mask, fold_comp[3]; const char *fold_name; /* colour lanes r,g,b (bits) multiplied per vertex by varying fold_name component fold_comp[lane] (fragment-side lighting the TSP cannot read) */
+    uint8_t uv_divide; /* bit0/1: sampler UV of slot 3/4 is divided by the same varying's other half (v.xy / v.zw): done per vertex on the GPU path */
+    uint8_t uv_approx; /* texture2D at a computed UV was approximated by the UV0 sample (see gl2fsc.inc) */
+    float fold_const[3]; /* nonzero: colour lane r,g,b multiplied per vertex by this constant (TSP has no per-lane constant multiply) */
 } gl2_fs_entry;
-typedef struct {gl2_fs_entry e;char samplers[2][32],varyings[3][32],uniforms[16][32];gl2_soft_program software;} gl2_fs_owned;
+#ifndef GL2_SPEC_SLOTS
+#define GL2_SPEC_SLOTS 8   /* zero-uniform program variants cached per program (>= 1) */
+#endif
+#ifndef GL2_SPEC_MAX_INSTR
+#define GL2_SPEC_MAX_INSTR 160  /* longest cached variant; longer programs keep the base code */
+#endif
+#ifndef GL2_SPEC_ROWS
+#define GL2_SPEC_ROWS 6    /* candidate uniform rows per program (key: 4 lanes each, <= 8) */
+#endif
+#ifndef GL2_SPEC
+#define GL2_SPEC 1         /* zero-uniform specialisation on/off */
+#endif
+typedef struct {gl2_fs_entry e;char samplers[2][32],varyings[3][32],uniforms[16][32],fold_vary[32];gl2_soft_program software;} gl2_fs_owned;
 typedef struct { uint32_t type, src_hash, ok, used, attachments, delete_pending, source_length; char log[64]; const char *src; vsc_result *vs; const gl2_fs_entry *fs; } gl2_shader;
-typedef struct { uint32_t used, ok, vsh, fsh, delete_pending, executable, validate_status; gl2_program prog; vsc_result vs; const gl2_fs_entry *fs; gl2_fs_owned fs_owned; uint8_t sampler_unit[2],fragment_vertex_alias[16];float fragment_values[16][4]; uint32_t blob[1]; char log[64]; } gl2_prog_obj;
+typedef struct { uint32_t used, ok, vsh, fsh, delete_pending, executable, validate_status; gl2_program prog; vsc_result vs; const gl2_fs_entry *fs; gl2_fs_owned fs_owned; uint8_t sampler_unit[2],fragment_vertex_alias[16];float fragment_values[16][4]; uint8_t attr_bind[5], nbind; char bind_name[8][32]; uint8_t bind_loc[8]; uint32_t blob[1]; char log[64]; uint32_t gpu_code[VSC_MAX_INSTR][2]; /* vs.code pruned to what the native TSP reads */ uint32_t gpu_nlit; uint16_t gpu_lit_idx[VSC_MAX_LIT]; float gpu_lit_val[VSC_MAX_LIT][4]; uint8_t full_normal_input, full_uv1_input, full_omit_colour; /* input layout of the unpruned code (software path) */
+    /* zero-uniform specialisation (gl2api.c spec_select): candidate constant rows, cached variants */
+    uint32_t base_nstage; uint8_t nspec, spec_row[GL2_SPEC_ROWS], spec_lru; uint32_t spec_key[GL2_SPEC_SLOTS]; uint32_t spec_n[GL2_SPEC_SLOTS]; uint32_t spec_code[GL2_SPEC_SLOTS][GL2_SPEC_MAX_INSTR][2]; } gl2_prog_obj;
 typedef int (*gl2_submit_fn)(const uint32_t *seg, uint32_t words, void *user); /* nonzero return fails draw */
 typedef struct {
-    uint32_t name, reserved, used, size, usage;
+    uint32_t name, reserved, used, size, usage, gen; /* gen: bumped by every upload (derived-data caches) */
+#ifdef GL2_BUFFER_POOL_BYTES
+    uint32_t offset, cap;
+#else
     uint8_t data[GL2_BUFFER_BYTES];
+#endif
 } gl2_buffer;
 typedef struct {
     uint32_t enabled; const void *ptr; uint32_t size, stride, buffer, type, normalized; float current[4]; /* byte stride; ptr is offset when buffer != 0 */
 } gl2_attribute;
 typedef int (*gl2_texture_sync_fn)(void *user, void *cpu, uint32_t gpuva, uint32_t bytes);
 typedef struct {
-    uint32_t name, reserved, used, defined, size, log2size, format, storage;
+    uint32_t name, reserved, used, defined, size, log2size, width, height, log2w, log2h, format, storage;
     uint32_t min_filter, mag_filter, wrap_s, wrap_t;
     uint32_t level_mask, mip_complete;
+    uint32_t arena_off, arena_bytes; /* storage in the texture arena: level 0 plus its whole mip chain */
 } gl2_texture_obj;
 typedef struct { uint32_t name,reserved,used,width,height,format,defined; } gl2_renderbuffer;
 typedef struct { uint32_t name,reserved,used,color_texture,depth_renderbuffer,stencil_renderbuffer; } gl2_framebuffer;
@@ -224,17 +252,21 @@ struct gl2_ctx;
 typedef int (*gl2_clear_fn)(struct gl2_ctx *c, uint32_t mask, uint32_t argb, float depth, uint32_t color_mask, uint32_t scissor_enabled, const int32_t scissor[4], void *user);
 typedef int (*gl2_read_fn)(struct gl2_ctx *c, int x, int y, int w, int h, uint32_t format, uint32_t type, uint32_t pack, void *pixels, void *user);
 typedef struct gl2_ctx {
-    uint32_t err; const gl2_fs_entry *cache; uint32_t ncache;
+    uint32_t err, err_site, err_aux, target_w, target_h; const gl2_fs_entry *cache; uint32_t ncache;
     char shader_source[GL2_MAX_SHADERS][GL2_SHADER_SOURCE_BYTES];
     gl2_shader sh[GL2_MAX_SHADERS]; vsc_result sh_vs[GL2_MAX_SHADERS]; gl2_fs_owned sh_fs[GL2_MAX_SHADERS]; gl2_prog_obj *pr; uint32_t cur; /* one result per shader ID; slot 0 unused */
     gl2_attribute attr[5];
     gl2_buffer buffers[GL2_MAX_BUFFERS];
+#ifdef GL2_BUFFER_POOL_BYTES
+    uint8_t buffer_pool[GL2_BUFFER_POOL_BYTES];
+    uint32_t buffer_pool_used;
+#endif
     uint32_t array_buffer, element_buffer, next_buffer;
     uint32_t cull_enabled, cull_face, front_face;
     gl2_state st; gl2_tex tex[2], raw_unit_tex[2]; uint32_t vp_w, vp_h;
     gl2_texture_obj textures[GL2_MAX_TEXTURES];
     uint32_t texture_binding[2], texture_managed[2], active_texture, next_texture, unpack_alignment;
-    uint8_t *texture_cpu; uint32_t texture_va;
+    uint8_t *texture_cpu; uint32_t texture_va, texture_arena_used;
     gl2_texture_sync_fn texture_sync; void *texture_sync_user;
     int (*texture_write_guard)(void *user); void *texture_write_guard_user; /* optional BEFORE-write veto */
     uint32_t soft_draws,diagnostic_gpu,soft_depth_initialized;
@@ -244,13 +276,15 @@ typedef struct gl2_ctx {
      * The callback must consume both spans before returning. */
     int (*submit_parts)(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words,void *user); uint32_t *seg; uint32_t seg_cap;
     uint8_t state_cache_enabled, cached_hdr_valid;
+    uint32_t buffer_gen;
     uint32_t cached_hdr_words, cached_hdr[GL2_MAX_HEADER_WORDS];
     gl2_framebuffer framebuffers[GL2_MAX_FRAMEBUFFERS]; gl2_renderbuffer renderbuffers[GL2_MAX_RENDERBUFFERS];
     uint32_t framebuffer_binding, renderbuffer_binding, next_framebuffer, next_renderbuffer;
-    uint32_t fbo_color[GL2_MAX_TEXTURE_SIZE * GL2_MAX_TEXTURE_SIZE];
-    float fbo_depth[GL2_MAX_TEXTURE_SIZE * GL2_MAX_TEXTURE_SIZE];
-    uint8_t copy_pixels[GL2_MAX_TEXTURE_SIZE * GL2_MAX_TEXTURE_SIZE * 4];
+    uint32_t fbo_color[GL2_MAX_FBO_SIZE * GL2_MAX_FBO_SIZE];
+    float fbo_depth[GL2_MAX_FBO_SIZE * GL2_MAX_FBO_SIZE];
+    uint8_t copy_pixels[GL2_MAX_FBO_SIZE * GL2_MAX_FBO_SIZE * 4];
     gl2_soft_saved fbo_saved; uint32_t fbo_active;
+    uint32_t landscape; /* window surface shown rotated: 0 portrait, 1 home right, 2 home left (gl2_set_landscape) */
     float clear_color[4]; float clear_depth; uint32_t clear_stencil;
     uint32_t color_mask, scissor_enabled; int32_t scissor_box[4];
     gl2_clear_fn clear; void *clear_user;
@@ -258,11 +292,26 @@ typedef struct gl2_ctx {
 } gl2_ctx;
 void gl2_set_state_cache(gl2_ctx *c, int enabled);
 void gl2_invalidate_state_cache(gl2_ctx *c);
+/* A scissor rectangle that covers the whole render target is a no-op. */
+#ifdef GL2_SCISSOR_IGNORE_DRAWS
+/* Opt-in: the application's scissor is an optimisation hint (it only trims
+ * work); draws are not clipped to it. glClear still honours the rectangle. */
+#define GL2_DRAW_SCISSOR_BLOCKS(c) 0
+#else
+#define GL2_DRAW_SCISSOR_BLOCKS(c) gl2_scissor_blocks(c)
+#endif
+static inline int gl2_scissor_blocks(const gl2_ctx *c){
+    if(!c->scissor_enabled)return 0;
+    if(!c->target_w||!c->target_h)return 1;
+    return c->scissor_box[0]>0||c->scissor_box[1]>0||c->scissor_box[2]<(int)c->target_w-c->scissor_box[0]||c->scissor_box[3]<(int)c->target_h-c->scissor_box[1];
+}
 int gl2_program_needs_software(const gl2_ctx *,const gl2_prog_obj *); /* internal backend route */
 uint32_t gl2_hash(const char *s);
 void gl2_init(gl2_ctx *c, gl2_prog_obj *progs /* array of 4 */, uint32_t *segbuf, uint32_t seg_cap, gl2_submit_fn fn, void *user);
 void gl2_set_fs_cache(gl2_ctx *c, const gl2_fs_entry *e, uint32_t n);
 uint32_t glGetError(gl2_ctx *c);
+uint32_t gl2_error_aux(gl2_ctx *c); /* extra diagnostic word captured with the error site */
+uint32_t gl2_error_site(gl2_ctx *c); /* source line (0x10000|line in gl2tex.c) that raised the most recent error */
 uint32_t glCreateShader(gl2_ctx *c, uint32_t type);
 void glShaderSource(gl2_ctx *c, uint32_t sh, const char *src);
 /* Multiple strings are concatenated exactly, with no inserted whitespace.
@@ -287,6 +336,7 @@ const char *glGetProgramInfoLog(gl2_ctx *c, uint32_t p);
 void glUseProgram(gl2_ctx *c, uint32_t p);
 int  glGetUniformLocation(gl2_ctx *c, uint32_t p, const char *name);
 int  glGetAttribLocation(gl2_ctx *c, uint32_t p, const char *name);
+void glBindAttribLocation(gl2_ctx *c, uint32_t p, uint32_t index, const char *name);
 /* Sampler locations live above the vertex-uniform namespace (GL2_MAX_UNI). */
 void glUniform1i(gl2_ctx *c, int loc, int unit);
 void glUniform1f(gl2_ctx *c, int loc, float x);
@@ -382,4 +432,8 @@ void glCopyTexSubImage2D(gl2_ctx *c, uint32_t target, int level, int xoffset, in
 int gl2_texture_store_argb(gl2_ctx *c, gl2_texture_obj *t, int dx, int dy, int w, int h, const uint32_t *surface, uint32_t sw, uint32_t sh, uint32_t stride);
 int gl2_texture_store_name(gl2_ctx *c, uint32_t name, int dx, int dy, int w, int h, const uint32_t *surface, uint32_t sw, uint32_t sh, uint32_t stride);
 int gl2_fbo_target(gl2_ctx *c, uint32_t *texture, uint32_t *width, uint32_t *height);
+/* Landscape window surface: draws to the default framebuffer are rotated onto the portrait
+ * panel in the GPU header (see gl2rt.c build_header); FBO targets are not rotated. Resets the
+ * viewport and scissor box to the logical surface size. */
+void gl2_set_landscape(gl2_ctx *c, uint32_t mode);
 #endif

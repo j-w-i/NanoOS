@@ -23,6 +23,7 @@
 #define glUseProgram gl2x_glUseProgram
 #define glGetUniformLocation gl2x_glGetUniformLocation
 #define glGetAttribLocation gl2x_glGetAttribLocation
+#define glBindAttribLocation gl2x_glBindAttribLocation
 #define glUniform1i gl2x_glUniform1i
 #define glUniform1f gl2x_glUniform1f
 #define glUniform2f gl2x_glUniform2f

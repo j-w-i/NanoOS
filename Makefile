@@ -15,6 +15,7 @@ $(THUMB_OBJS): CFLAGS += -mthumb
 # MBX: register pokes and a test page, no divisions: -Os
 build/mbx.o build/mbx_test.o build/mmu.o build/game.o build/asset.o: CFLAGS += -Os
 .PHONY: all clean
+CFLAGS += $(KERNEL_DEFS)
 all: build/kernel.bin
 build:
 	mkdir -p $@

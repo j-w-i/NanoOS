@@ -5,6 +5,16 @@ SECTIONS
     . = ORIGIN(GAME);
     .game_header : { KEEP(*(.game_header)) } > GAME
     .text : { *(.text.app_entry) *(.text*) *(.rodata*) } > GAME
+    /* C++ global constructors (and C __attribute__((constructor))): kept through
+     * --gc-sections and run by start.S before nano_example_main. Without this every
+     * C++ global with a constructor (e.g. OpenLara's COLOR_WHITE) stayed zero. */
+    .init_array : {
+        . = ALIGN(4);
+        __init_array_start = .;
+        KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+        KEEP(*(.init_array))
+        __init_array_end = .;
+    } > GAME
     .data : { *(.data*) . = ALIGN(4); } > GAME
     __image_end = .;
     .bss (NOLOAD) : {

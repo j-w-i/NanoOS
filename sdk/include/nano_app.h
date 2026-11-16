@@ -16,8 +16,8 @@ typedef struct {
     int pressed;       /* 1 on transition from up -> down */
     int released;      /* 1 on transition from down -> up */
     int moved;         /* 1 when down and coordinates changed */
-    int x;             /* Display X in [0, 239] */
-    int y;             /* Display Y in [0, 431] */
+    int x;             /* Display X in [0, 239] (landscape: [0, 431]) */
+    int y;             /* Display Y in [0, 431] (landscape: [0, 239]) */
     int prev_x;        /* Previous display X in [0, 239] */
     int prev_y;        /* Previous display Y in [0, 431] */
     uint32_t buttons;  /* Raw NGAME_* button bitmask */
@@ -37,7 +37,19 @@ uint32_t nano_app_usec(void);
 /* Clean CPU D-cache to DRAM. */
 void nano_app_dcache_clean(void);
 
-/* Poll touchscreen (mapped to 240x432 display coords) and physical buttons. */
+/* Screen orientation. Call before eglCreateWindowSurface. LANDSCAPE: the EGL window is
+ * 432x240 (home button on the right), LANDSCAPE_LEFT: home button on the left. Touch
+ * coordinates from nano_app_poll_input follow the orientation (top-left origin). */
+#define NANO_ORIENT_PORTRAIT       0u
+#define NANO_ORIENT_LANDSCAPE      1u
+#define NANO_ORIENT_LANDSCAPE_LEFT 2u
+int nano_app_set_orientation(uint32_t orientation);
+/* Logical screen size for the current orientation. */
+int nano_app_screen_w(void);
+int nano_app_screen_h(void);
+
+/* Poll touchscreen (display coords for the current orientation: 240x432 portrait,
+ * 432x240 landscape) and physical buttons. */
 void nano_app_poll_input(nano_input_t *out);
 
 /* Return 1 if NGAME_HOME button is pressed. */

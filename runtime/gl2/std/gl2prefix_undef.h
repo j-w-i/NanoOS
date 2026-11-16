@@ -23,6 +23,7 @@
 #undef glUseProgram
 #undef glGetUniformLocation
 #undef glGetAttribLocation
+#undef glBindAttribLocation
 #undef glUniform1i
 #undef glUniform1f
 #undef glUniform2f

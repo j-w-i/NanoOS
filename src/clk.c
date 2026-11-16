@@ -184,7 +184,8 @@ int clk_apply(unsigned profile, uint32_t gpu) {
     for (unsigned i = 0; i < 14; ++i) w[0][i] = CLK(regs[i]);
     /* STOCK: no CLKCON write at all (the report below is RAM only) */
     clk_cause = 0;            /* raise_cpu sets it when a step failed */
-    int r = profile ? raise_cpu(profile) : 0;
+    /* profile 3: GPU rate only (CPU/PLL-A untouched); reported as -1 */
+    int r = profile == 3 ? -1 : profile ? raise_cpu(profile) : 0;
     if (!clk_cause) clk_cause = r;
     /* a GPU on PLL-A (SAFE: 684/4 = 171) follows the retune: /3 = 144 */
     if (r > 0 && gpu >> 28 == 1) gpu -= 0x10000u;

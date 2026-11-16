@@ -16,6 +16,15 @@ int nano_app_init(const struct nanoos_api *api) {
     return 0;
 }
 
+static uint32_t g_orient;
+int nano_app_set_orientation(uint32_t o) {
+    if (gl2_egl_set_orientation(o)) return -1;
+    g_orient = o;
+    return 0;
+}
+int nano_app_screen_w(void) { return g_orient ? (int)NANO_SCREEN_H : (int)NANO_SCREEN_W; }
+int nano_app_screen_h(void) { return g_orient ? (int)NANO_SCREEN_W : (int)NANO_SCREEN_H; }
+
 const struct nanoos_api *nano_app_api(void) {
     return g_api;
 }
@@ -57,6 +66,11 @@ void nano_app_poll_input(nano_input_t *out) {
             if (dx >= (int)NANO_SCREEN_W) dx = (int)NANO_SCREEN_W - 1;
             if (dy < 0) dy = 0;
             if (dy >= (int)NANO_SCREEN_H) dy = (int)NANO_SCREEN_H - 1;
+            if (g_orient == NANO_ORIENT_LANDSCAPE) {            /* panel (dx, dy) -> logical, see gl2nano.c nano_read */
+                int lx = dy, ly = (int)NANO_SCREEN_W - 1 - dx; dx = lx; dy = ly;
+            } else if (g_orient == NANO_ORIENT_LANDSCAPE_LEFT) {
+                int lx = (int)NANO_SCREEN_H - 1 - dy, ly = dx; dx = lx; dy = ly;
+            }
             out->down = 1;
             out->x = dx;
             out->y = dy;

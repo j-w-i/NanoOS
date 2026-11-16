@@ -84,6 +84,8 @@ NanoOS by Tenspav. Requires the community untethered jailbreak to install.
 
 See [docs/ARCHITECTURE_AND_SDK.md](docs/ARCHITECTURE_AND_SDK.md) for full architecture, memory map, and SDK details.
 
+**Performance work: read [docs/PERFORMANCE.md](docs/PERFORMANCE.md) (techniques, runtime features, build knobs; OpenLara 60 FPS at stock clocks) and [section 7a of the architecture doc](docs/ARCHITECTURE_AND_SDK.md#7a-performance-playbook-read-before-optimising-measured-on-hardware) first.** The 40k-triangle 55 FPS reference (`run227`) uses stock clocks, queued frames, hardware culling, strips and a trivial vertex shader; vertex-program length drives vertex-feed cost; the GPU clock field does not.
+
 - **GLES 2.0 + EGL Reimplementation ([`runtime/gl2/`](runtime/gl2/)):**
   - `gl2api.c` (GLES 2.0 state/API + TSP combiner lowering), `gl2rt.c` (MBX Lite TA/TSP/ISP packet builder), `gl2vsc.c` (GLSL vertex shader -> VGP microcode compiler), `gl2tex.c` (mipmaps & texture formats including PVRTC 4bpp `0x38`), `gl2nano.c` (hardware submit/vsync), and standard `gl*`/`egl*` headers & wrappers under `runtime/gl2/std/` (`GLES2/gl2.h`, `EGL/egl.h`, `gl2std.c`, `egl_nano.c`).
 - **NAND PPN Driver & Storage Stack ([`src/nand.c`](src/nand.c), [`runtime/storage/`](runtime/storage/)):**

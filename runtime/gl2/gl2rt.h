@@ -23,7 +23,18 @@ typedef struct {
     uint32_t rounding_bias; /* zero disabled; otherwise hidden 1/255 colour constant index+1 */
     uint32_t repeat_uv0; /* second combiner samples the first stage's transformed UV */
     uint32_t normal_input; /* active slot1 width; zero keeps legacy FIFO layout */
+    uint32_t uv1_input;    /* floats per vertex in the second UV set / VGP input 4 (0, 2, 3 or 4) */
+    uint32_t uv0_input;    /* floats per vertex in UV0 / VGP input 3: 0 = legacy 2; 3 or 4 when the code reads .z/.w */
+    uint8_t pack_pos, pack_uv1; /* per draw: position as raw short4 (2 words), input 4 as packed ubyte4 (1 word) */
+    uint8_t rotate;             /* landscape window target: 0 none, 1 = 90 deg (home right), 2 = 270 deg (home left); see build_header */
+    uint32_t cused_valid; uint8_t cused[16]; /* constant rows the compiled vertex code reads (bit per index); unread uniform rows are not sent */
+    /* constant record layout cache (build_header): sorted rows and where their values live; rebuilt when
+     * the set of set uniforms, the read rows or the literals change (clay_valid = 0) */
+    uint8_t clay_valid; uint16_t clay_n; uint8_t clay_idx[GL2_MAX_UNI * 4 + 66]; const float *clay_val[GL2_MAX_UNI * 4 + 66];
 } gl2_program;
+void gl2_program_scan_constants(gl2_program *p); /* fill cused from the compiled vertex code */
+#define GL2_UV0W(p) ((p)->uv0_input > 2u ? (p)->uv0_input : 2u)
+#define GL2_VW(p) (((p)->pack_pos ? 2u : 4u) + (p)->normal_input + ((p)->omit_colour ? 0u : 1u) + GL2_UV0W(p) + ((p)->pack_uv1 ? 1u : (p)->uv1_input))
 typedef struct { uint32_t blend, src, dst, depth_test, depth_func, depth_write; } gl2_state;   /* GL enums */
 /* Zero preserves the legacy ARGB8888 descriptor. Other values are the measured
  * MBX texture-format field, not public GL transfer enums. */

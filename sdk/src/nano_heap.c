@@ -361,13 +361,12 @@ float floorf(float x) { return (float)floor(x); }
 double ceil(double x) { long i = (long)x; return (double)(x > (double)i ? i + 1 : i); }
 float ceilf(float x) { return (float)ceil(x); }
 
-double sqrt(double x) {
-    if (x <= 0.0) return 0.0;
-    double g = x > 1.0 ? x * 0.5 : 1.0;
-    for (int i = 0; i < 24; ++i) g = 0.5 * (g + x / g);
-    return g;
-}
-float sqrtf(float x) { return (float)sqrt(x); }
+/* Hardware VFP square root (vsqrt): this file is built with VFP (app.mk);
+ * startup.s enables the FPU for all apps. The former 24-step Newton loop in
+ * software doubles cost microseconds per call (OpenLara animation: ~13 ms per
+ * frame). Non-positive input still returns 0. */
+double sqrt(double x) { return x <= 0.0 ? 0.0 : __builtin_sqrt(x); }
+float sqrtf(float x) { return x <= 0.0f ? 0.0f : __builtin_sqrtf(x); }
 
 double sin(double x) {
     const double two_pi = 6.28318530717958647692;

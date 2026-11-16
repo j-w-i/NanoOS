@@ -5,17 +5,18 @@
 typedef struct { int f, i, w, hascv, mat; int sw[4]; float cv[4]; } V;           /* f: 0 input 1 const 2 temp 3 zero */
 typedef struct { int op, dst, mask, hi, neg[3]; V s[3]; } Ins;
 enum { MOV = 1, ADD = 2, MAD = 3, MUL = 4, RCP = 5, RSQ = 6, DP3 = 7, DP4 = 8, MIN = 9, MAX = 10, SGE = 12, EX2 = 0x13 };
+extern int vsc_copyprop_enabled;
 static char tk[MAXTOK][TLEN]; static int ntk, tp;
-static struct { char n[TLEN]; V v; int local; } vars[96]; static int nvars;
-typedef struct { char n[TLEN]; int np; char pn[4][TLEN]; int bs,be; } UserFn;
+static struct { char n[TLEN]; V v; int local; } vars[160]; static int nvars;
+typedef struct { char n[TLEN]; int np, is_void; char pn[4][TLEN]; int bs,be; } UserFn;
 static UserFn ufn[8]; static int nufn;
 static int seq(const char*,const char*);static void scpy(char*,const char*,int);static void stmt(void);
-static char scope_o[64][TLEN],scope_n[64][TLEN];static int nscope;static unsigned fnid,fn_serial;
+static char scope_o[128][TLEN],scope_n[128][TLEN];static int nscope;static unsigned fnid,fn_serial;
 static int fn_depth,fn_control,fn_ret,fn_body_end;static V fn_val;
 static const char *map_name(const char*n){for(int i=nscope-1;i>=0;--i)if(seq(scope_o[i],n))return scope_n[i];return n;}
-static void push_scope(const char*o,const char*u){if(nscope<64){scpy(scope_o[nscope],o,TLEN);scpy(scope_n[nscope],u,TLEN);++nscope;}}
+static void push_scope(const char*o,const char*u){if(nscope<128){scpy(scope_o[nscope],o,TLEN);scpy(scope_n[nscope],u,TLEN);++nscope;}}
 static void make_uniq(char*out,const char*name){unsigned s=fn_serial;int p=0;out[p++]='f';char d[12];int n=0;if(!s)d[n++]='0';else{while(s){d[n++]=(char)('0'+s%10);s/=10;}}while(n)out[p++]=d[--n];out[p++]='_';int i=0;while(name[i]&&p<TLEN-2)out[p++]=name[i++];out[p]=0;}
-static struct { char n[TLEN]; int w, slot; } outs[8]; static int nouts;
+static struct { char n[TLEN]; int w, slot; V val; } outs[8]; static int nouts;
 static vsc_result *R; static int nc, nreg, ncode, written_pos, err_flag;
 static Ins code[VSC_MAX_INSTR];
 static V position_value;
@@ -134,10 +135,10 @@ static V call(const char *name, V *a, int n) {
         int save_tp = tp, save_nv = nvars, save_ns = nscope, save_depth = fn_depth, save_ctrl = fn_control, save_ret = fn_ret, save_end = fn_body_end;
         unsigned save_serial = fn_serial; V save_val = fn_val;
         fn_serial = serial;
-        for (int p = 0; p < n; ++p) { if (nvars >= 48) { fail("too many function locals"); goto fn_done; } char uniq[TLEN]; make_uniq(uniq, ufn[fi].pn[p]); push_scope(ufn[fi].pn[p], uniq); scpy(vars[nvars].n, uniq, TLEN); vars[nvars].v = a[p]; vars[nvars].local = 1; ++nvars; }
+        for (int p = 0; p < n; ++p) { if (nvars >= 160) { fail("too many function locals"); goto fn_done; } char uniq[TLEN]; make_uniq(uniq, ufn[fi].pn[p]); push_scope(ufn[fi].pn[p], uniq); scpy(vars[nvars].n, uniq, TLEN); vars[nvars].v = a[p]; vars[nvars].local = 1; ++nvars; }
         tp = ufn[fi].bs; fn_depth++; fn_control = 0; fn_ret = 0; fn_body_end = ufn[fi].be;
         while (tp < ufn[fi].be && !fn_ret && !err_flag) stmt();
-        if (!fn_ret) { fail("function body must return a value"); goto fn_done; }
+        if (!ufn[fi].is_void && !fn_ret) { fail("function body must return a value"); goto fn_done; }
         { V r = fn_val;
           tp = save_tp; nvars = save_nv; nscope = save_ns; fn_depth = save_depth; fn_control = save_ctrl; fn_ret = save_ret; fn_body_end = save_end; fn_serial = save_serial; fn_val = save_val;
           return r; }
@@ -217,6 +218,13 @@ static V call(const char *name, V *a, int n) {
     }
     if (seq(name, "cross")) {
         if (n != 2 || a[0].w != 3 || a[1].w != 3) { fail("cross needs two vec3"); return z; }
+        if (vsc_copyprop_enabled) {
+            /* Vector form: a.yzx*b.zxy - a.zxy*b.yzx (same per-lane operations as the
+             * scalar form; 2 instructions after MAD fusion instead of 9). */
+            int i1[3] = {1, 2, 0}, i2[3] = {2, 0, 1};
+            V a1 = swz(a[0], i1, 3), b2 = swz(a[1], i2, 3), a2 = swz(a[0], i2, 3), b1 = swz(a[1], i1, 3);
+            return binop('-', binop('*', a1, b2), binop('*', a2, b1));
+        }
         int ix[3][1] = {{0},{1},{2}}; V ax = swz(a[0], ix[0], 1), ay = swz(a[0], ix[1], 1), az = swz(a[0], ix[2], 1);
         V bx = swz(a[1], ix[0], 1), by = swz(a[1], ix[1], 1), bz = swz(a[1], ix[2], 1);
         V c[3] = { binop('-', binop('*', ay, bz), binop('*', az, by)),
@@ -254,6 +262,31 @@ static V call(const char *name, V *a, int n) {
         V d = dot_(a[0], a[0]); V s[1] = { d }; V r = tmp(RSQ, s, 1, 1, 0, 0); return binop('*', a[0], r);
     }
     if (seq(name, "exp2")) { if (n != 1) { fail("args"); return z; } return scalar_math(EX2,a[0]); }
+    /* No FRC/FLR on the VGP: round to nearest with the IEEE single trick (x + 1.5*2^23) - 1.5*2^23
+     * (|x| < 2^22), then floor = r - 1 + step(r, x). sin/cos reduce to [-pi, pi] and use the odd
+     * Taylor series to y^11 (max error ~5e-4). */
+    if (seq(name, "floor") || seq(name, "fract") || seq(name, "sin") || seq(name, "cos")) {
+        if (n != 1) { fail("args"); return z; }
+        int w = a[0].w; V x = a[0];
+        #define KV(val) bc(cnst((float[]){ (val) }, 1), w)
+        if (seq(name, "sin") || seq(name, "cos")) {
+            if (seq(name, "cos")) x = binop('+', x, KV(1.5707963267948966f));
+            V t = binop('*', x, KV(0.15915494309189535f));
+            V r = binop('-', binop('+', t, KV(12582912.f)), KV(12582912.f));
+            V y = binop('*', binop('-', t, r), KV(6.283185307179586f));
+            /* bounded even if the hardware rounds differently from IEEE (2 instructions) */
+            { V lo[2] = { y, KV(-3.141592653589793f) }; y = call("max", lo, 2); V hi[2] = { y, KV(3.141592653589793f) }; y = call("min", hi, 2); }
+            V y2 = binop('*', y, y);
+            static const float c[6] = { -2.505210838544172e-08f, 2.7557319223985893e-06f, -0.0001984126984126984f, 0.008333333333333333f, -0.16666666666666666f, 1.f };
+            V p = KV(c[0]);
+            for (int i = 1; i < 6; ++i) p = binop('+', binop('*', p, y2), KV(c[i]));
+            return binop('*', p, y);
+        }
+        V r = binop('-', binop('+', x, KV(12582912.f)), KV(12582912.f));
+        V st[2] = { r, x }; V fl = binop('+', binop('-', r, KV(1.f)), call("step", st, 2));
+        #undef KV
+        return seq(name, "floor") ? fl : binop('-', x, fl);
+    }
     fail("unsupported function"); return z;
 }
 static V post(V v) {
@@ -288,7 +321,8 @@ static V primary(void) {
         fail("unknown array element"); return z;
     }
     if (seq(mt, "gl_Position") && written_pos) return post(position_value);
-    for (int i = nvars - 1; i >= 0; --i) if (seq(vars[i].n, mt)) return post(vars[i].v);
+    for (int i = nvars - 1; i >= 0; --i) if (vars[i].n[0] && seq(vars[i].n, mt)) return post(vars[i].v);
+    for (int i = 0; i < nouts; ++i) if (seq(outs[i].n, mt)) return post(outs[i].val);
     fail("unknown identifier"); return z;
 }
 static V unary(void) {
@@ -375,7 +409,9 @@ static int parse_block(Block *b){
         if(w&&!seq(peek(1),"(")&&!seq(peek(1),".")&&*peek(1)){fail("declarations in if branch unsupported");return 0;}
         char name[TLEN];scpy(name,eat(0),TLEN);
         const char *mn=map_name(name);int li=local_index(mn);
-        if(li>=0&&seq(peek(0),"=")){eat("=");V v=bc(expr(),vars[li].v.w);eat(";");vars[li].v=v;bput_loc(b,li,v);continue;}
+        /* Locals: any assignment form stmt() accepts (=, op=, swizzle masks); both sides of an
+         * if are computed and selected afterwards, so the branch only records the new value. */
+        if(li>=0){--tp;stmt();if(err_flag)return 0;bput_loc(b,li,vars[li].v);continue;}
         if(seq(name,"gl_Position")){
             int mask[4],nm=0;const char*sets[3]={"xyzw","rgba","stpq"};
             if(seq(peek(0),".")){
@@ -431,10 +467,13 @@ static int emit_varying(const char*n,const int*mask,int nm,V v){
     V s=v;for(int k=0;k<4;++k)s.sw[k]=o[k];s.w=4;s.hascv=0;
     emit(MOV,slot,m4,&s,1,0,0);return 1;
 }
-static int parse_if_chain(Block *dst,int allow_outputs){
+static int if_depth;
+static int parse_if_chain_(Block *dst,int allow_outputs);
+static int parse_if_chain(Block *dst,int allow_outputs){++if_depth;int r=parse_if_chain_(dst,allow_outputs);--if_depth;return r;}
+static int parse_if_chain_(Block *dst,int allow_outputs){
     eat("if");eat("(");V c0=snap(cond_expr(),1);eat(")");
     if(c0.w!=1){fail("if condition must be scalar");return 0;}
-    V pre[48];int npre=nvars;for(int i=0;i<npre;++i)pre[i]=vars[i].v;
+    static V pre_stack[4][160];if(if_depth>4){fail("if nesting too deep");return 0;}V *pre=pre_stack[if_depth-1];int npre=nvars;for(int i=0;i<npre;++i)pre[i]=vars[i].v;
     Block blk[8];V cd[8];int nb=0;
     for(int i=0;i<8;++i){blk[i].no=0;blk[i].nl=0;}
     if(!seq(eat(0),"{")){fail("if body must be a block");return 0;}
@@ -454,7 +493,13 @@ static int parse_if_chain(Block *dst,int allow_outputs){
             eat("{");if(!parse_block(&blk[nb]))return 0;nb++;fin=1;break;
         } else { fail("else must be a block or another if"); return 0; }
     }
-    if(!fin){fail("else-if chain requires a final else");return 0;}
+    if(!fin){
+        /* No final else: an implicit empty one keeps the previous values. Locals only; an
+         * output assigned in only some branches has no tracked previous value here. */
+        if(nb>=8){fail("too many else-if branches");return 0;}
+        for(int j=0;j<nb;++j)if(blk[j].no){fail("if without else cannot assign outputs");return 0;}
+        blk[nb].no=0;blk[nb].nl=0;nb++;
+    }
     int nfin=nb-1;
     for(int i=0;i<nvars;++i)if(vars[i].local){
         int any=0;for(int j=0;j<nb;++j)if(bfind_loc(&blk[j],i))any=1;
@@ -541,26 +586,47 @@ static void stmt(void) {
     if (seq(t, "lowp") || seq(t, "mediump") || seq(t, "highp")) { eat(0); t = peek(0); }
     int w = ty_w(t);
     if (w && !seq(peek(1), "(") && !seq(peek(1), ".") && *peek(1)) {
-        eat(0); char name[TLEN]; scpy(name, eat(0), TLEN);
-        if (fn_depth > 0) { char uniq[TLEN]; make_uniq(uniq, name); push_scope(name, uniq); scpy(name, uniq, TLEN); }
-        if(symbol_exists(name)){fail("duplicate local symbol");return;}
-        if (seq(peek(0), "[")) {
-            eat("["); char cb[TLEN]; scpy(cb, eat(0), TLEN); eat("]"); int count = atoi_(cb);
-            if (count < 1 || count > 16 || nvars + count > 48) { fail("bad local array size"); return; }
-            eat(";"); float zero[4] = { 0, 0, 0, 0 };
-            for (int ai = 0; ai < count; ++ai) {
-                char en[TLEN]; int p = 0; while (name[p]) { en[p] = name[p]; ++p; }
-                en[p++] = '['; char dg[8]; int dn = 0, v = ai; if (v == 0) dg[dn++] = '0'; else while (v) { dg[dn++] = (char)('0' + v % 10); v /= 10; }
-                while (dn) en[p++] = dg[--dn];
-                en[p++] = ']'; en[p] = 0;
-                scpy(vars[nvars].n, en, TLEN); vars[nvars].v = cnst(zero, w); vars[nvars].local = 1; ++nvars;
+        eat(0);
+        for (;;) {
+            char name[TLEN]; scpy(name, eat(0), TLEN);
+            if (fn_depth > 0) { char uniq[TLEN]; make_uniq(uniq, name); push_scope(name, uniq); scpy(name, uniq, TLEN); }
+            if (symbol_exists(name)) { fail("duplicate local symbol"); return; }
+            if (seq(peek(0), "[")) {
+                eat("["); char cb[TLEN]; scpy(cb, eat(0), TLEN); eat("]"); int count = atoi_(cb);
+                if (count < 1 || count > 16 || nvars + count > 96) { fail("bad local array size"); return; }
+                eat(";"); float zero[4] = { 0, 0, 0, 0 };
+                for (int ai = 0; ai < count; ++ai) {
+                    char en[TLEN]; int p = 0; while (name[p]) { en[p] = name[p]; ++p; }
+                    en[p++] = '['; char dg[8]; int dn = 0, v = ai; if (v == 0) dg[dn++] = '0'; else while (v) { dg[dn++] = (char)('0' + v % 10); v /= 10; }
+                    while (dn) en[p++] = dg[--dn];
+                    en[p++] = ']'; en[p] = 0;
+                    scpy(vars[nvars].n, en, TLEN); vars[nvars].v = cnst(zero, w); vars[nvars].local = 1; ++nvars;
+                }
+                return;
             }
+            if (nvars >= 160) { fail("too many local symbols"); return; }
+            float zero[4] = { 0, 0, 0, 0 };
+            V v = cnst(zero, w);
+            if (seq(peek(0), "=")) { eat("="); v = bc(expr(), w); }
+            scpy(vars[nvars].n, name, TLEN); vars[nvars].v = v; vars[nvars].local = 1; ++nvars;
+            if (seq(peek(0), ",")) { eat(","); continue; }
+            eat(";");
             return;
         }
-        if(nvars>=48){fail("too many local symbols");return;}eat("="); V v = bc(expr(), w); eat(";");
-        if (nvars < 48) { scpy(vars[nvars].n, name, TLEN); vars[nvars].v = v; vars[nvars].local = 1; ++nvars; } return;
     }
     char n[TLEN]; scpy(n, eat(0), TLEN);
+    if (seq(peek(0), "(")) {
+        eat("("); V a[8]; int na = 0;
+        if (!seq(peek(0), ")")) for (;;) {
+            if (na >= 8) { fail("too many call args"); return; }
+            a[na++] = expr();
+            if (!seq(peek(0), ",")) break;
+            eat(",");
+        }
+        eat(")"); eat(";");
+        (void)call(n, a, na);
+        return;
+    }
     const char *mn = map_name(n);
     if (seq(peek(0), "[")) {
         eat("["); V ix = expr(); eat("]");
@@ -573,7 +639,6 @@ static void stmt(void) {
         for (int i = nvars - 1; i >= 0; --i) if (vars[i].local && seq(vars[i].n, full) && seq(peek(0), "=")) { eat("="); V v = bc(expr(), vars[i].v.w); eat(";"); vars[i].v = v; return; }
         fail("unknown local array element"); return;
     }
-    for (int i = nvars - 1; i >= 0; --i) if (vars[i].local && seq(vars[i].n, mn) && seq(peek(0), "=")) { eat("="); V v = bc(expr(), vars[i].v.w); eat(";"); vars[i].v = v; return; }
     int mask[4], nm = 0; const char *sets[3] = { "xyzw", "rgba", "stpq" };
     if (seq(peek(0), ".")) {
         eat("."); const char *m = eat(0); int set=-1;
@@ -585,10 +650,46 @@ static void stmt(void) {
             set=foundset;mask[nm++]=f;
         }
     }
+    char cop = 0;
+    if ((seq(peek(0), "*") || seq(peek(0), "+") || seq(peek(0), "-") || seq(peek(0), "/")) && seq(peek(1), "=")) {
+        cop = eat(0)[0];
+    }
     eat("=");
+    int li = -1;
+    for (int i = nvars - 1; i >= 0; --i) if (vars[i].local && seq(vars[i].n, mn)) { li = i; break; }
+    if (li >= 0) {
+        V rhs = expr(); eat(";");
+        V *dst = &vars[li].v;
+        if (!nm) {
+            if (cop) rhs = binop(cop, *dst, rhs);
+            *dst = bc(rhs, dst->w);
+        } else {
+            if (rhs.w == 1 && nm > 1) rhs = bc(rhs, nm);
+            if (rhs.w < nm) { fail("width mismatch"); return; }
+            V cur = *dst;
+            if (cop) {
+                V sub = swz(cur, mask, nm);
+                rhs = binop(cop, sub, bc(rhs, nm));
+            }
+            if (rhs.f != 2 || rhs.i >= MAXVTEMP) { V tmpv = tmp(MOV, &rhs, 1, rhs.w, 0, 0); rhs = tmpv; }
+            int t = newtmp();
+            emit(MOV, 16 + t, 15, &cur, 1, 0, 0);
+            int m4 = 0, sw4[4] = { 0, 0, 0, 0 };
+            for (int j = 0; j < nm; ++j) { m4 |= 1 << mask[j]; sw4[mask[j]] = rhs.sw[j]; }
+            V wv = rhs; wv.w = 4; for (int k = 0; k < 4; ++k) wv.sw[k] = sw4[k];
+            emit(MOV, 16 + t, m4, &wv, 1, 0, 0);
+            *dst = mkv(2, t, cur.w);
+        }
+        return;
+    }
     int pos = seq(n, "gl_Position"), oi = pos ? -1 : out_find(n);
     if (!pos && oi < 0) { fail("can only assign to varyings/gl_Position"); return; }
     V v = expr(); eat(";");
+    if (cop) {
+        V base = pos ? (written_pos ? position_value : mkv(3, 0, 4)) : outs[oi].val;
+        if (nm) base = swz(base, mask, nm);
+        v = binop(cop, base, v);
+    }
     int full = pos ? 4 : outs[oi].w, slot = pos ? 0 : outs[oi].slot;
     for(int k=0;k<nm;++k)if(mask[k]>=full){fail("output mask out of range");return;}
     if (!nm) for (int k = 0; k < full; ++k) mask[nm++] = k;
@@ -620,10 +721,160 @@ static void stmt(void) {
         emit(ADD, 5, 1, distances, 2, 0, 0); /* w + z */
         emit(ADD, 5, 2, distances, 2, 0, 1); /* w - z */
         written_pos = 1;
-    } else emit(MOV, slot, m4, &s, 1, 0, 0);
+    } else {
+        int t = newtmp();
+        V prev = outs[oi].val;
+        emit(MOV, 16 + t, 15, &prev, 1, 0, 0);
+        V wv = v; wv.w = 4; for (int k = 0; k < 4; ++k) wv.sw[k] = sw[k];
+        int vm = 0; for (int j = 0; j < nm; ++j) vm |= 1 << mask[j];
+        emit(MOV, 16 + t, vm, &wv, 1, 0, 0);
+        outs[oi].val = mkv(2, t, outs[oi].w);
+        emit(MOV, slot, m4, &s, 1, 0, 0);
+    }
 }
 /* ---- DCE, temp allocation, encoding */
+/* Copy propagation. A full-mask MOV into a temporary that is written exactly
+ * once is a pure alias: its uses read the same values from the MOV's source
+ * (swizzles compose, negation XORs). Applied only when the source is another
+ * single-write temp, a vertex input, or one constant, and only when the user
+ * still has at most one distinct non-temporary operand (the hardware limit this
+ * compiler already respects). The existing dead-code pass then removes the MOV. */
+int vsc_copyprop_enabled = 1;
+static void copy_propagate(void) {
+    static unsigned char ndef[MAXVTEMP];
+    for (int i = 0; i < MAXVTEMP; ++i) ndef[i] = 0;
+    for (int i = 0; i < ncode; ++i) if (code[i].dst >= 16 && code[i].dst - 16 < MAXVTEMP && ndef[code[i].dst - 16] < 2) ++ndef[code[i].dst - 16];
+    for (int i = 0; i < ncode; ++i) {
+        Ins *m = &code[i];
+        if (m->op != MOV || m->dst < 16 || m->mask != 15) continue;
+        int r = m->dst - 16; if (r >= MAXVTEMP || ndef[r] != 1) continue;
+        V src = m->s[0];
+        if (src.f == 3 || src.f > 3) continue;
+        if (src.f == 2 && (src.i >= MAXVTEMP || ndef[src.i] != 1)) continue;
+        for (int j = i + 1; j < ncode; ++j) {
+            Ins *u = &code[j];
+            for (int k = 0; k < 3; ++k) {
+                if (u->s[k].f != 2 || u->s[k].i != r) continue;
+                if (src.f != 2) {
+                    int ok = 1;
+                    for (int q = 0; q < 3; ++q) {
+                        if (q == k || u->s[q].f == 2 || u->s[q].f == 3) continue;
+                        if (u->s[q].f != src.f || u->s[q].i != src.i) ok = 0;
+                    }
+                    if (!ok) continue;
+                }
+                V nv = src; for (int l = 0; l < 4; ++l) nv.sw[l] = src.sw[u->s[k].sw[l]];
+                nv.w = u->s[k].w;
+                u->s[k] = nv; u->neg[k] ^= m->neg[0];
+                if (src.f == 1) u->hi = src.i >> 4;
+            }
+        }
+    }
+}
+/* Scalar-into-lane folding. "OP S.x <- ..." whose only use is "MOV D.<lane> <- S.x"
+ * can write D.<lane> directly: the write mask does the placement. The producer
+ * must be lane-uniform (every non-zero source swizzles the same component into
+ * all four lanes, or the op ignores the destination lane), have no negation on
+ * the MOV, and nothing between the two instructions may read or write D. */
+static void fold_scalar_lanes(void) {
+    static unsigned char ndef[MAXVTEMP], nuse[MAXVTEMP]; static int defat[MAXVTEMP];
+    for (int i = 0; i < MAXVTEMP; ++i) { ndef[i] = nuse[i] = 0; defat[i] = -1; }
+    for (int i = 0; i < ncode; ++i) {
+        if (code[i].dst >= 16 && code[i].dst - 16 < MAXVTEMP) { int r = code[i].dst - 16; if (ndef[r] < 2) ++ndef[r]; defat[r] = i; }
+        for (int k = 0; k < 3; ++k) if (code[i].s[k].f == 2 && code[i].s[k].i < MAXVTEMP && nuse[code[i].s[k].i] < 2) ++nuse[code[i].s[k].i];
+    }
+    for (int i = 0; i < ncode; ++i) {
+        Ins *m = &code[i];
+        if (m->op != MOV || m->dst < 16 || m->neg[0] || m->s[0].f != 2 || !m->mask) continue;
+        int mk = m->mask;
+        int S = m->s[0].i; if (S >= MAXVTEMP || ndef[S] != 1 || nuse[S] != 1) continue;
+        int pi = defat[S]; if (pi < 0 || pi >= i) continue;
+        Ins *pr = &code[pi];
+        int uniform = pr->op == DP3 || pr->op == DP4 || pr->op == RCP || pr->op == RSQ || pr->op == EX2;
+        int lanewise = pr->op == ADD || pr->op == MUL || pr->op == MAD || pr->op == MIN || pr->op == MAX || pr->op == SGE || pr->op == MOV;
+        if (!uniform && !lanewise) continue;
+        int ok = 1;
+        for (int k = 0; k < 4 && ok; ++k) {
+            if (!(mk & (1 << k))) continue;
+            int j = m->s[0].sw[k];                       /* lane of S this lane copies */
+            if (!(pr->mask & (1 << j))) { ok = 0; break; }
+            if (lanewise) for (int q = 0; q < 3; ++q) { V *v = &pr->s[q]; if (v->f == 3) continue; if (v->sw[k] != v->sw[j]) ok = 0; }
+        }
+        if (!ok) continue;
+        int D = m->dst - 16;
+        for (int j = pi + 1; j < i && ok; ++j) {
+            if (code[j].dst == m->dst) ok = 0;
+            for (int k = 0; k < 3; ++k) if (code[j].s[k].f == 2 && code[j].s[k].i == D) ok = 0;
+        }
+        if (!ok) continue;
+        pr->dst = m->dst; pr->mask = mk;
+        m->dst = 16 + MAXVTEMP - 1; m->mask = 0;          /* unread scratch temp: removed by DCE */
+        ++ndef[D];
+    }
+}
+/* Dead store: a full-mask write to a temporary that is overwritten by another
+ * full-mask write before any read is never observed. */
+static void drop_dead_full_writes(void) {
+    for (int i = 0; i < ncode; ++i) {
+        Ins *w = &code[i];
+        if (w->dst < 16 || w->mask != 15 || w->dst - 16 >= MAXVTEMP - 1) continue;
+        for (int j = i + 1; j < ncode; ++j) {
+            int read = 0; for (int k = 0; k < 3; ++k) if (code[j].s[k].f == 2 && code[j].s[k].i == w->dst - 16) read = 1;
+            if (read) break;
+            if (code[j].dst == w->dst) { if (code[j].mask == 15) { w->dst = 16 + MAXVTEMP - 1; w->mask = 0; } break; }
+        }
+    }
+}
+/* MUL feeding ADD -> MAD. "MUL T = a*b" (single definition, single use) followed
+ * by "ADD d = T + c" becomes "MAD d = a*b + c". The product's sources must not
+ * change in between, lane swizzles must match, and the result keeps the
+ * one-distinct-constant rule. Differs from separate MUL+ADD by at most one
+ * rounding step. */
+static void fuse_mad(void) {
+    static unsigned char ndef[MAXVTEMP], nuse[MAXVTEMP]; static int defat[MAXVTEMP];
+    for (int i = 0; i < MAXVTEMP; ++i) { ndef[i] = nuse[i] = 0; defat[i] = -1; }
+    for (int i = 0; i < ncode; ++i) {
+        if (code[i].dst >= 16 && code[i].dst - 16 < MAXVTEMP) { int r = code[i].dst - 16; if (ndef[r] < 2) ++ndef[r]; defat[r] = i; }
+        for (int k = 0; k < 3; ++k) if (code[i].s[k].f == 2 && code[i].s[k].i < MAXVTEMP && nuse[code[i].s[k].i] < 2) ++nuse[code[i].s[k].i];
+    }
+    for (int i = 0; i < ncode; ++i) {
+        Ins *ad = &code[i];
+        if (ad->op != ADD || !ad->mask) continue;
+        for (int t = 0; t < 2; ++t) {
+            V *tv = &ad->s[t], *cv = &ad->s[1 - t];
+            if (tv->f != 2 || tv->i >= MAXVTEMP || ndef[tv->i] != 1 || nuse[tv->i] != 1) continue;
+            int pi = defat[tv->i]; if (pi < 0 || pi >= i) continue;
+            Ins *mu = &code[pi];
+            if (mu->op != MUL || mu->neg[0] || mu->neg[1]) { if (mu->op != MUL) continue; }
+            int ok = 1;
+            for (int l = 0; l < 4 && ok; ++l) {
+                if (!(ad->mask & (1 << l))) continue;
+                int j = tv->sw[l];
+                if (!(mu->mask & (1 << j))) { ok = 0; break; }
+                for (int q = 0; q < 2; ++q) { V *v = &mu->s[q]; if (v->f != 3 && v->sw[l] != v->sw[j]) ok = 0; }
+            }
+            if (!ok) continue;
+            /* operand rules after fusion: a, b, c non-temp operands must name at most one distinct register */
+            V a = mu->s[0], b = mu->s[1], c = *cv;
+            int nf = -1, ni = -1, bad = 0;
+            V *ops[3] = { &a, &b, &c };
+            for (int q = 0; q < 3; ++q) if (ops[q]->f == 0 || ops[q]->f == 1) { if (nf < 0) { nf = ops[q]->f; ni = ops[q]->i; } else if (nf != ops[q]->f || ni != ops[q]->i) bad = 1; }
+            if (bad) continue;
+            /* sources of the product must be unchanged between the MUL and the ADD */
+            for (int j = pi + 1; j < i && ok; ++j) for (int q = 0; q < 2; ++q) if (mu->s[q].f == 2 && code[j].dst == 16 + mu->s[q].i) ok = 0;
+            if (!ok) continue;
+            if (ad->neg[t] ) { /* -(a*b) + c: fold into a's negation */ }
+            int na = mu->neg[0] ^ ad->neg[t], nb = mu->neg[1], nc = ad->neg[1 - t];
+            ad->op = MAD; ad->s[0] = a; ad->s[1] = b; ad->s[2] = c;
+            ad->neg[0] = na; ad->neg[1] = nb; ad->neg[2] = nc;
+            ad->hi = 0; for (int q = 0; q < 3; ++q) if (ad->s[q].f == 1) ad->hi = ad->s[q].i >> 4;
+            mu->dst = 16 + MAXVTEMP - 1; mu->mask = 0;
+            break;
+        }
+    }
+}
 static int finish(void) {
+    if (vsc_copyprop_enabled) { copy_propagate(); fold_scalar_lanes(); drop_dead_full_writes(); fuse_mad(); }
     static char live[MAXVTEMP]; static int keep[VSC_MAX_INSTR]; int nk = 0;
     for (int i = 0; i < MAXVTEMP; ++i) live[i] = 0;
     for (int i = ncode - 1; i >= 0; --i) {
@@ -978,22 +1229,22 @@ int gl2vsc_compile(const char *src, vsc_result *out) {
                 if (R->nattr < 8) { scpy(R->attr_name[R->nattr], name, TLEN); R->attr_slot[R->nattr] = (uint8_t)slot; R->attr_w[R->nattr] = (uint8_t)w; ++R->nattr; }
             } else {
                 eat(";");
-                static const char *on[] = { "vColor", "vFog", "vTexCoord", "vTexCoord1" }; static const int os[] = { 1, 2, 3, 4 };
-                int slot = -1; for (int i = 0; i < 4; ++i) if (seq(name, on[i])) slot = os[i];
+                static const char *on[] = { "vColor", "vDiffuse", "vFog", "vTexCoord", "vTexCoord1" }; static const int os[] = { 1, 1, 2, 3, 4 };
+                int slot = -1; for (int i = 0; i < 5; ++i) if (seq(name, on[i])) slot = os[i];
                 int used[8] = { 0 }; for (int i = 0; i < nouts; ++i) used[outs[i].slot] = 1;
                 if (slot >= 0 && used[slot]) slot = -1;
                 if (slot < 0) {
-                    const int *pref = (w == 4 || w == 3) ? (const int[]){ 1, 2, 3, 4, 6, 7, -1 } : w == 2 ? (const int[]){ 3, 4, 1, 2, 6, 7, -1 } : (const int[]){ 2, 1, 3, 4, 6, 7, -1 };
+                    const int *pref = (w == 4 || w == 3) ? (const int[]){ 6, 7, 1, 2, 4, 3, -1 } : w == 2 ? (const int[]){ 3, 4, 6, 7, 1, 2, -1 } : (const int[]){ 2, 6, 7, 1, 4, 3, -1 };
                     for (int i = 0; pref[i] >= 0; ++i) if (!used[pref[i]]) { slot = pref[i]; break; }
                     if (slot < 0) { fail("no free output slot"); break; }
                 }
                 if (nouts >= 8) { fail("too many varyings"); break; }
-                scpy(outs[nouts].n, name, TLEN); outs[nouts].w = w; outs[nouts].slot = slot; ++nouts;
+                scpy(outs[nouts].n, name, TLEN); outs[nouts].w = w; outs[nouts].slot = slot; outs[nouts].val = mkv(3, 0, w); ++nouts;
                 if (R->nvary < 8) { scpy(R->vary_name[R->nvary], name, TLEN); R->vary_slot[R->nvary] = (uint8_t)slot; R->vary_w[R->nvary] = (uint8_t)w; ++R->nvary; }
             }
-        } else if (ty_w(t) && !seq(peek(0), "(") && !seq(t, "void")) {
+        } else if ((ty_w(t) || (seq(t, "void") && !seq(peek(0), "main"))) && !seq(peek(0), "(")) {
             if (nufn >= 8) { fail("too many user functions"); break; }
-            scpy(ufn[nufn].n, eat(0), TLEN); eat("(");
+            scpy(ufn[nufn].n, eat(0), TLEN); ufn[nufn].is_void = seq(t, "void"); eat("(");
             int np = 0;
             while (!seq(peek(0), ")")) {
                 if (np >= 4) { fail("too many function parameters"); break; }
@@ -1014,4 +1265,225 @@ int gl2vsc_compile(const char *src, vsc_result *out) {
     if (err_flag) return -1;
     if (!written_pos) { fail("gl_Position not written"); return -2; }
     return finish();
+}
+/* GPU-only pruning of encoded vertex code (component-level dead-code removal).
+ * live_out: bit d = output register d is read downstream. Instructions whose
+ * written lanes are never read (by a later instruction, or as a live output at
+ * program end) are removed; partly dead writes keep only their live lanes.
+ * Straight-line code on physical registers: outputs 0..15, temps 16..31.
+ * Returns the new instruction count (code compacted in place). */
+static unsigned vsc_reads(uint32_t op, unsigned need, uint32_t sw) {
+    unsigned r = 0;
+    if (op == DP3) { for (unsigned j = 0; j < 3; ++j) r |= 1u << (sw >> (2 * j) & 3u); return r; }
+    if (op == DP4 || op == RCP || op == RSQ || op == EX2) { for (unsigned j = 0; j < 4; ++j) r |= 1u << (sw >> (2 * j) & 3u); return r; }
+    for (unsigned l = 0; l < 4; ++l) if (need & (1u << l)) r |= 1u << (sw >> (2 * l) & 3u);
+    return r;
+}
+uint32_t vsc_prune(uint32_t (*code)[2], uint32_t n, uint32_t live_out) {
+    static uint8_t keep[VSC_MAX_INSTR];
+    uint8_t live[32];
+    if (n > VSC_MAX_INSTR) return n;
+    for (unsigned r = 0; r < 32; ++r) live[r] = r < 16 && (live_out >> r & 1u) ? 15u : 0u;
+    for (int i = (int)n - 1; i >= 0; --i) {
+        uint32_t A = code[i][0], B = code[i][1], op = A & 31u, dst = B >> 26, mask = B >> 22 & 15u;
+        unsigned known = op == MOV || op == ADD || op == MAD || op == MUL || op == RCP || op == RSQ || op == DP3 || op == DP4 || op == MIN || op == MAX || op == SGE || op == EX2;
+        if (!known || dst >= 32) {            /* unknown encoding: keep it and treat every source as read */
+            keep[i] = 1;
+            for (unsigned k = 0; k < 3; ++k) if ((B >> (16 + 2 * k) & 3u) == 2u) live[16 + (B >> (4 * k) & 15u)] = 15u;
+            continue;
+        }
+        unsigned need = mask & live[dst];
+        keep[i] = need != 0;
+        if (!need) continue;
+        live[dst] &= (uint8_t)~mask;
+        if (need != mask) code[i][1] = (B & ~(15u << 22)) | (uint32_t)need << 22;
+        unsigned nsrc = op == MAD ? 3u : (op == MOV || op == RCP || op == RSQ || op == EX2) ? 1u : 2u;
+        for (unsigned k = 0; k < nsrc; ++k) {
+            if ((B >> (16 + 2 * k) & 3u) != 2u) continue;
+            unsigned reg = 16u + (B >> (4 * k) & 15u);
+            live[reg] |= (uint8_t)vsc_reads(op, need, A >> (8 + 8 * k) & 0xffu);
+        }
+    }
+    uint32_t m = 0;
+    for (uint32_t i = 0; i < n; ++i) if (keep[i]) { code[m][0] = code[i][0]; code[m][1] = code[i][1]; ++m; }
+    return m;
+}
+
+/* ---- vsc_optimize: copy propagation + copy retargeting on native VGP code ----
+ * The compiler builds most vectors in scratch registers and copies them into place
+ * (OpenLara's lit room program: 36 of 89 instructions were MOVs). Two lane-exact
+ * rewrites, then vsc_prune deletes what became dead:
+ *  forward:  MOV D.m <- S.sw ; later reads of D lanes that still hold the copy read S
+ *            (S unchanged meanwhile) with the swizzle composed and the negation folded;
+ *  backward: p: T <- op ... ; MOV D.m <- T.sw where p's result is read only by that MOV:
+ *            p writes D directly (component-wise ops get their source swizzles permuted,
+ *            broadcast ops DP3/DP4/RCP/RSQ/EX2 just change destination).
+ * Hardware rules kept: at most one distinct constant row and one distinct input
+ * register per instruction; no new scratch registers; zero operands are not moved
+ * into other instructions. Outputs (dst < 16) are only retargeted if allow_out. */
+typedef struct { unsigned op, dst, mask, f[3], idx[3], sw[3][4], neg[3]; } vins;
+static unsigned v_nsrc(unsigned op) { return op == MAD ? 3u : (op == MOV || op == RCP || op == RSQ || op == EX2) ? 1u : 2u; }
+static int v_bcast(unsigned op) { return op == DP3 || op == DP4 || op == RCP || op == RSQ || op == EX2; }
+static int v_known(unsigned op) { return op == MOV || op == ADD || op == MAD || op == MUL || op == RCP || op == RSQ || op == DP3 || op == DP4 || op == MIN || op == MAX || op == SGE || op == EX2; }
+static void v_dec(const uint32_t *c, vins *v) {
+    uint32_t A = c[0], B = c[1]; v->op = A & 31u; v->dst = B >> 26; v->mask = B >> 22 & 15u;
+    for (unsigned k = 0; k < 3; ++k) {
+        v->f[k] = B >> (16 + 2 * k) & 3u; v->idx[k] = B >> (4 * k) & 15u;
+        if (v->f[k] == 1u) v->idx[k] |= (B >> 12 & 15u) << 4;
+        for (unsigned l = 0; l < 4; ++l) v->sw[k][l] = A >> (8 + 8 * k + 2 * l) & 3u;
+        v->neg[k] = A >> (5 + k) & 1u;
+    }
+}
+static int v_enc(const vins *v, uint32_t *c) {
+    uint32_t A = v->op, B = v->dst << 26 | v->mask << 22; int chi = -1;
+    for (unsigned k = 0; k < 3; ++k) {
+        unsigned sw = 0; for (unsigned l = 0; l < 4; ++l) sw |= v->sw[k][l] << (2 * l);
+        A |= sw << (8 + 8 * k) | v->neg[k] << (5 + k);
+        B |= v->f[k] << (16 + 2 * k);
+        if (k < 3) {
+            if (v->f[k] == 1u && k < v_nsrc(v->op)) { if (chi >= 0 && (unsigned)chi != v->idx[k] >> 4) return -1; chi = (int)(v->idx[k] >> 4); }
+            if (k < 2 || v->f[k] != 1u || 1) B |= (v->idx[k] & 15u) << (4 * k);
+        }
+    }
+    if (chi >= 0) B = (B & ~(15u << 12)) | (uint32_t)chi << 12;
+    c[0] = A; c[1] = B; return 0;
+}
+static unsigned v_reads(const vins *v, unsigned k) {        /* lanes of source k read */
+    unsigned sw = 0; for (unsigned l = 0; l < 4; ++l) sw |= v->sw[k][l] << (2 * l);
+    return vsc_reads(v->op, v->mask, sw);
+}
+static unsigned v_reg(const vins *v, unsigned k) { return v->f[k] == 2u ? 16u + v->idx[k] : v->f[k] == 0u ? 100u + v->idx[k] : v->f[k] == 1u ? 200u + v->idx[k] : 999u; }
+static int v_rules_ok(const vins *v) {                       /* one distinct constant row and input per instruction */
+    int c = -1, in = -1;
+    for (unsigned k = 0; k < v_nsrc(v->op); ++k) {
+        if (v->f[k] == 1u) { if (c >= 0 && (unsigned)c != v->idx[k]) return 0; c = (int)v->idx[k]; }
+        if (v->f[k] == 0u) { if (in >= 0 && (unsigned)in != v->idx[k]) return 0; in = (int)v->idx[k]; }
+    }
+    return 1;
+}
+static int v_fwd(vins *v, unsigned n) {
+    int changed = 0;
+    for (unsigned m = 0; m < n; ++m) {
+        vins *c = &v[m];
+        if (c->op != MOV || c->dst < 16 || c->f[0] == 3u) continue;
+        unsigned D = c->dst, S = v_reg(c, 0), held = c->mask;   /* D lanes still holding the copy */
+        unsigned sdirty = 0;                                     /* S lanes overwritten since m */
+        for (unsigned j = m + 1; j < n && held; ++j) {
+            vins *u = &v[j];
+            if (!v_known(u->op)) break;
+            for (unsigned k = 0; k < v_nsrc(u->op); ++k) {
+                if (v_reg(u, k) != D) continue;
+                unsigned L = v_reads(u, k); if (!L || (L & ~held)) continue;
+                unsigned sl = 0; for (unsigned l = 0; l < 4; ++l) if (L >> l & 1u) sl |= 1u << c->sw[0][l];
+                if (sl & sdirty) continue;
+                vins t = *u; t.f[k] = c->f[0]; t.idx[k] = c->idx[0]; t.neg[k] ^= c->neg[0];
+                for (unsigned l = 0; l < 4; ++l) t.sw[k][l] = c->sw[0][u->sw[k][l]];
+                if (!v_rules_ok(&t)) continue;
+                *u = t; changed = 1;
+            }
+            if (u->dst == D) held &= ~u->mask;
+            if (S >= 16 && S < 32 && u->dst == S) sdirty |= u->mask;
+        }
+    }
+    return changed;
+}
+static int v_back(vins *v, unsigned *pn, int allow_out) {
+    unsigned n = *pn; int changed = 0;
+    for (unsigned m = 0; m < n; ++m) {
+        vins *c = &v[m];
+        if (c->op != MOV || c->f[0] != 2u || c->neg[0]) continue;
+        if (c->dst < 16 && !allow_out) continue;
+        unsigned T = 16u + c->idx[0], D = c->dst, M = c->mask, R = 0;
+        for (unsigned l = 0; l < 4; ++l) if (M >> l & 1u) R |= 1u << c->sw[0][l];
+        int p = -1; unsigned cover = 0;                         /* last writer of the lanes R */
+        for (int j = (int)m - 1; j >= 0; --j) { if (v[j].dst == T && (v[j].mask & R & ~cover)) { if (p < 0) p = j; else if ((unsigned)j != (unsigned)p) { p = -2; break; } cover |= v[j].mask & R; } if ((cover & R) == R) break; }
+        if (p < 0 || (cover & R) != R) continue;
+        vins *q = &v[p];
+        if (!v_known(q->op) || (q->mask & R) != R) continue;
+        int ok = 1;
+        /* p's result (all lanes it writes to T) is read only by m */
+        unsigned alive = q->mask;
+        for (unsigned j = (unsigned)p + 1; j < n && alive && ok; ++j) {
+            const vins *u = &v[j];
+            if (!v_known(u->op)) { ok = 0; break; }
+            for (unsigned k = 0; k < v_nsrc(u->op); ++k) if (v_reg(u, k) == T && (v_reads(u, k) & alive) && j != m) ok = 0;
+            if (u->dst == T) alive &= ~u->mask;
+        }
+        if (!ok) continue;
+        /* D lanes M neither read nor written between p and m */
+        for (unsigned j = (unsigned)p + 1; j < m && ok; ++j) {
+            const vins *u = &v[j];
+            if (u->dst == D && (u->mask & M)) ok = 0;
+            for (unsigned k = 0; k < v_nsrc(u->op); ++k) if (v_reg(u, k) == D && (v_reads(u, k) & M)) ok = 0;
+        }
+        if (!ok) continue;
+        vins t = *q; t.dst = D; t.mask = M;
+        if (!v_bcast(q->op)) for (unsigned k = 0; k < 3; ++k) for (unsigned l = 0; l < 4; ++l) t.sw[k][l] = (M >> l & 1u) ? q->sw[k][c->sw[0][l]] : q->sw[k][l];
+        else if (q->op != DP3 && q->op != DP4) { /* scalar ops read lane w of the source swizzle: unchanged */ }
+        v[p] = t;
+        for (unsigned j = m; j + 1 < n; ++j) v[j] = v[j + 1];
+        --n; --m; changed = 1;
+    }
+    *pn = n; return changed;
+}
+uint32_t vsc_optimize(uint32_t (*code)[2], uint32_t n, uint32_t live_out, int allow_out) {
+    static vins v[VSC_MAX_INSTR];
+    if (n > VSC_MAX_INSTR) return n;
+    for (unsigned it = 0; it < 6; ++it) {
+        for (unsigned i = 0; i < n; ++i) v_dec(code[i], &v[i]);
+        int ch = v_fwd(v, n);
+        unsigned nn = n; ch |= v_back(v, &nn, allow_out);
+        static uint32_t tmpc[VSC_MAX_INSTR][2];
+        for (unsigned i = 0; i < nn; ++i) if (v_enc(&v[i], tmpc[i])) return n;   /* should not happen: keep original */
+        for (unsigned i = 0; i < nn; ++i) { code[i][0] = tmpc[i][0]; code[i][1] = tmpc[i][1]; }
+        n = vsc_prune(code, nn, live_out);
+        if (!ch) break;
+    }
+    return n;
+}
+
+/* ---- vsc_fold_zero: specialise native code for uniform lanes that are exactly zero ----
+ * zero_rows[ci] = lanes of constant row ci known to be 0.0. Known-zero lanes are
+ * propagated (x*0 = 0, x+0 = x, a*b+c with a zero product = c, dot of zero = 0);
+ * instructions whose written lanes are all zero become MOV dst <- zero operand (the
+ * form prune_native already uses on hardware), ADD/MAD with a dead term become MOVs,
+ * then vsc_optimize forwards the copies and prunes everything that only fed zeros
+ * (OpenLara rooms: lights 1-3 at colour 0 make their whole lighting chain dead).
+ * Zero operands are never placed in non-MOV instructions. */
+uint32_t vsc_fold_zero(uint32_t (*code)[2], uint32_t n, const uint8_t *zero_rows, uint32_t live_out, int allow_out) {
+    static vins v[VSC_MAX_INSTR];
+    if (n > VSC_MAX_INSTR) return n;
+    uint8_t zr[32]; for (unsigned r = 0; r < 32; ++r) zr[r] = 0;   /* known-zero lanes of outputs (0..15) and temps (16..31) */
+    for (unsigned i = 0; i < n; ++i) {
+        v_dec(code[i], &v[i]); vins *u = &v[i];
+        if (!v_known(u->op) || u->dst >= 32) return n;
+        unsigned zl[3] = {0, 0, 0};                                  /* lanes (after swizzle) of each source known zero */
+        for (unsigned k = 0; k < v_nsrc(u->op); ++k) {
+            unsigned regz = u->f[k] == 3u ? 15u : u->f[k] == 1u ? (u->idx[k] < 256u ? zero_rows[u->idx[k]] : 0u) : u->f[k] == 2u ? zr[16 + u->idx[k]] : 0u;
+            for (unsigned l = 0; l < 4; ++l) if (regz >> u->sw[k][l] & 1u) zl[k] |= 1u << l;
+        }
+        unsigned M = u->mask, res = 0;
+        switch (u->op) {
+        case MOV: res = zl[0]; break;
+        case MUL: res = zl[0] | zl[1]; break;
+        case ADD: res = zl[0] & zl[1];
+            if ((zl[0] & 15u) != 15u && (zl[1] & M) == M) { u->op = MOV; }
+            else if ((zl[0] & M) == M && (zl[1] & M) != M) { u->op = MOV; u->f[0] = u->f[1]; u->idx[0] = u->idx[1]; u->neg[0] = u->neg[1]; for (unsigned l = 0; l < 4; ++l) u->sw[0][l] = u->sw[1][l]; }
+            break;
+        case MAD: { unsigned prod = zl[0] | zl[1]; res = prod & zl[2];
+            if ((prod & M) == M) { u->op = MOV; u->f[0] = u->f[2]; u->idx[0] = u->idx[2]; u->neg[0] = u->neg[2]; for (unsigned l = 0; l < 4; ++l) u->sw[0][l] = u->sw[2][l]; }
+            break; }
+        case DP3: { unsigned t = zl[0] | zl[1]; if ((t & 7u) == 7u) res = 15u; break; }
+        case DP4: { unsigned t = zl[0] | zl[1]; if ((t & 15u) == 15u) res = 15u; break; }
+        case MIN: case MAX: res = zl[0] & zl[1]; break;
+        default: res = 0; break;
+        }
+        if ((res & M) == M && !(u->op == MOV && u->f[0] == 3u)) {   /* all written lanes are zero */
+            u->op = MOV; u->f[0] = 3u; u->idx[0] = 0; u->neg[0] = 0; for (unsigned l = 0; l < 4; ++l) u->sw[0][l] = l;
+        }
+        if (u->op == MOV) for (unsigned k = 1; k < 3; ++k) { u->f[k] = 3u; u->idx[k] = 0; u->neg[k] = 0; for (unsigned l = 0; l < 4; ++l) u->sw[k][l] = l; }
+        zr[u->dst] = (uint8_t)((zr[u->dst] & ~M) | (res & M));
+    }
+    for (unsigned i = 0; i < n; ++i) if (v_enc(&v[i], code[i])) return n;
+    return vsc_optimize(code, n, live_out, allow_out);
 }

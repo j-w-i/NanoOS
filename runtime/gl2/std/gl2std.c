@@ -16,6 +16,12 @@ static int std_uniform_at(gl2_prog_obj*o,uint32_t i,const char**name,uint32_t*w,
     i-=o->vs.nuni;if(!o->fs||i>=o->fs->nuniform)return 0;*name=o->fs->uniform_names[i];*w=o->fs->uniform_widths[i];*cnt=1;return 1;
 }
 static gl2std_frame_fn g_ensure,g_changed;
+/* Optional per-call profiling: set gl2std_clock to a microsecond counter. */
+uint32_t (*gl2std_clock)(void);uint32_t gl2std_prof[8];
+extern uint32_t (*gl2_prof_clock)(void);
+void gl2std_set_clock(uint32_t (*f)(void)){gl2std_clock=f;gl2_prof_clock=f;}
+#define PROF_BEGIN uint32_t pt0=gl2std_clock?gl2std_clock():0
+#define PROF_END(i) do{if(gl2std_clock)gl2std_prof[i]+=gl2std_clock()-pt0;}while(0)
 void gl2std_set_context(struct gl2_ctx *c){g_ctx=c;}
 void gl2std_set_frame_hooks(gl2std_frame_fn e,gl2std_frame_fn c){g_ensure=e;g_changed=c;}
 static void copylog(const char *s,GLsizei n,GLsizei *len,GLchar *out){
@@ -26,7 +32,7 @@ static void copylog(const char *s,GLsizei n,GLsizei *len,GLchar *out){
 void glClearColor(GLfloat r,GLfloat g,GLfloat b,GLfloat a){gl2x_glClearColor(g_ctx,r,g,b,a);}
 void glClearDepthf(GLclampf d){gl2x_glClearDepthf(g_ctx,d);}
 void glClearStencil(GLint s){gl2x_glClearStencil(g_ctx,s);}
-void glClear(GLbitfield mask){if(g_ensure)g_ensure();gl2x_glClear(g_ctx,mask);}
+void glClear(GLbitfield mask){PROF_BEGIN;if(g_ensure)g_ensure();gl2x_glClear(g_ctx,mask);PROF_END(6);}
 void glEnable(GLenum cap){gl2x_glEnable(g_ctx,cap);}
 void glDisable(GLenum cap){gl2x_glDisable(g_ctx,cap);}
 void glViewport(GLint x,GLint y,GLsizei w,GLsizei h){gl2x_glViewport(g_ctx,x,y,w,h);}
@@ -39,6 +45,8 @@ void glColorMask(GLboolean r,GLboolean g,GLboolean b,GLboolean a){gl2x_glColorMa
 void glScissor(GLint x,GLint y,GLsizei w,GLsizei h){gl2x_glScissor(g_ctx,x,y,w,h);}
 void glPixelStorei(GLenum p,GLint v){gl2x_glPixelStorei(g_ctx,p,v);}
 GLenum glGetError(void){return (GLenum)gl2x_glGetError(g_ctx);}
+unsigned gl2std_error_aux(void){return (unsigned)gl2_error_aux(g_ctx);}
+unsigned gl2std_error_site(void){return (unsigned)gl2_error_site(g_ctx);}
 const GLubyte *glGetString(GLenum n){return (const GLubyte *)gl2x_glGetString(g_ctx,n);}
 void glGetIntegerv(GLenum p,GLint *v){gl2x_glGetIntegerv(g_ctx,p,v);}
 void glGetFloatv(GLenum p,GLfloat *v){gl2x_glGetFloatv(g_ctx,p,v);}
@@ -58,7 +66,7 @@ GLuint glCreateProgram(void){return gl2x_glCreateProgram(g_ctx);}
 void glAttachShader(GLuint p,GLuint sh){gl2x_glAttachShader(g_ctx,p,sh);}
 void glDetachShader(GLuint p,GLuint sh){gl2x_glDetachShader(g_ctx,p,sh);}
 void glLinkProgram(GLuint p){gl2x_glLinkProgram(g_ctx,p);}
-void glUseProgram(GLuint p){gl2x_glUseProgram(g_ctx,p);}
+void glUseProgram(GLuint p){PROF_BEGIN;gl2x_glUseProgram(g_ctx,p);PROF_END(2);}
 void glDeleteProgram(GLuint p){gl2x_glDeleteProgram(g_ctx,p);}
 GLboolean glIsProgram(GLuint p){return (GLboolean)gl2x_glIsProgram(g_ctx,p);}
 void glGetProgramiv(GLuint p,GLenum n,GLint *v){
@@ -78,7 +86,7 @@ void glGetAttachedShaders(GLuint p,GLsizei n,GLsizei *c,GLuint *s){gl2x_glGetAtt
 void glValidateProgram(GLuint p){gl2x_glValidateProgram(g_ctx,p);}
 GLint glGetAttribLocation(GLuint p,const GLchar *n){return gl2x_glGetAttribLocation(g_ctx,p,n);}
 GLint glGetUniformLocation(GLuint p,const GLchar *n){return gl2x_glGetUniformLocation(g_ctx,p,n);}
-void glBindAttribLocation(GLuint p,GLuint i,const GLchar *n){(void)p;(void)i;(void)n;}
+void glBindAttribLocation(GLuint p,GLuint i,const GLchar *n){gl2x_glBindAttribLocation(g_ctx,p,i,n);}
 void glUniform1i(GLint l,GLint x){gl2x_glUniform1i(g_ctx,l,x);}
 void glUniform1iv(GLint l,GLsizei c,const GLint *v){if(c>0&&v)gl2x_glUniform1i(g_ctx,l,v[0]);}
 void glUniform1f(GLint l,GLfloat x){gl2x_glUniform1f(g_ctx,l,x);}
@@ -88,10 +96,10 @@ void glUniform4f(GLint l,GLfloat x,GLfloat y,GLfloat z,GLfloat w){gl2x_glUniform
 void glUniform1fv(GLint l,GLsizei c,const GLfloat *v){for(GLsizei i=0;i<c;++i)gl2x_glUniform1f(g_ctx,l+i,v[i]);}
 void glUniform2fv(GLint l,GLsizei c,const GLfloat *v){for(GLsizei i=0;i<c;++i)gl2x_glUniform2f(g_ctx,l+i,v[i*2],v[i*2+1]);}
 void glUniform3fv(GLint l,GLsizei c,const GLfloat *v){for(GLsizei i=0;i<c;++i)gl2x_glUniform3f(g_ctx,l+i,v[i*3],v[i*3+1],v[i*3+2]);}
-void glUniform4fv(GLint l,GLsizei c,const GLfloat *v){for(GLsizei i=0;i<c;++i)gl2x_glUniform4f(g_ctx,l+i,v[i*4],v[i*4+1],v[i*4+2],v[i*4+3]);}
+void glUniform4fv(GLint l,GLsizei c,const GLfloat *v){PROF_BEGIN;for(GLsizei i=0;i<c;++i)gl2x_glUniform4f(g_ctx,l+i,v[i*4],v[i*4+1],v[i*4+2],v[i*4+3]);PROF_END(5);}
 void glUniformMatrix2fv(GLint l,GLsizei c,GLboolean t,const GLfloat *v){gl2x_glUniformMatrix2fv(g_ctx,l,c,t,v);}
 void glUniformMatrix3fv(GLint l,GLsizei c,GLboolean t,const GLfloat *v){gl2x_glUniformMatrix3fv(g_ctx,l,c,t,v);}
-void glUniformMatrix4fv(GLint l,GLsizei c,GLboolean t,const GLfloat *v){gl2x_glUniformMatrix4fv(g_ctx,l,c,t,v);}
+void glUniformMatrix4fv(GLint l,GLsizei c,GLboolean t,const GLfloat *v){PROF_BEGIN;gl2x_glUniformMatrix4fv(g_ctx,l,c,t,v);PROF_END(4);}
 void glEnableVertexAttribArray(GLuint i){gl2x_glEnableVertexAttribArray(g_ctx,i);}
 void glDisableVertexAttribArray(GLuint i){gl2x_glDisableVertexAttribArray(g_ctx,i);}
 void glVertexAttribPointer(GLuint i,GLint s,GLenum t,GLboolean n,GLsizei st,const void *p){gl2x_glVertexAttribPointer(g_ctx,i,s,t,n,st,p);}
@@ -107,9 +115,9 @@ void glBufferData(GLenum t,GLsizeiptr s,const void *d,GLenum u){gl2x_glBufferDat
 void glBufferSubData(GLenum t,GLintptr o,GLsizeiptr s,const void *d){gl2x_glBufferSubData(g_ctx,t,o,s,d);}
 void glGetBufferParameteriv(GLenum t,GLenum p,GLint *v){*v=gl2x_glGetBufferParameteriv(g_ctx,t,p);}
 void glDrawArrays(GLenum m,GLint f,GLsizei c){if(g_ensure)g_ensure();gl2x_glDrawArrays(g_ctx,m,f,c);}
-void glDrawElements(GLenum m,GLsizei c,GLenum t,const void *i){if(g_ensure)g_ensure();gl2x_glDrawElements(g_ctx,m,c,t,i);}
+void glDrawElements(GLenum m,GLsizei c,GLenum t,const void *i){PROF_BEGIN;if(g_ensure)g_ensure();PROF_END(0);pt0=gl2std_clock?gl2std_clock():0;gl2x_glDrawElements(g_ctx,m,c,t,i);PROF_END(1);}
 void glGenTextures(GLsizei n,GLuint *t){gl2x_glGenTextures(g_ctx,n,(uint32_t*)t);}
-void glBindTexture(GLenum t,GLuint n){gl2x_glBindTexture(g_ctx,t,n);}
+void glBindTexture(GLenum t,GLuint n){PROF_BEGIN;gl2x_glBindTexture(g_ctx,t,n);PROF_END(3);}
 void glDeleteTextures(GLsizei n,const GLuint *t){gl2x_glDeleteTextures(g_ctx,n,(const uint32_t*)t);}
 GLboolean glIsTexture(GLuint t){return (GLboolean)gl2x_glIsTexture(g_ctx,t);}
 void glActiveTexture(GLenum t){gl2x_glActiveTexture(g_ctx,t);}
