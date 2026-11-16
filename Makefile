@@ -4,7 +4,7 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 # -mno-unaligned-access: with the MMU off (NANOOS_MMU=0) all memory is
 # Strongly-ordered, where an unaligned load faults (GCC merges byte loads
 # into ldrh/ldr); with it on, the uncached DMA sections still are.
-CFLAGS := -mcpu=cortex-a5 -marm -O2 -mno-unaligned-access -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-pic -fno-common -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -I../gl2rt -MMD -MP
+CFLAGS := -mcpu=cortex-a5 -marm -O2 -mno-unaligned-access -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-pic -fno-common -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Iruntime/gl2 -Iruntime/storage -MMD -MP
 OBJECTS := $(addprefix build/,startup.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o btui.o libc_shim.o gl2rt.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o)
 # Size: the chainloader package must fit the Blocks.hbapp slot it replaces
 # in the emulator test (20708 bytes, emulator/tools/disk_patch.py). Code
@@ -18,24 +18,24 @@ build/mbx.o build/mbx_test.o build/mmu.o build/game.o build/asset.o: CFLAGS += -
 all: build/kernel.bin
 build:
 	mkdir -p $@
-# Build runtime/compiler from their canonical, host-tested sources, not stale src copies.
-build/gl2rt.o: ../gl2rt/gl2rt.c ../gl2rt/gl2rt.h | build
+# Build runtime/compiler from canonical NanoOS/runtime sources.
+build/gl2rt.o: runtime/gl2/gl2rt.c runtime/gl2/gl2rt.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/gl2vsc.o: ../gl2rt/gl2vsc.c ../gl2rt/gl2vsc.h | build
+build/gl2vsc.o: runtime/gl2/gl2vsc.c runtime/gl2/gl2vsc.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/gl2api.o: ../gl2rt/gl2api.c ../gl2rt/gl2api.h | build
+build/gl2api.o: runtime/gl2/gl2api.c runtime/gl2/gl2api.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/gl2tex.o: ../gl2rt/gl2tex.c ../gl2rt/gl2api.h | build
+build/gl2tex.o: runtime/gl2/gl2tex.c runtime/gl2/gl2api.h | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/sftl.o: ../gl2rt/storage/sftl.c | build
+build/sftl.o: runtime/storage/sftl.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/disk.o: ../gl2rt/storage/disk.c | build
+build/disk.o: runtime/storage/disk.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/mount.o: ../gl2rt/storage/mount.c | build
+build/mount.o: runtime/storage/mount.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/partition.o: ../gl2rt/storage/partition.c | build
+build/partition.o: runtime/storage/partition.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
-build/hfs.o: ../gl2rt/storage/hfs.c | build
+build/hfs.o: runtime/storage/hfs.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -48,6 +48,12 @@ build/kernel.bin: build/kernel.elf
 	$(OBJCOPY) -O binary $< $@
 clean:
 	rm -rf build
+
+# Build any NanoOS SDK application (examples/hello_gles2 or external APP_DIR)
+APP_DIR ?= examples/hello_gles2
+.PHONY: app
+app:
+	$(MAKE) -C $(APP_DIR) NANOOS_DIR=$(abspath .) native
 -include $(OBJECTS:.o=.d)
 
 # Embed this kernel as the existing chainloader's fallback. Build in isolation

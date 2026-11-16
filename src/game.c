@@ -9,10 +9,10 @@
 #include "timer.h"
 #include "mbx.h"
 #include "nand.h"
-#include "../../gl2rt/storage/mount.h"
-#include "../../gl2rt/storage/disk.h"
-#include "../../gl2rt/storage/partition.h"
-#include "../../gl2rt/storage/hfs.h"
+#include "../runtime/storage/mount.h"
+#include "../runtime/storage/disk.h"
+#include "../runtime/storage/partition.h"
+#include "../runtime/storage/hfs.h"
 static const struct ngame_hdr *game;
 static uint32_t usec(void) { return USEC; }
 static void dcache_clean(void) { dcache_clean_all(); }
