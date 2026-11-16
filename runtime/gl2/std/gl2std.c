@@ -80,6 +80,7 @@ GLint glGetAttribLocation(GLuint p,const GLchar *n){return gl2x_glGetAttribLocat
 GLint glGetUniformLocation(GLuint p,const GLchar *n){return gl2x_glGetUniformLocation(g_ctx,p,n);}
 void glBindAttribLocation(GLuint p,GLuint i,const GLchar *n){(void)p;(void)i;(void)n;}
 void glUniform1i(GLint l,GLint x){gl2x_glUniform1i(g_ctx,l,x);}
+void glUniform1iv(GLint l,GLsizei c,const GLint *v){if(c>0&&v)gl2x_glUniform1i(g_ctx,l,v[0]);}
 void glUniform1f(GLint l,GLfloat x){gl2x_glUniform1f(g_ctx,l,x);}
 void glUniform2f(GLint l,GLfloat x,GLfloat y){gl2x_glUniform2f(g_ctx,l,x,y);}
 void glUniform3f(GLint l,GLfloat x,GLfloat y,GLfloat z){gl2x_glUniform3f(g_ctx,l,x,y,z);}

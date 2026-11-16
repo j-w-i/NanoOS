@@ -7,7 +7,7 @@
 #include <stdint.h>
 #define VSC_MAX_INSTR 256
 #define VSC_MAX_LIT 64
-#define VSC_MAX_UNI 16
+#define VSC_MAX_UNI 96
 typedef struct {
     uint32_t ncode; uint32_t code[VSC_MAX_INSTR][2];
     uint32_t nlit; uint16_t lit_idx[VSC_MAX_LIT]; float lit_val[VSC_MAX_LIT][4];
@@ -17,5 +17,6 @@ typedef struct {
     uint32_t nconst, ntemps;
     char err[64];
 } vsc_result;
+int gl2_preprocess(const char *src, char *out, uint32_t cap);
 int gl2vsc_compile(const char *src, vsc_result *out);   /* 0 ok, <0 error (message in out->err) */
 #endif

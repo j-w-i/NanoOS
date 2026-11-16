@@ -84,6 +84,47 @@ typedef char GLchar;
 #ifndef GL_UNSIGNED_SHORT
 #define GL_UNSIGNED_SHORT 0x1403
 #endif
+#ifndef GL_UNSIGNED_INT
+#define GL_UNSIGNED_INT 0x1405
+#endif
+#ifndef GL_NEVER
+#define GL_NEVER 0x0200
+#endif
+#ifndef GL_LESS
+#define GL_LESS 0x0201
+#endif
+#ifndef GL_EQUAL
+#define GL_EQUAL 0x0202
+#endif
+#ifndef GL_LEQUAL
+#define GL_LEQUAL 0x0203
+#endif
+#ifndef GL_GREATER
+#define GL_GREATER 0x0204
+#endif
+#ifndef GL_NOTEQUAL
+#define GL_NOTEQUAL 0x0205
+#endif
+#ifndef GL_GEQUAL
+#define GL_GEQUAL 0x0206
+#endif
+#ifndef GL_ALWAYS
+#define GL_ALWAYS 0x0207
+#endif
+#ifndef GL_DEPTH_COMPONENT
+#define GL_DEPTH_COMPONENT 0x1902
+#endif
+#ifndef GL_TEXTURE_CUBE_MAP
+#define GL_TEXTURE_CUBE_MAP 0x8513
+#endif
+#ifndef GL_TEXTURE_CUBE_MAP_POSITIVE_X
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_X 0x8515
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_X 0x8516
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_Y 0x8517
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_Y 0x8518
+#define GL_TEXTURE_CUBE_MAP_POSITIVE_Z 0x8519
+#define GL_TEXTURE_CUBE_MAP_NEGATIVE_Z 0x851A
+#endif
 #ifndef GL_ARRAY_BUFFER
 #define GL_ARRAY_BUFFER 0x8892
 #endif
@@ -553,6 +594,7 @@ GL_API GLint GL_APIENTRY glGetAttribLocation(GLuint program, const GLchar *name)
 GL_API GLint GL_APIENTRY glGetUniformLocation(GLuint program, const GLchar *name);
 GL_API void GL_APIENTRY glBindAttribLocation(GLuint program, GLuint index, const GLchar *name);
 GL_API void GL_APIENTRY glUniform1i(GLint location, GLint x);
+GL_API void GL_APIENTRY glUniform1iv(GLint location, GLsizei count, const GLint *v);
 GL_API void GL_APIENTRY glUniform1f(GLint location, GLfloat x);
 GL_API void GL_APIENTRY glUniform2f(GLint location, GLfloat x, GLfloat y);
 GL_API void GL_APIENTRY glUniform3f(GLint location, GLfloat x, GLfloat y, GLfloat z);

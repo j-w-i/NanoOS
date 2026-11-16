@@ -1,12 +1,12 @@
 #include "gl2vsc.h"
-#define MAXTOK 700
+#define MAXTOK 2400
 #define MAXVTEMP (VSC_MAX_INSTR * 2)
 #define TLEN 32
 typedef struct { int f, i, w, hascv, mat; int sw[4]; float cv[4]; } V;           /* f: 0 input 1 const 2 temp 3 zero */
 typedef struct { int op, dst, mask, hi, neg[3]; V s[3]; } Ins;
 enum { MOV = 1, ADD = 2, MAD = 3, MUL = 4, RCP = 5, RSQ = 6, DP3 = 7, DP4 = 8, MIN = 9, MAX = 10, SGE = 12, EX2 = 0x13 };
 static char tk[MAXTOK][TLEN]; static int ntk, tp;
-static struct { char n[TLEN]; V v; int local; } vars[48]; static int nvars;
+static struct { char n[TLEN]; V v; int local; } vars[96]; static int nvars;
 typedef struct { char n[TLEN]; int np; char pn[4][TLEN]; int bs,be; } UserFn;
 static UserFn ufn[8]; static int nufn;
 static int seq(const char*,const char*);static void scpy(char*,const char*,int);static void stmt(void);
@@ -287,6 +287,7 @@ static V primary(void) {
         for (int i = nvars - 1; i >= 0; --i) if (seq(vars[i].n, full)) return post(vars[i].v);
         fail("unknown array element"); return z;
     }
+    if (seq(mt, "gl_Position") && written_pos) return post(position_value);
     for (int i = nvars - 1; i >= 0; --i) if (seq(vars[i].n, mt)) return post(vars[i].v);
     fail("unknown identifier"); return z;
 }
@@ -662,9 +663,260 @@ static int finish(void) {
     }
     R->nconst = (uint32_t)nc; return 0;
 }
+/* ---- freestanding GLSL ES 1.00 preprocessor ---- */
+#define PP_MAX_MACROS 64
+typedef struct { char name[32]; char val[96]; uint8_t used; } pp_macro;
+static pp_macro pp_macros[PP_MAX_MACROS];
+static const char *pp_p;
+static int pp_find(const char *name) {
+    for (int i = 0; i < PP_MAX_MACROS; ++i)
+        if (pp_macros[i].used && seq(pp_macros[i].name, name)) return i;
+    return -1;
+}
+static void pp_set(const char *name, const char *val) {
+    int idx = pp_find(name);
+    if (idx < 0) {
+        for (int i = 0; i < PP_MAX_MACROS; ++i) if (!pp_macros[i].used) { idx = i; break; }
+    }
+    if (idx < 0) return;
+    pp_macros[idx].used = 1;
+    scpy(pp_macros[idx].name, name, 32);
+    scpy(pp_macros[idx].val, val && *val ? val : "1", 96);
+}
+static void pp_unset(const char *name) {
+    int idx = pp_find(name);
+    if (idx >= 0) pp_macros[idx].used = 0;
+}
+static void pp_skip_ws(void) { while (*pp_p == ' ' || *pp_p == '\t') ++pp_p; }
+static int pp_expr(void);
+static int pp_primary(void) {
+    pp_skip_ws();
+    if (*pp_p == '(') { ++pp_p; int v = pp_expr(); pp_skip_ws(); if (*pp_p == ')') ++pp_p; return v; }
+    if (*pp_p == '!') { ++pp_p; return !pp_primary(); }
+    if (*pp_p == '-') { ++pp_p; return -pp_primary(); }
+    if (*pp_p == '+') { ++pp_p; return pp_primary(); }
+    if (isid(*pp_p)) {
+        char id[32]; int n = 0;
+        while ((isid(*pp_p) || isdig(*pp_p)) && n < 31) id[n++] = *pp_p++;
+        while (isid(*pp_p) || isdig(*pp_p)) ++pp_p;
+        id[n] = 0;
+        if (seq(id, "defined")) {
+            pp_skip_ws();
+            int par = 0; if (*pp_p == '(') { par = 1; ++pp_p; pp_skip_ws(); }
+            char target[32]; int tn = 0;
+            while ((isid(*pp_p) || isdig(*pp_p)) && tn < 31) target[tn++] = *pp_p++;
+            while (isid(*pp_p) || isdig(*pp_p)) ++pp_p;
+            target[tn] = 0;
+            if (par) { pp_skip_ws(); if (*pp_p == ')') ++pp_p; }
+            return pp_find(target) >= 0 ? 1 : 0;
+        }
+        int idx = pp_find(id);
+        if (idx < 0) return 0;
+        const char *saved = pp_p; pp_p = pp_macros[idx].val;
+        int v = pp_expr(); pp_p = saved;
+        return v;
+    }
+    if (isdig(*pp_p)) {
+        int v = 0;
+        if (pp_p[0] == '0' && (pp_p[1] == 'x' || pp_p[1] == 'X')) {
+            pp_p += 2;
+            while (isdig(*pp_p) || (*pp_p >= 'a' && *pp_p <= 'f') || (*pp_p >= 'A' && *pp_p <= 'F')) {
+                char c = *pp_p++; int d = isdig(c) ? (c - '0') : ((c >= 'a' ? c - 'a' : c - 'A') + 10);
+                v = v * 16 + d;
+            }
+        } else {
+            while (isdig(*pp_p)) v = v * 10 + (*pp_p++ - '0');
+        }
+        return v;
+    }
+    return 0;
+}
+static int pp_mul(void) {
+    int v = pp_primary();
+    for (;;) {
+        pp_skip_ws();
+        if (*pp_p == '*') { ++pp_p; v *= pp_primary(); }
+        else if (*pp_p == '/') { ++pp_p; int d = pp_primary(); v = d ? (v / d) : 0; }
+        else break;
+    }
+    return v;
+}
+static int pp_add(void) {
+    int v = pp_mul();
+    for (;;) {
+        pp_skip_ws();
+        if (*pp_p == '+') { ++pp_p; v += pp_mul(); }
+        else if (*pp_p == '-') { ++pp_p; v -= pp_mul(); }
+        else break;
+    }
+    return v;
+}
+static int pp_rel(void) {
+    int v = pp_add();
+    for (;;) {
+        pp_skip_ws();
+        if (pp_p[0] == '<' && pp_p[1] == '=') { pp_p += 2; v = v <= pp_add(); }
+        else if (pp_p[0] == '>' && pp_p[1] == '=') { pp_p += 2; v = v >= pp_add(); }
+        else if (*pp_p == '<') { ++pp_p; v = v < pp_add(); }
+        else if (*pp_p == '>') { ++pp_p; v = v > pp_add(); }
+        else break;
+    }
+    return v;
+}
+static int pp_eq(void) {
+    int v = pp_rel();
+    for (;;) {
+        pp_skip_ws();
+        if (pp_p[0] == '=' && pp_p[1] == '=') { pp_p += 2; v = v == pp_rel(); }
+        else if (pp_p[0] == '!' && pp_p[1] == '=') { pp_p += 2; v = v != pp_rel(); }
+        else break;
+    }
+    return v;
+}
+static int pp_and(void) {
+    int v = pp_eq();
+    while (1) { pp_skip_ws(); if (pp_p[0] == '&' && pp_p[1] == '&') { pp_p += 2; int r = pp_eq(); v = v && r; } else break; }
+    return v;
+}
+static int pp_expr(void) {
+    int v = pp_and();
+    while (1) { pp_skip_ws(); if (pp_p[0] == '|' && pp_p[1] == '|') { pp_p += 2; int r = pp_and(); v = v || r; } else break; }
+    return v;
+}
+static int pp_eval_str(const char *s) { const char *saved = pp_p; pp_p = s; int v = pp_expr(); pp_p = saved; return v; }
+static void pp_emit_expanded(const char *s, int len, char *out, uint32_t *op, uint32_t cap, int depth) {
+    int i = 0;
+    while (i < len) {
+        if (isid(s[i])) {
+            char id[32]; int n = 0; int start = i;
+            while (i < len && (isid(s[i]) || isdig(s[i]))) { if (n < 31) id[n++] = s[i]; ++i; }
+            id[n] = 0;
+            int m = (depth < 6) ? pp_find(id) : -1;
+            if (m >= 0 && (i - start) < 32) {
+                int vlen = 0; while (pp_macros[m].val[vlen]) ++vlen;
+                pp_emit_expanded(pp_macros[m].val, vlen, out, op, cap, depth + 1);
+            } else {
+                for (int k = start; k < i; ++k) if (*op + 1 < cap) out[(*op)++] = s[k];
+            }
+        } else {
+            if (*op + 1 < cap) out[(*op)++] = s[i];
+            ++i;
+        }
+    }
+}
+int gl2_preprocess(const char *src, char *out, uint32_t cap) {
+    if (!src || !out || cap == 0) return -1;
+    for (int i = 0; i < PP_MAX_MACROS; ++i) pp_macros[i].used = 0;
+    struct { uint8_t parent_active, active, seen_true; } stk[16];
+    int sp = 0; uint32_t op = 0; int in_comment = 0;
+    const char *p = src;
+    while (*p) {
+        const char *ls = p;
+        while (*p && *p != '\n') ++p;
+        int llen = (int)(p - ls);
+        if (*p == '\n') ++p;
+        if (llen > 0 && ls[llen - 1] == '\r') --llen;
+        int cur_active = (sp == 0) ? 1 : stk[sp - 1].active;
+        int k = 0;
+        while (k < llen && (ls[k] == ' ' || ls[k] == '\t')) ++k;
+        if (!in_comment && k < llen && ls[k] == '#') {
+            ++k;
+            while (k < llen && (ls[k] == ' ' || ls[k] == '\t')) ++k;
+            char dir[16]; int dn = 0;
+            while (k < llen && (isid(ls[k]) || isdig(ls[k])) && dn < 15) dir[dn++] = ls[k++];
+            dir[dn] = 0;
+            while (k < llen && (ls[k] == ' ' || ls[k] == '\t')) ++k;
+            char rest[256]; int rn = 0;
+            while (k < llen && rn < 255) {
+                if (k + 1 < llen && ls[k] == '/' && ls[k + 1] == '/') break;
+                rest[rn++] = ls[k++];
+            }
+            while (rn > 0 && (rest[rn - 1] == ' ' || rest[rn - 1] == '\t')) --rn;
+            rest[rn] = 0;
+            if (seq(dir, "ifdef") || seq(dir, "ifndef")) {
+                if (sp < 16) {
+                    char id[32]; int n = 0;
+                    while (rest[n] && (isid(rest[n]) || isdig(rest[n])) && n < 31) { id[n] = rest[n]; ++n; }
+                    id[n] = 0;
+                    int cond = pp_find(id) >= 0; if (seq(dir, "ifndef")) cond = !cond;
+                    stk[sp].parent_active = (uint8_t)cur_active;
+                    stk[sp].active = (uint8_t)(cur_active && cond);
+                    stk[sp].seen_true = (uint8_t)cond;
+                    ++sp;
+                }
+            } else if (seq(dir, "if")) {
+                if (sp < 16) {
+                    int cond = cur_active ? (pp_eval_str(rest) != 0) : 0;
+                    stk[sp].parent_active = (uint8_t)cur_active;
+                    stk[sp].active = (uint8_t)(cur_active && cond);
+                    stk[sp].seen_true = (uint8_t)cond;
+                    ++sp;
+                }
+            } else if (seq(dir, "elif")) {
+                if (sp > 0) {
+                    int cond = (stk[sp - 1].parent_active && !stk[sp - 1].seen_true) ? (pp_eval_str(rest) != 0) : 0;
+                    stk[sp - 1].active = (uint8_t)cond;
+                    if (cond) stk[sp - 1].seen_true = 1;
+                }
+            } else if (seq(dir, "else")) {
+                if (sp > 0) {
+                    int cond = stk[sp - 1].parent_active && !stk[sp - 1].seen_true;
+                    stk[sp - 1].active = (uint8_t)cond;
+                    stk[sp - 1].seen_true = 1;
+                }
+            } else if (seq(dir, "endif")) {
+                if (sp > 0) --sp;
+            } else if (cur_active && seq(dir, "define")) {
+                char name[32]; int n = 0, rk = 0;
+                while (rest[rk] && (isid(rest[rk]) || isdig(rest[rk])) && n < 31) name[n++] = rest[rk++];
+                name[n] = 0;
+                if (rest[rk] != '(') {
+                    while (rest[rk] == ' ' || rest[rk] == '\t') ++rk;
+                    if (n > 0) pp_set(name, rest + rk);
+                }
+            } else if (cur_active && seq(dir, "undef")) {
+                char name[32]; int n = 0, rk = 0;
+                while (rest[rk] && (isid(rest[rk]) || isdig(rest[rk])) && n < 31) name[n++] = rest[rk++];
+                name[n] = 0;
+                if (n > 0) pp_unset(name);
+            }
+            if (op + 1 < cap) out[op++] = '\n';
+            continue;
+        }
+        if (cur_active) {
+            int i = 0;
+            while (i < llen) {
+                if (in_comment) {
+                    if (i + 1 < llen && ls[i] == '*' && ls[i + 1] == '/') { in_comment = 0; i += 2; }
+                    else ++i;
+                } else if (i + 1 < llen && ls[i] == '/' && ls[i + 1] == '/') {
+                    break;
+                } else if (i + 1 < llen && ls[i] == '/' && ls[i + 1] == '*') {
+                    in_comment = 1; i += 2;
+                } else {
+                    int seg_start = i;
+                    while (i < llen && !(i + 1 < llen && ls[i] == '/' && (ls[i + 1] == '/' || ls[i + 1] == '*'))) ++i;
+                    pp_emit_expanded(ls + seg_start, i - seg_start, out, &op, cap, 0);
+                }
+            }
+            if (op + 1 < cap) out[op++] = '\n';
+        } else {
+            for (int i = 0; i < llen; ++i) {
+                if (in_comment && i + 1 < llen && ls[i] == '*' && ls[i + 1] == '/') { in_comment = 0; ++i; }
+                else if (!in_comment && i + 1 < llen && ls[i] == '/' && ls[i + 1] == '*') { in_comment = 1; ++i; }
+            }
+            if (op + 1 < cap) out[op++] = '\n';
+        }
+    }
+    out[op] = 0;
+    return 0;
+}
+
 int gl2vsc_compile(const char *src, vsc_result *out) {
+    static char pp_buf[16384];
     R = out; R->ncode=R->nconst=R->ntemps=0; R->err[0] = 0; R->nlit = R->nuni = R->nattr = R->nvary = 0; err_flag = 0; nc = 0; nreg = 0; ncode = 0; nvars = 0; nouts = 0; tp = 0; written_pos = 0; nufn = 0;
-    tokenize(src); if (err_flag) return -1;
+    gl2_preprocess(src, pp_buf, sizeof(pp_buf));
+    tokenize(pp_buf); if (err_flag) return -1;
     while (tp < ntk && !err_flag) {
         const char *t = eat(0);
         if (seq(t, "precision")) { while (tp < ntk && !seq(eat(0), ";")) {} }
@@ -672,22 +924,34 @@ int gl2vsc_compile(const char *src, vsc_result *out) {
             int kind = seq(t, "uniform") ? 0 : seq(t, "attribute") ? 1 : 2;
             if (seq(peek(0), "lowp") || seq(peek(0), "mediump") || seq(peek(0), "highp")) eat(0);
             char ty[TLEN], name[TLEN]; scpy(ty, eat(0), TLEN); scpy(name, eat(0), TLEN);
-            if(symbol_exists(name)){fail("duplicate global symbol");break;}if(nvars>=48){fail("too many global symbols");break;}
+            if(symbol_exists(name)){fail("duplicate global symbol");break;}if(nvars>=96){fail("too many global symbols");break;}
             if ((seq(ty, "mat4") || seq(ty, "mat3") || seq(ty, "mat2")) && kind == 0) {
                 eat(";");
                 int md = seq(ty, "mat4") ? 4 : seq(ty, "mat3") ? 3 : 2;
-                if (nvars >= 48 || R->nuni >= VSC_MAX_UNI || nc + (unsigned)md > 112) { fail("out of constants"); break; }
+                if (nvars >= 96 || R->nuni >= VSC_MAX_UNI || nc + (unsigned)md > 112) { fail("out of constants"); break; }
                 V v = mkv(1, nc, 4); v.mat = md; scpy(vars[nvars].n, name, TLEN); vars[nvars].v = v; vars[nvars].local = 0; ++nvars;
                 scpy(R->uni_name[R->nuni], name, TLEN); R->uni_idx[R->nuni] = (uint8_t)nc; R->uni_cnt[R->nuni] = (uint8_t)md;R->uni_width[R->nuni]=(uint8_t)(md*md); ++R->nuni; nc += (unsigned)md; continue;
             }
             int w = ty_w(ty); if (!w) { fail("unsupported type"); break; }
             if (kind == 0) {
                 int count = 1;
-                if (seq(peek(0), "[")) { eat("["); char cb[TLEN]; scpy(cb, eat(0), TLEN); eat("]"); count = atoi_(cb); if (count < 1 || count > 16) { fail("bad uniform array size"); break; } }
+                if (seq(peek(0), "[")) {
+                    eat("[");
+                    char exprbuf[64]; int ep = 0;
+                    while (!seq(peek(0), "]") && tp < ntk) {
+                        const char *pt = eat(0);
+                        for (int k = 0; pt[k] && ep < 63; ++k) exprbuf[ep++] = pt[k];
+                        if (ep < 63) exprbuf[ep++] = ' ';
+                    }
+                    exprbuf[ep] = 0;
+                    eat("]");
+                    count = pp_eval_str(exprbuf);
+                    if (count < 1 || count > 64) { fail("bad uniform array size"); break; }
+                }
                 eat(";");
                 if (count > 1) {
                     for (int ai = 0; ai < count; ++ai) {
-                        if (nvars >= 48 || R->nuni >= VSC_MAX_UNI || nc >= 112) { fail("out of constants"); break; }
+                        if (nvars >= 96 || R->nuni >= VSC_MAX_UNI || nc >= 112) { fail("out of constants"); break; }
                         char en[TLEN]; int p = 0; while (name[p]) { en[p] = name[p]; ++p; }
                         en[p++] = '['; char dg[8]; int dn = 0, v = ai; if (v == 0) dg[dn++] = '0'; else while (v) { dg[dn++] = (char)('0' + v % 10); v /= 10; }
                         while (dn) en[p++] = dg[--dn];
@@ -697,7 +961,7 @@ int gl2vsc_compile(const char *src, vsc_result *out) {
                     }
                     continue;
                 }
-                if (nvars >= 48 || R->nuni >= VSC_MAX_UNI || nc >= 112) { fail("out of constants"); break; }
+                if (nvars >= 96 || R->nuni >= VSC_MAX_UNI || nc >= 112) { fail("out of constants"); break; }
                 scpy(vars[nvars].n, name, TLEN); vars[nvars].v = mkv(1, nc, w); vars[nvars].local = 0; ++nvars;
                 scpy(R->uni_name[R->nuni], name, TLEN); R->uni_idx[R->nuni] = (uint8_t)nc; R->uni_cnt[R->nuni] = 1;R->uni_width[R->nuni]=(uint8_t)w; ++R->nuni; ++nc;
             } else if (kind == 1) {
@@ -706,7 +970,7 @@ int gl2vsc_compile(const char *src, vsc_result *out) {
                 int slot = -1; for (int i = 0; i < 5; ++i) if (seq(name, an[i])) slot = as[i];
                 if (slot < 0) {
                     int used[8] = { 0 }; for (int i = 0; i < nvars; ++i) if (vars[i].v.f == 0) used[vars[i].v.i] = 1;
-                    const int *pref = w == 4 ? (const int[]){ 0, 2, -1 } : w == 3 ? (const int[]){ 0, 1, 2, 4, -1 } : w == 2 ? (const int[]){ 3, 4, -1 } : (const int[]){ 2, -1, -1 };
+                    const int *pref = w == 4 ? (const int[]){ 0, 2, 1, 3, 4, -1 } : w == 3 ? (const int[]){ 0, 1, 2, 3, 4, -1 } : w == 2 ? (const int[]){ 3, 4, 1, 2, -1 } : (const int[]){ 2, 1, 3, 4, -1 };
                     for (int i = 0; pref[i] >= 0; ++i) if (!used[pref[i]]) { slot = pref[i]; break; }
                     if (slot < 0) { fail("no free input slot"); break; }
                 }
@@ -717,9 +981,9 @@ int gl2vsc_compile(const char *src, vsc_result *out) {
                 static const char *on[] = { "vColor", "vFog", "vTexCoord", "vTexCoord1" }; static const int os[] = { 1, 2, 3, 4 };
                 int slot = -1; for (int i = 0; i < 4; ++i) if (seq(name, on[i])) slot = os[i];
                 int used[8] = { 0 }; for (int i = 0; i < nouts; ++i) used[outs[i].slot] = 1;
-                if (slot >= 0 && used[slot]) { fail("varying collides on an output slot"); break; }
+                if (slot >= 0 && used[slot]) slot = -1;
                 if (slot < 0) {
-                    const int *pref = w == 4 || w == 3 ? (const int[]){ 1, -1, -1 } : w == 2 ? (const int[]){ 3, 4, -1 } : (const int[]){ 2, -1, -1 };
+                    const int *pref = (w == 4 || w == 3) ? (const int[]){ 1, 2, 3, 4, 6, 7, -1 } : w == 2 ? (const int[]){ 3, 4, 1, 2, 6, 7, -1 } : (const int[]){ 2, 1, 3, 4, 6, 7, -1 };
                     for (int i = 0; pref[i] >= 0; ++i) if (!used[pref[i]]) { slot = pref[i]; break; }
                     if (slot < 0) { fail("no free output slot"); break; }
                 }

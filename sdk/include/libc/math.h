@@ -1,5 +1,8 @@
 #ifndef SHMUP_NANO_MATH_H
 #define SHMUP_NANO_MATH_H
+#ifdef __cplusplus
+extern "C" {
+#endif
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -12,7 +15,9 @@ double floor(double x);
 double ceil(double x);
 double pow(double x, double y);
 double acos(double x);
+double asin(double x);
 double atan2(double y, double x);
+double exp(double x);
 float sinf(float x);
 float cosf(float x);
 float tanf(float x);
@@ -20,7 +25,14 @@ float sqrtf(float x);
 float fabsf(float x);
 float floorf(float x);
 float ceilf(float x);
+float fmodf(float x, float y);
 float powf(float x, float y);
 float acosf(float x);
+float asinf(float x);
 float atan2f(float y, float x);
+float expf(float x);
+float logf(float x);
+#ifdef __cplusplus
+}
+#endif
 #endif

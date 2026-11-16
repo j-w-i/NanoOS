@@ -112,90 +112,13 @@ static int cache_valid(const gl2_fs_entry *e) {
     }
     return 1;
 }
-static int pp_isid(char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_';}
-static int pp_isid2(char c){return pp_isid(c)||(c>='0'&&c<='9');}
-static const char *gl2_preprocess(const char *src, char *out, uint32_t cap, char *log){
-    int has_hash=0; for(const char *p=src;*p;++p)if(*p=='#'){has_hash=1;break;}
-    if(!has_hash)return src;
-    struct { char name[32], val[64]; uint8_t used; } defs[32];
-    for(unsigned i=0;i<32;++i)defs[i].used=0;
-    int act[16], seen_else[16], depth=0; act[0]=1; seen_else[0]=0;
-    uint32_t outp=0; const char *s=src;
-    while(*s){
-        const char *ls=s; while(*s&&*s!='\n')++s;
-        const char *le=s; if(*s=='\n')++s;
-        const char *p=ls; while(p<le&&(*p==' '||*p=='\t'||*p=='\r'))++p;
-        if(p<le&&*p=='#'){
-            ++p; while(p<le&&(*p==' '||*p=='\t'))++p;
-            char dir[16]; unsigned dn=0; while(p<le&&pp_isid(*p)&&dn<15)dir[dn++]=*p++; dir[dn]=0;
-            while(p<le&&(*p==' '||*p=='\t'))++p;
-            char name[32]; unsigned nn=0; while(p<le&&pp_isid2(*p)&&nn<31)name[nn++]=*p++; name[nn]=0;
-            int active=act[depth];
-            if(!scmp(dir,"ifdef")||!scmp(dir,"ifndef")){
-                if(!nn||depth>=15){scpy(log,"preprocessor conditional error",64);return 0;}
-                int found=0; for(unsigned i=0;i<32;++i)if(defs[i].used&&!scmp(defs[i].name,name)){found=1;break;}
-                int cond=(!scmp(dir,"ifdef"))?found:!found;
-                ++depth; act[depth]=active&&cond; seen_else[depth]=0;
-            }else if(!scmp(dir,"else")){
-                if(depth==0||seen_else[depth]){scpy(log,"unexpected #else",64);return 0;}
-                seen_else[depth]=1; act[depth]=act[depth-1]&&!act[depth];
-            }else if(!scmp(dir,"endif")){
-                if(depth==0){scpy(log,"unexpected #endif",64);return 0;}
-                --depth;
-            }else if(!scmp(dir,"define")){
-                if(active){
-                    if(!nn){scpy(log,"invalid #define",64);return 0;}
-                    while(p<le&&(*p==' '||*p=='\t'))++p;
-                    const char *ve=le; while(ve>p&&(ve[-1]==' '||ve[-1]=='\t'||ve[-1]=='\r'))--ve;
-                    int slot=-1; for(unsigned i=0;i<32;++i)if(defs[i].used&&!scmp(defs[i].name,name)){slot=(int)i;break;}
-                    if(slot<0)for(unsigned i=0;i<32;++i)if(!defs[i].used){slot=(int)i;break;}
-                    if(slot<0){scpy(log,"too many #define macros",64);return 0;}
-                    defs[slot].used=1; scpy(defs[slot].name,name,32);
-                    uint32_t vn=(uint32_t)(ve-p); if(vn>=63)vn=63;
-                    for(uint32_t k=0;k<vn;++k)defs[slot].val[k]=p[k];
-                    defs[slot].val[vn]=0;
-                }
-            }else if(!scmp(dir,"undef")){
-                if(active){ for(unsigned i=0;i<32;++i)if(defs[i].used&&!scmp(defs[i].name,name))defs[i].used=0; }
-            }else if(!scmp(dir,"pragma")||!scmp(dir,"version")){
-                /* ignore */
-            }else{
-                scpy(log,"unsupported preprocessor directive",64);return 0;
-            }
-            if(outp+1>=cap){scpy(log,"preprocessed shader too large",64);return 0;}
-            out[outp++]='\n';
-            continue;
-        }
-        if(!act[depth]){if(outp+1>=cap){scpy(log,"preprocessed shader too large",64);return 0;}out[outp++]='\n';continue;}
-        const char *q=ls;
-        while(q<le){
-            if(pp_isid(*q)){
-                char id[32]; unsigned in=0; const char *qs=q;
-                while(q<le&&pp_isid2(*q)){if(in<31)id[in++]=*q; ++q;}
-                id[in]=0;
-                const char *rep=0;
-                if(in<31&&(uint32_t)(q-qs)==in){for(unsigned i=0;i<32;++i)if(defs[i].used&&!scmp(defs[i].name,id)){rep=defs[i].val;break;}}
-                if(rep){for(const char *r=rep;*r;++r){if(outp+1>=cap){scpy(log,"preprocessed shader too large",64);return 0;}out[outp++]=*r;}}
-                else{for(const char *r=qs;r<q;++r){if(outp+1>=cap){scpy(log,"preprocessed shader too large",64);return 0;}out[outp++]=*r;}}
-            }else{
-                if(outp+1>=cap){scpy(log,"preprocessed shader too large",64);return 0;}
-                out[outp++]=*q++;
-            }
-        }
-        if(outp+1>=cap){scpy(log,"preprocessed shader too large",64);return 0;}
-        out[outp++]='\n';
-    }
-    if(depth!=0){scpy(log,"unterminated #ifdef",64);return 0;}
-    out[outp]=0;
-    return out;
-}
 void glCompileShader(gl2_ctx *c, uint32_t sh) {
     gl2_shader *s = shp(c, sh); if (!s) return; s->ok = 0; s->log[0] = 0; s->vs = 0; s->fs = 0;
     if (!s->src) { scpy(s->log, "shader has no source", 64); return; }
     for(uint32_t i=0;i<s->source_length;++i)if(!s->src[i]){scpy(s->log,"embedded NUL in shader source",64);return;}
     static char pp_buf[GL2_SHADER_SOURCE_BYTES];
-    const char *src = gl2_preprocess(s->src, pp_buf, sizeof pp_buf, s->log);
-    if (!src) return;
+    if (gl2_preprocess(s->src, pp_buf, sizeof pp_buf) != 0) { scpy(s->log, "preprocess failed", 64); return; }
+    const char *src = pp_buf;
     if (s->type == GL_VERTEX_SHADER) {
         vsc_result *r = &c->sh_vs[sh];          /* shader IDs must never alias compiled storage */
         if (gl2vsc_compile(src, r) == 0) { s->ok = 1; s->vs = r; } else scpy(s->log, r->err, 64);
@@ -318,6 +241,14 @@ void glUseProgram(gl2_ctx *c,uint32_t p){
 int glGetUniformLocation(gl2_ctx *c, uint32_t p, const char *name) {
     gl2_prog_obj *P = prp(c, p); if (!P || !P->ok) { err(c, GL_INVALID_OPERATION); return -1; }
     for (uint32_t i = 0; i < P->vs.nuni; ++i) { if (!scmp(P->vs.uni_name[i], name)) return (int)i; }
+    {
+        char arr[36]; uint32_t n = 0;
+        while (name[n] && n < 28) { arr[n] = name[n]; ++n; }
+        if (!name[n]) {
+            arr[n++] = '['; arr[n++] = '0'; arr[n++] = ']'; arr[n] = 0;
+            for (uint32_t i = 0; i < P->vs.nuni; ++i) if (!scmp(P->vs.uni_name[i], arr)) return (int)i;
+        }
+    }
     for (uint32_t i = 0; i < P->fs->nsampler; ++i) if (!scmp(P->fs->sampler_names[i], name)) return GL2_MAX_UNI + (int)i;
     for(unsigned i=0;i<P->fs->nuniform;++i)if(!scmp(P->fs->uniform_names[i],name))return P->fragment_vertex_alias[i]?(int)P->fragment_vertex_alias[i]-1:GL2_FRAGMENT_UNIFORM_BASE+(int)i;
     return -1;

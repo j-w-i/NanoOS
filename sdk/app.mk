@@ -5,6 +5,7 @@
 .DEFAULT_GOAL := native
 CROSS ?= arm-none-eabi-
 CC := $(CROSS)gcc
+CXX := $(CROSS)g++
 OBJCOPY := $(CROSS)objcopy
 SIZE := $(CROSS)size
 
@@ -24,6 +25,7 @@ SDK_INCLUDES := -I$(NANO_SDK)/include -I$(NANO_GL2)/std -I$(NANO_GL2) -I$(NANO_S
 SDK_BASE_FLAGS := $(CPPFLAGS) $(APP_CPPFLAGS) $(ARCH) -std=c99 -Os -ffreestanding -fno-builtin -fno-common -fno-strict-aliasing -fno-pic -mword-relocations -ffunction-sections -fdata-sections -MMD -MP
 SDK_CFLAGS := $(SDK_BASE_FLAGS) -Wall -Wextra -Werror $(SDK_INCLUDES)
 APP_ALL_CFLAGS := $(SDK_BASE_FLAGS) $(SDK_LIBC_INCLUDES) $(APP_CFLAGS) $(SDK_INCLUDES)
+APP_ALL_CXXFLAGS := $(CPPFLAGS) $(APP_CPPFLAGS) $(ARCH) -Os -ffreestanding -fno-builtin -fno-common -fno-strict-aliasing -fno-pic -mword-relocations -ffunction-sections -fdata-sections -MMD -MP -fno-exceptions -fno-rtti -fno-threadsafe-statics $(SDK_LIBC_INCLUDES) $(APP_CXXFLAGS) $(SDK_INCLUDES)
 
 GL2_PREFIX := -include $(NANO_GL2)/std/gl2prefix.h
 
@@ -35,6 +37,7 @@ SDK_OBJS := \
 	$(BUILD)/sdk/nano_app.o \
 	$(BUILD)/sdk/nano_fs.o \
 	$(BUILD)/sdk/nano_heap.o \
+	$(BUILD)/sdk/nano_cpp.o \
 	$(BUILD)/sdk/memory.o \
 	$(BUILD)/sdk/gl2std.o \
 	$(BUILD)/sdk/egl_nano.o \
@@ -46,7 +49,7 @@ SDK_OBJS := \
 	$(addprefix $(BUILD)/sdk/stor_,$(SDK_STOR_FILES:.c=.o)) \
 	$(addprefix $(BUILD)/sdk/sdkstor_,$(SDK_LIB_FILES:.c=.o))
 
-APP_OBJS := $(patsubst %.c,$(BUILD)/app/%.o,$(APP_SRCS))
+APP_OBJS := $(patsubst %.cpp,$(BUILD)/app/%.o,$(patsubst %.c,$(BUILD)/app/%.o,$(APP_SRCS)))
 
 .PHONY: native clean install
 
@@ -64,6 +67,9 @@ $(BUILD)/sdk/nano_fs.o: $(NANO_SDK)/src/nano_fs.c | $(BUILD)/sdk
 
 $(BUILD)/sdk/nano_heap.o: $(NANO_SDK)/src/nano_heap.c | $(BUILD)/sdk
 	$(CC) $(SDK_CFLAGS) -I$(NANO_SDK)/include/libc -c $< -o $@
+
+$(BUILD)/sdk/nano_cpp.o: $(NANO_SDK)/src/nano_cpp.cpp | $(BUILD)/sdk
+	$(CXX) $(ARCH) -Os -ffreestanding -fno-builtin -fno-common -fno-exceptions -fno-rtti -fno-threadsafe-statics -I$(NANO_SDK)/include/libc -c $< -o $@
 
 $(BUILD)/sdk/memory.o: $(NANO_SDK)/src/memory.c | $(BUILD)/sdk
 	$(CC) $(SDK_CFLAGS) -c $< -o $@
@@ -98,6 +104,10 @@ $(BUILD)/sdk/sdkstor_%.o: $(NANO_SDK)/src/storage/%.c | $(BUILD)/sdk
 $(BUILD)/app/%.o: %.c | $(BUILD)/app
 	@mkdir -p $(dir $@)
 	$(CC) $(APP_ALL_CFLAGS) -c $< -o $@
+
+$(BUILD)/app/%.o: %.cpp | $(BUILD)/app
+	@mkdir -p $(dir $@)
+	$(CXX) $(APP_ALL_CXXFLAGS) -c $< -o $@
 
 $(BUILD)/$(APP_NAME).elf: $(SDK_OBJS) $(APP_OBJS) $(NANO_SDK)/src/app.ld
 	$(CC) $(ARCH) -nostdlib -Wl,--gc-sections,-T,$(NANO_SDK)/src/app.ld,-Map,$(BUILD)/$(APP_NAME).map $(SDK_OBJS) $(APP_OBJS) -lgcc -o $@

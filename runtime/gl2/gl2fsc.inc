@@ -23,7 +23,7 @@ static void f_next(void){
 #define F_CHAR() do{if(n>=31){f_fail("fragment token exceeds31bytes");goto done;}f.token[n++]=*s++;}while(0)
  if(f_id(*s)){while(f_id(*s)||f_digit(*s))F_CHAR();}
  else if(f_digit(*s)||(*s=='.'&&f_digit(s[1]))){while(f_digit(*s))F_CHAR();if(*s=='.'){F_CHAR();while(f_digit(*s))F_CHAR();}if(*s=='e'||*s=='E'){F_CHAR();if(*s=='+'||*s=='-')F_CHAR();if(!f_digit(*s))f_fail("missing fragment exponent");while(f_digit(*s))F_CHAR();}}
- else if(*s){const char *p="+-*/=;(),.{}";while(*p&&*p!=*s)++p;if(!*p)f_fail("unsupported fragment character");F_CHAR();}
+ else if(*s){const char *p="+-*/=;(),.{}<>!&|[]";while(*p&&*p!=*s)++p;if(!*p)f_fail("unsupported fragment character");F_CHAR();}
  done:f.token[n]=0;f.cursor=s;
 #undef F_CHAR
 }
@@ -108,20 +108,58 @@ static void f_symbol_add(const char *name,f_value value,unsigned storage,unsigne
 static f_value f_parse(const char *source){
  f.cursor=source;f_next();while(!f.error&&!f_eq("void")&&f.token[0]){
   if(f_eq("precision")){f_next();if(!f_eq("lowp")&&!f_eq("mediump")&&!f_eq("highp")){f_fail("missing fragment precision qualifier");break;}f_precision();if(!f_eq("float")&&!f_eq("int")&&!f_eq("sampler2D")){f_fail("invalid fragment precision type");break;}f_next();f_eat(";");continue;}
-  unsigned storage=f_eq("uniform")?2:f_eq("varying")?1:0;if(!storage){f_fail("unsupported fragment global declaration");break;}f_next();f_precision();int sampler=f_eq("sampler2D"),width=f_width(f.token);f_next();char name[32];f_name(name);f_eat(";");f_value v=f_zero();unsigned slot=0;
+  unsigned storage=f_eq("uniform")?2:f_eq("varying")?1:0;if(!storage){f_fail("unsupported fragment global declaration");break;}f_next();f_precision();int ismat=(f_eq("mat4")||f_eq("mat3")||f_eq("mat2"));int sampler=f_eq("sampler2D"),width=f_width(f.token);f_next();char name[32];f_name(name);
+  if(f_eq("[")){while(!f.error&&!f_eq("]")&&f.token[0])f_next();f_eat("]");if(storage==2){f_eat(";");continue;}}
+  f_eat(";");if(storage==2&&ismat)continue;f_value v=f_zero();unsigned slot=0;
   if(storage==2){if(sampler){if(f.nsampler>=1){f_fail("fragment compiler currently supports one sampler");break;}v.kind=2;v.index=(uint8_t)f.nsampler++;}
    else{if(!width){f_fail("unsupported fragment uniform type");break;}if(f.nuniform>=16){f_fail("fragment uniform limit16");break;}v.w=(uint8_t)width;v.index=(uint8_t)f.nuniform++;storage=3;for(int k=0;k<width;++k)v.v[k]=f_intern(F_INPUT,GL2_SOFT_UNIFORM_BASE+4*v.index+(unsigned)k,0,0);}
   }
-  else{if(sampler||(width!=2&&width!=4)){f_fail("unsupported fragment varying type");break;}v.w=(uint8_t)width;if(width==4){slot=1;for(unsigned i=0;i<f.ns;++i)if(f.symbols[i].storage==1&&f.symbols[i].slot==slot)f_fail("fragment colour varying slot occupied");for(unsigned k=0;k<4;++k)v.v[k]=f_intern(F_INPUT,k,0,0);}
-   else{slot=3;for(unsigned i=0;i<f.ns;++i)if(f.symbols[i].storage==1&&f.symbols[i].slot==3)slot=4;v.kind=1;v.index=(uint8_t)slot;}
-   if((!scmp(name,"vColor")&&width!=4)||((!scmp(name,"vTexCoord")||!scmp(name,"vTexCoord1"))&&width!=2)){f_fail("reserved fragment varying type mismatch");}if(!scmp(name,"vTexCoord1"))slot=v.index=4;if(!scmp(name,"vTexCoord")&&slot!=3)f_fail("fragment varying slot collision");
-   for(unsigned i=0;i<f.ns;++i)if(f.symbols[i].storage==1&&f.symbols[i].slot==slot)f_fail("fragment varying slot occupied");
+  else{if(sampler||!width){f_fail("unsupported fragment varying type");break;}v.w=(uint8_t)width;
+   if((!scmp(name,"vColor")&&width!=4)||((!scmp(name,"vTexCoord")||!scmp(name,"vTexCoord1"))&&width!=2)){f_fail("reserved fragment varying type mismatch");}
+   int used[8]={0};for(unsigned i=0;i<f.ns;++i)if(f.symbols[i].storage==1&&f.symbols[i].slot<8)used[f.symbols[i].slot]=1;
+   if(!scmp(name,"vColor"))slot=1;
+   else if(!scmp(name,"vFog"))slot=2;
+   else if(!scmp(name,"vTexCoord"))slot=3;
+   else if(!scmp(name,"vTexCoord1"))slot=4;
+   else if(width==2){slot=!used[3]?3:!used[4]?4:!used[1]?1:!used[2]?2:6;}
+   else if(width==1){slot=!used[2]?2:!used[1]?1:!used[3]?3:!used[4]?4:6;}
+   else{slot=!used[1]?1:!used[2]?2:!used[3]?3:!used[4]?4:6;}
+   if(used[slot]){for(unsigned s=1;s<8;++s)if(s!=5&&!used[s]){slot=s;break;}}
+   if(used[slot])f_fail("fragment varying slot occupied");
+   if(width==2&&(slot==3||slot==4)){v.kind=1;v.index=(uint8_t)slot;}
+   else{for(unsigned k=0;k<(unsigned)width;++k)v.v[k]=f_intern(F_INPUT,k,0,0);}
   }f_symbol_add(name,v,storage,slot);
  }
  f_eat("void");f_eat("main");f_eat("(");if(f_eq("void"))f_next();f_eat(")");f_eat("{");f_value output=f_zero();unsigned assigned=0;
- while(!f.error&&!f_eq("}")&&f.token[0]){f_precision();int width=f_width(f.token);char name[32];if(width)f_next();scpy(name,f.token,32);if(!f_id(name[0])){f_fail("invalid fragment statement");break;}f_next();f_eat("=");f_value v=f_expr();f_eat(";");if(!scmp(name,"gl_FragColor")){if(width||v.kind||v.w!=4){f_fail("gl_FragColor needs vec4");break;}output=v;assigned=1;}
-  else if(width){if(v.kind||v.w!=width){f_fail("fragment local type mismatch");break;}f_symbol_add(name,v,0,0);}
-  else{int i=f_find(name);if(i<0||f.symbols[i].storage||v.kind||v.w!=f.symbols[i].value.w){f_fail("invalid fragment assignment");break;}f.symbols[i].value=v;}
+ while(!f.error&&!f_eq("}")&&f.token[0]){
+  if(f_eq("if")){f_next();f_eat("(");int pd=1;while(!f.error&&pd>0&&f.token[0]){if(f_eq("("))++pd;else if(f_eq(")"))--pd;f_next();}f_eat("discard");f_eat(";");continue;}
+  f_precision();int width=f_width(f.token);char name[32];if(width)f_next();scpy(name,f.token,32);if(!f_id(name[0])){f_fail("invalid fragment statement");break;}f_next();
+  int lanes[4]={0,1,2,3},nl=0;
+  if(!width&&f_eq(".")){f_next();const char *sets[3]={"xyzw","rgba","stpq"};int set=-1;
+   for(const char *s=f.token;*s;++s){int lane=-1,which=-1;for(int q=0;q<3;++q)for(int k=0;k<4;++k)if(sets[q][k]==*s){lane=k;which=q;}
+    if(lane<0||nl>=4||(set>=0&&set!=which)){f_fail("invalid fragment lhs swizzle");break;}set=which;lanes[nl++]=lane;}
+   f_next();
+  }
+  unsigned cop=0;if(f_eq("*"))cop=F_MUL;else if(f_eq("+"))cop=F_ADD;else if(f_eq("-"))cop=F_SUB;
+  if(cop)f_next();
+  f_eat("=");f_value v=f_expr();f_eat(";");
+  if(!scmp(name,"gl_FragColor")){if(width||v.kind||v.w!=4||nl||cop){f_fail("gl_FragColor needs vec4");break;}output=v;assigned=1;}
+  else if(width){if(v.kind||v.w!=width||nl||cop){f_fail("fragment local type mismatch");break;}f_symbol_add(name,v,0,0);}
+  else{int i=f_find(name);if(i<0||f.symbols[i].storage||v.kind){f_fail("invalid fragment assignment");break;}
+   f_value *dst=&f.symbols[i].value;
+   if(!nl){
+    if(cop){v=f_binary(cop,*dst,v);}
+    if(v.w!=dst->w){f_fail("invalid fragment assignment");break;}
+    *dst=v;
+   }else{
+    if(v.w!=1&&v.w!=nl){f_fail("fragment swizzle assign width mismatch");break;}
+    for(int k=0;k<nl;++k){
+     if(lanes[k]>=dst->w){f_fail("fragment swizzle lane out of range");break;}
+     uint16_t rhs=v.v[v.w==1?0:k];
+     dst->v[lanes[k]]=cop?f_op(cop,dst->v[lanes[k]],rhs):rhs;
+    }
+   }
+  }
  }
  f_eat("}");if(f.token[0])f_fail("fragment text after main");if(!assigned)f_fail("gl_FragColor not assigned");return output;
 }
