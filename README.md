@@ -79,3 +79,21 @@ hardware validation covers the drivers listed above, including NAND page
 reads. Clock stability beyond stock profiles remains under active bring-up.
 
 NanoOS by Tenspav. Requires the community untethered jailbreak to install.
+
+## Consolidated GLES 2.0, NAND/Storage & Application SDK
+
+See [docs/ARCHITECTURE_AND_SDK.md](docs/ARCHITECTURE_AND_SDK.md) for full architecture, memory map, and SDK details.
+
+- **GLES 2.0 + EGL Reimplementation ([`runtime/gl2/`](runtime/gl2/)):**
+  - `gl2api.c` (GLES 2.0 state/API + TSP combiner lowering), `gl2rt.c` (MBX Lite TA/TSP/ISP packet builder), `gl2vsc.c` (GLSL vertex shader -> VGP microcode compiler), `gl2tex.c` (mipmaps & texture formats including PVRTC 4bpp `0x38`), `gl2nano.c` (hardware submit/vsync), and standard `gl*`/`egl*` headers & wrappers under `runtime/gl2/std/` (`GLES2/gl2.h`, `EGL/egl.h`, `gl2std.c`, `egl_nano.c`).
+- **NAND PPN Driver & Storage Stack ([`src/nand.c`](src/nand.c), [`runtime/storage/`](runtime/storage/)):**
+  - Burst-DMA PPN NAND page reads, 1-bank SFTL `survey()` mount, 16-page (256 KiB) LRU disk sector cache (`disk.c`), and HFS+ B-tree binary-search catalog lookup (`hfs.c`), plus preallocated save-file helpers (`sdk/src/storage/`).
+- **Application SDK & Example ([`sdk/`](sdk/), [`examples/hello_gles2/`](examples/hello_gles2/)):**
+  - Build standalone `NGM1` apps via `make -C NanoOS app APP_DIR=/path/to/app` using `sdk/app.mk`, `nano_app.h`, `nano_fs.h`, `nano_heap.h`, and freestanding `sdk/include/libc/`.
+
+### Measured Hardware Performance (iPod Nano 7)
+
+- **SFTL/HFS+ Mount (`US[0]`):** `19.36 s` → `4.95–4.97 s` (1-bank `survey()` + `nand.c` burst/DMA).
+- **SHMUP `act1.scene` Asset Load (`US[3]`):** `5.85 s` (PNG) → `0.85 s` (offline `.ntx` PVRTC 4bpp + native formats) with `13.01 ms` cached cold file open (`1.15 ms` warm).
+- **SHMUP `act1.scene` Sustained Rendering (1,505 frames):** `software=0`, `fault=0`, `glerr=0`, median `16.83–16.99 ms/frame` (`~59 FPS`).
+- **`examples/hello_gles2` (`HELLO_BENCH`):** `30` hardware frames, `software=0`, `fault=0`.

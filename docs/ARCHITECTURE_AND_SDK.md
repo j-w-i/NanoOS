@@ -43,9 +43,15 @@ NanoOS is a bare-metal single-address-space kernel for the iPod Nano 7 (`S5L8740
 | `MM_GAME` | `0x0b000000..0x0ba00000` | Cached | `game.bin` image (`text/data/bss`) + tail heap |
 | `MM_GAME_HEAP2` | `0x0ba20000..0x0be40000` | Cached | Secondary SDK CPU heap region (clear of report mirrors) |
 
-## 3. GPU, Shader Compiler & Texture Formats
+## 3. GLES 2.0 Reimplementation, Shader Compiler & Texture Formats
 
-- **MBX Lite Pipeline:** `gl2rt.c` emits native TA/TSP/ISP draw headers; `gl2vsc.c` compiles GLSL vertex shaders into VGP microcode; `gl2api.c` + `gl2soft.inc` lowers supported single-pass fragment shaders (`C`, `P`, `T`, `T*C`, `T*P`) directly onto TSP combiners with zero software fallback.
+- **GLES 2.0 & EGL Implementation (`NanoOS/runtime/gl2/`):**
+  - `gl2api.c` / `gl2api.h` + `gl2soft.inc`: GLES 2.0 state machine, buffer/texture/shader/program objects, and single-pass TSP combiner lowering (`C`, `P`, `T`, `T*C`, `T*P`) with software fallback only for unsupported fragment shaders.
+  - `gl2rt.c` / `gl2rt.h`: Native PowerVR MBX Lite TA/TSP/ISP command-list builder.
+  - `gl2vsc.c` / `gl2vsc.h`: GLSL ES 1.00 vertex shader compiler emitting VGP microcode.
+  - `gl2tex.c`: Mipmap & texture upload/swizzle (`ARGB8888`, `RGB565`, `ARGB4444`, `ARGB1555`, `AL88`, and `PVRTC4`).
+  - `gl2nano.c` / `gl2nano.h`: Hardware MBX Lite submission, sync, and vsync swap backend.
+  - `std/gl2std.c`, `std/egl_nano.c`, `std/GLES2/gl2.h`, `std/EGL/egl.h`: Standard `gl*` and `egl*` C API wrappers and headers used by applications.
 - **PVRTC 4bpp Hardware Verification (`texpvrtc`, `run398`/`run399`):**
   - Physical Nano 7 silicon testing revealed that MBX TSP format `0x20000` decodes as **2bpp** (8×4 blocks), whereas `0x38000` (`fmt = 0x38`) decodes **4bpp PVRTC** (4×4 blocks) for both opaque (`RGB554`/`RGB555`) and alpha (`ARGB3443`/`ARGB3444`) blocks.
   - Block order is PowerVR Morton twiddle (`Y` in even bits `0x5555`, `X` in odd bits `0xAAAA`).
@@ -65,7 +71,7 @@ Include `<nano_app.h>`, `<nano_fs.h>`, `<nano_heap.h>`, `<EGL/egl.h>`, `<GLES2/g
 
 - **Lifecycle & Input (`nano_app.h`):**
   - `nano_app_init(api)` — binds `NGAME` API, initializes EGL platform & input state.
-  - `nano_app_poll_input(&in)` — polls buttons (`home_pressed` via `NGAME_HOME`) and maps landscape touch `(0..431, 0..239)` to portrait display `(239 - y, x)` with `pressed`/`moved`/`released` edges.
+  - `nano_app_poll_input(&in)` — polls buttons (`home_pressed` via `NGAME_HOME`) and maps landscape touch `(0..431, 0..239)` to portrait display `(239 - y, x)` with `pressed`/`moved`/`released` edges and `prev_x`/`prev_y` for drag deltas.
   - `nano_app_usec()`, `nano_app_dcache_clean()`, `nano_app_gfx_stats()`.
 - **Filesystem (`nano_fs.h`):**
   - `nano_fs_mount()`, `nano_fs_open(path)`, `nano_fs_read()`, `nano_fs_pread()`, `nano_fs_seek()`, `nano_fs_tell()`, `nano_fs_close()`, `nano_fs_read_all()`.
