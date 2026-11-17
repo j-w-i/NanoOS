@@ -3,6 +3,12 @@
 #include <stdint.h>
 void mbx_timings(uint32_t out[12]);
 void mbx_submit_parts(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words);
+/* v24: the vertex span may be streamed by DMA after return; keep it unchanged until the next mbx_* call. */
+void mbx_submit_parts_async(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words);
+const uint32_t *mbx_fifo_async_info(void);
+void mbx_fifo_sync(void);   /* finish any in-flight async span (its memory may then be reused) */
+void mbx_fifo_pump(void);
+void mbx_fiq_disarm(void);  /* stop the FIQ FIFO feeder, restore VBAR / VIC routing (game exit, halt) */   /* feed queued async spans into the FIFO as far as it has room, without waiting */
 /* id: core +0xf00 (core ID); rev: +0xf10; sig: +0xff0..+0xffc bytes
  * (0xb105f00d on cores that have it); done_us: scene submit to render
  * done; scenes: completed; status: +0x12c at the end of the last one;

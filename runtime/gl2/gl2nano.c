@@ -81,6 +81,16 @@ static int submit_parts(const uint32_t *header,uint32_t nh,const void *vertices,
     }
     b->api->mbx_submit_parts(header,nh,vertices,nv);++b->draws;++b->frame_draws;++b->direct_draws;b->words+=nh+nv;return 0;
 }
+static int submit_parts_async(const uint32_t *header,uint32_t nh,const void *vertices,uint32_t nv,void *user){
+    gl2_nano *b=user;
+    if(!owned(b)||!b->frame_open||b->cpu_active||b->fault||!header||!nh||!vertices||!nv){
+        if(b){++b->errors;if(b->ctx)gl2_invalidate_state_cache(b->ctx);}
+        return -1;
+    }
+    b->api->mbx_submit_parts_async(header,nh,vertices,nv);++b->draws;++b->frame_draws;++b->direct_draws;b->words+=nh+nv;return 0;
+}
+static void submit_sync(void *user){gl2_nano *b=user;if(owned(b))b->api->mbx_fifo_sync();}
+static void submit_pump(void *user){gl2_nano *b=user;if(owned(b))b->api->mbx_fifo_pump();}
 static int nano_clear(struct gl2_ctx *c,uint32_t mask,uint32_t argb,float depth,uint32_t color_mask,uint32_t scissor_enabled,const int32_t scissor[4],void *user);
 static int nano_read(struct gl2_ctx *c,int x,int y,int w,int h,uint32_t format,uint32_t type,uint32_t pack,void *pixels,void *user);
 int gl2_nano_open(gl2_nano *b,const struct nanoos_api *api,gl2_ctx *c,
@@ -98,6 +108,10 @@ int gl2_nano_open(gl2_nano *b,const struct nanoos_api *api,gl2_ctx *c,
     gl2_init(c,progs,segment,cap,submit,b);
     gl2_set_state_cache(c,0);
     if(NGAME_API_TABLE(api)>=21&&api->mbx_submit_parts)c->submit_parts=submit_parts;
+#ifndef GL2_NANO_ASYNC_FIFO
+#define GL2_NANO_ASYNC_FIFO 1   /* queue cached vertex spans; the kernel's 20 us FIQ feeder streams them while the application runs (API v24) */
+#endif
+    if(GL2_NANO_ASYNC_FIFO&&NGAME_API_TABLE(api)>=24&&api->mbx_submit_parts_async&&api->mbx_fifo_sync&&api->mbx_fifo_pump){c->submit_parts_async=submit_parts_async;c->submit_sync=submit_sync;c->submit_pump=submit_pump;}
     c->texture_write_guard=write_guard;c->texture_write_guard_user=b;
     c->clear=nano_clear;c->clear_user=b;
     c->read_pixels=nano_read;c->read_pixels_user=b;
@@ -317,7 +331,7 @@ void gl2_nano_close(gl2_nano *b) {
     }
     gl2_set_state_cache(b->ctx,0);
     b->ctx->soft_target=0;b->ctx->soft_depth=0;
-    b->ctx->submit_parts=0;b->ctx->submit=deny_submit;b->ctx->submit_user=0;
+    b->ctx->submit_parts=0;b->ctx->submit_parts_async=0;b->ctx->submit_sync=0;b->ctx->submit_pump=0;b->ctx->submit=deny_submit;b->ctx->submit_user=0;
     b->ctx->texture_write_guard=deny;b->ctx->texture_write_guard_user=0;
     b->ctx->texture_sync=0;b->ctx->texture_sync_user=0;
     b->frame_open=b->completed=b->opened=b->pending_valid=0;b->pending_target=b->retired_target=0;owner=0;

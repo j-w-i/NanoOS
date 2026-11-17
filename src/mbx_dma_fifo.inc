@@ -1,9 +1,15 @@
-/* Experimental DMA feeding of the already-owned MBX FIFO. Disabled by default.
+/* DMA feeding of the already-owned MBX FIFO.
+ * MBX_FIFO_DMA 1: experimental synchronous capacity-reserved spans (memory-to-memory mode).
+ * MBX_FIFO_DMA 2: asynchronous flow-controlled vertex spans (mbx_submit_parts_async, mbx.c).
+ *   Runs 535/536: the GPU never raised the request with any of 6 channel configurations
+ *   (count untouched, no error, FIFO empty); RetailOS itself feeds the 3D FIFO by CPU.
+ * MBX_FIFO_DMA 3 (default): the FIFO queue's vertex chunks, each at most the free FIFO room, are
+ *   copied by memory-to-memory DMA so the CPU only programs them (mbx.c fqd_*).
  * Live-pinned firmware maps GPU request30 to DMA engine2 request1 and clockID6.
  * Start with capacity-reserved32word transfers, preserving every packet bell.
  * Initial implementation waits synchronously; it does not claim a free CPU. */
 #ifndef MBX_FIFO_DMA
-#define MBX_FIFO_DMA 0
+#define MBX_FIFO_DMA 3
 #endif
 #ifndef MBX_FIFO_DMA_PORT
 #define MBX_FIFO_DMA_PORT 0x3b800000u
@@ -61,6 +67,7 @@ static void fdma_open(void){
  fdma_owned=1;fdma_ready=0;
  FDMA(0x104)=MBX_FIFO_DMA_PORT;FDMA(0x108)=0;FDMA(0x10c)=MBX_FIFO_DMA_CFG;fdma_barrier();r[1]=1;
 }
+#if MBX_FIFO_DMA == 1
 static int fdma_span(const void*source,uint32_t words){
  uint32_t*r=mbx_fifo_dma_stats;uint32_t entered=USEC;uintptr_t a=(uintptr_t)source,end=a+words*4u;
  if(!fdma_owned||!fdma_ready||!words||words>123u||(a&3u)||a<MM_DRAM||end<a||end>MM_DRAM+0x04000000u)return -1;
@@ -94,6 +101,7 @@ static int fdma_span(const void*source,uint32_t words){
  if(rc){++r[5];FDMA(0x110)=0;fdma_barrier();if(fdma_wait_idle(20000)){FDMA(0x30)=0;fdma_barrier();}return -1;}
  FDMA(0x08)=1;fdma_barrier();++r[2];r[3]+=words;return 0;
 }
+#endif
 #else
 static void fdma_open(void){mbx_fifo_dma_stats[0]=0;}
 static void fdma_close(void){}

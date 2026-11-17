@@ -94,17 +94,18 @@ static int submit_draw_packet_i(gl2_ctx *c, uint32_t *seg, uint32_t n, uint32_t 
     int fail = 0;
     PT(td);uint32_t dn = hit ? 0u : delta_header(c, seg, prefix);if(gl2_prof_clock)gl2_prof2[1]+=gl2_prof_clock()-td;
     gl2_prof2[4]+=hit?2u:dn?dn+2u:nh;gl2_prof2[5]+=parts_src?parts_words:(n>nh?n-nh:0u);if(!hit&&!dn)++gl2_prof2[6];if(dn)++gl2_prof2[7];
+    int (*parts)(const uint32_t *,uint32_t,const void *,uint32_t,void *) = (c->parts_stable && parts_src && c->submit_parts_async) ? c->submit_parts_async : c->submit_parts;
     if (dn && (parts_src || c->submit_parts)) {
         /* Same program and constant layout as the cached header: send only the
          * changed constant records (and the state tail if it changed), then the
          * two primitive words. VGP program, constants and TA state persist
          * between packets exactly as on a full cache hit. */
         delta_buf[dn] = seg[prefix]; delta_buf[dn + 1u] = seg[prefix + 1u];
-        if (parts_src) fail = c->submit_parts(delta_buf, dn + 2u, parts_src, parts_words, c->submit_user);
+        if (parts_src) fail = parts(delta_buf, dn + 2u, parts_src, parts_words, c->submit_user);
         else fail = c->submit_parts(delta_buf, dn + 2u, seg + nh, n - nh, c->submit_user);
         ++gl2_delta_headers;
     }
-    else if (parts_src) fail = c->submit_parts(sub, hit ? 2u : nh, parts_src, parts_words, c->submit_user);
+    else if (parts_src) fail = parts(sub, hit ? 2u : nh, parts_src, parts_words, c->submit_user);
     else if (c->submit) fail = c->submit(sub, n - (hit ? prefix : 0u), c->submit_user);
     if (fail) { gl2_invalidate_state_cache(c); return -1; }
     if (c->state_cache_enabled && !hit && (parts_src || c->submit) && prefix <= GL2_MAX_HEADER_WORDS) {
@@ -985,11 +986,15 @@ static int vc_signature(gl2_ctx *c,const gl2_prog_obj *P,uint32_t *out){
     *out=sig;return 1;
 }
 /* Submit a cached draw: strips one packet each, a list as one packet. */
+/* Cached spans stay in vcache for the frame, so they may be streamed by DMA after the
+ * call returns (submit_parts_async); vcache memory is only reused after submit_sync. */
 static int vc_submit(gl2_ctx *c,const gl2_prog_obj *P,uint32_t header,const uint32_t *v,const uint16_t *lens,uint32_t nprim,uint32_t count){
-    const uint32_t vw=GL2_VW(&P->prog);
-    if(!lens){return submit_draw_packet(c,c->seg,header,header,v,count*vw);}
-    for(uint32_t pi=0;pi<nprim;++pi){uint32_t nw=(uint32_t)lens[pi]*vw;if(submit_draw_packet(c,c->seg,header,header,v,nw))return -1;v+=nw;}
-    return 0;
+    const uint32_t vw=GL2_VW(&P->prog);int r=0;
+    c->parts_stable=1;
+    if(!lens)r=submit_draw_packet(c,c->seg,header,header,v,count*vw);
+    else for(uint32_t pi=0;pi<nprim;++pi){uint32_t nw=(uint32_t)lens[pi]*vw;if(submit_draw_packet(c,c->seg,header,header,v,nw)){r=-1;break;}v+=nw;}
+    c->parts_stable=0;
+    return r;
 }
 #endif
 /* Set only by draw_prims: the indices form prim_count strips of prim_len[i]
@@ -1084,7 +1089,7 @@ static int draw_gather(gl2_ctx *c, gl2_prog_obj *P, uint32_t mode, int count, co
                 gl2_strip_entry *se=(gl2_strip_entry *)prim_entry;
                 uint32_t words=(uint32_t)count*vw;
                 if(cacheable&&!(se->vc_epoch==vcache_epoch&&se->vc_sig==sig)&&words<=GL2_VCACHE_WORDS){
-                    if(vcache_used+words>GL2_VCACHE_WORDS){vcache_used=0;++vcache_epoch;}
+                    if(vcache_used+words>GL2_VCACHE_WORDS){if(c->submit_sync)c->submit_sync(c->submit_user);vcache_used=0;++vcache_epoch;}   /* no DMA may still read the old spans */
                     uint32_t *o=vcache+vcache_used;
                     gl2_vertex_convert(at,bp,nin,withcol,uv0w,uv1w,(unsigned)(P->prog.pack_pos|P->prog.pack_uv1<<1),indices,0,count,o);
                     se->vc_off=vcache_used;se->vc_sig=sig;se->vc_epoch=vcache_epoch;vcache_used+=words;

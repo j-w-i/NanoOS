@@ -183,3 +183,70 @@ display servicing 1.4 ms, update 1.2 ms, swap 1.4 ms. **These run one after the 
 overlapping CPU work with GPU vertex processing (a frame-sized command buffer fed to the TA FIFO by DMA or
 an interrupt while the CPU continues), which would bring the average under 16.7 ms and roughly halve the
 heavy views.
+
+## 9. CPU/GPU overlap attempts (runs 535-538)
+
+Goal: let the GPU keep consuming vertex words while the CPU runs the application, instead of the
+CPU spinning on the full 123-word TA FIFO and the GPU idling during application work.
+
+**Flow-controlled DMA (kernel `MBX_FIFO_DMA 2`, API v24 `mbx_submit_parts_async`)**: the header goes
+through the CPU, the vertex span is streamed by DMA engine 2 channel 0 in memory-to-peripheral mode,
+the call returns and the doorbell is rung at the next FIFO access (`fa_sync`). The channel
+configuration follows RetailOS's driver (config = flow << 11 | dest request << 6 | src request << 1 |
+0x8001; the GPU is engine 2 request 1). Result: **the GPU never raised its DMA request** with any of
+six configurations (runs 535/536: count untouched, no DMA error, FIFO empty, TC never set). RetailOS
+must enable the request somewhere not yet found. The timeout/overflow abort, scene failure and
+recovery path worked (one recovered fault, then CPU fallback). Off by default (`MBX_FIFO_DMA 0`).
+
+**Software queue (`MBX_FIFO_QUEUE`)**: async draws are queued in the kernel and fed without waiting
+whenever the application calls into GL (`mbx_fifo_pump` from every `gl2std` entry). Correct on the
+device, but **no gain** (run537: walk 18.3 ms either way): a pump can only top the FIFO up, the GPU
+drains it in ~25 us, and the application's CPU stretches between GL calls are far longer. Its 140 KB
+of kernel BSS also broke the NanoEmu boot, so it is compiled out (`MBX_FIFO_QUEUE 0`) and the v24 calls
+fall back to synchronous submission (`GL2_NANO_ASYNC_FIFO 0` in the runtime).
+
+**Is there a DMA enable to find? No.** A read-only dump of the running RetailOS (`hwbridge/dump_ram.py`,
+0x08000000-0x08A00000) confirms the firmware's DMA tables: request 30 = engine 2 request 1 at
+peripheral address 0x3b000000 (table at 0x0890c170, channel start 0x080b1cb4, config = flow |
+dest req << 6 | src req << 1 | 0x8001). But the earlier stock-path trace
+(`hw-reports/native-submit-trace.md`) shows **RetailOS feeds the 3D FIFO with CPU stores** (credit
+from +0x12c occupancy, 123 - occupancy), run155 already saw the hardware-paced request time out, and
+run158 showed 0x3b000000 is not a 3D FIFO alias. The 0x3b800000 literals in the firmware are the
+float 1/256, not FIFO pointers. Software-paced DMA works but only in credit-sized pieces and was
+slower than CPU stores (runs 156-163).
+
+What would work: something that refills the FIFO while application code runs: an interrupt-driven feeder (a timer every ~20 us topping
+the FIFO up from the queue; NanoOS currently runs with CPU interrupts masked). Expected gain from the
+profile: up to ~6 ms of the 18.3 ms average frame.
+
+## 10. FIQ-fed FIFO with DMA copying (runs 539-546)
+
+The kernel now feeds the TA FIFO from a queue while the application runs (all generic, kernel API v24):
+- `mbx_submit_parts_async` queues cached draws (header words copied, vertex span referenced);
+  every synchronous FIFO use and the EOL drain the queue first, so packet order and one doorbell per
+  packet hold. `GL2_NANO_ASYNC_FIFO 1` uses it for converted-vertex-cache spans.
+- **FIQ feeder** (`MBX_FIFO_FIQ`): timer channel B (3 MHz, VIC IRQ 8, set up as RetailOS's scheduler
+  tick) is routed to the CPU's FIQ line only (VIC INTSELECT bit 8), so the IRQ sources RetailOS left
+  enabled stay masked. A small vector table (`src/fiq.s`, installed through VBAR while a game runs;
+  other exceptions go to the previous vectors and are recorded in `nano_exc_info`) calls
+  `nano_fiq_handler`, which tops the FIFO up every 10 us unless main code is in a FIFO section.
+  First boot faulted because ARM helpers lacked `.type %function` (Thumb `bl` into ARM code).
+- **DMA copying** (`MBX_FIFO_DMA 3`): each top-up hands the FIFO's free room to DMA engine 2 channel 0
+  (memory to memory, source AHB master 2), so the CPU only programs the transfer.
+
+Measurement that changed the plan: sampling FIFO occupancy every tick showed the FIFO **empty 78% of the
+time** (run540): the frame is CPU-bound, so feeding alone could not help; moving the copying off the CPU did.
+
+| Run | Change | Walk avg | median | frames < 16.7 ms | p99 |
+|---|---|---|---|---|---|
+| 534/538 | before | 18.3 ms | 17.3 | 254 / 600 | 39 ms |
+| 539 | FIQ feeder, CPU copies | 18.5 ms | 17.7 | 254 | 40 ms |
+| 541 | + DMA copying, 20 us | 17.3 ms | 16.2 | 407 | 35 ms |
+| 543 | 10 us period | **17.1 ms** | **15.7** | **440** | 36 ms |
+| 544 | 5 us period | 17.7 ms | 16.5 | 395 | 38 ms |
+
+**Texture filtering:** OpenLara's port forced LOW (nearest) in `Game::init`; the Nano build now lets the
+launcher choose (`LARA_FILTER`, playable default 1 = bilinear). Bilinear costs nothing (run546: 17.1 ms).
+Trilinear (TSP filter 0xce) faulted on every frame on hardware (run545, 300 recoveries), so the runtime
+samples the nearest mip level instead (`GL2_TRILINEAR 0`). Shadows above LOW (shadow maps) and per-pixel
+specular are not possible on the MBX combiner; OpenLara's LOW blob shadows already render.

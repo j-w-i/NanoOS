@@ -281,6 +281,7 @@ static const struct nanoos_api api = {
     mbx_submit_parts,
     mbx_queue_capacity, mbx_render_async,
     lcd_present_buffer, lcd_buffer_busy,
+    mbx_submit_parts_async, mbx_fifo_sync, mbx_fifo_async_info, mbx_fifo_pump,
 };
 
 static int outside(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi) {
@@ -440,4 +441,5 @@ void game_run(void) {
     __asm__ volatile("mcr p15, 0, %0, c7, c5, 0\n mcr p15, 0, %0, c7, c5, 6\n dsb sy\n isb"
                      :: "r"(0) : "memory");
     ((int (*)(const struct nanoos_api *))g->entry)(&api);
+    mbx_fiq_disarm();   /* the game may return with the FIFO feeder armed */
 }

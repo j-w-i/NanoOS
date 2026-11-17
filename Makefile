@@ -5,7 +5,7 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 # Strongly-ordered, where an unaligned load faults (GCC merges byte loads
 # into ldrh/ldr); with it on, the uncached DMA sections still are.
 CFLAGS := -mcpu=cortex-a5 -marm -O2 -mno-unaligned-access -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-pic -fno-common -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Iruntime/gl2 -Iruntime/storage -MMD -MP
-OBJECTS := $(addprefix build/,startup.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o btui.o libc_shim.o gl2rt.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o)
+OBJECTS := $(addprefix build/,startup.o fiq.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o btui.o libc_shim.o gl2rt.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o)
 # Size: the chainloader package must fit the Blocks.hbapp slot it replaces
 # in the emulator test (20708 bytes, emulator/tools/disk_patch.py). Code
 # off the pixel/bus hot paths is Thumb-2 (-O2: -Os calls libgcc for divisions by constants); lcd, input, timer, font
@@ -41,6 +41,8 @@ build/hfs.o: runtime/storage/hfs.c | build
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 build/startup.o: src/startup.s | build
+	$(CC) $(CFLAGS) -c $< -o $@
+build/fiq.o: src/fiq.s | build
 	$(CC) $(CFLAGS) -c $< -o $@
 build/kernel.elf: $(OBJECTS) kernel.ld
 	$(CC) $(CFLAGS) -nostdlib -Wl,-T,kernel.ld,--gc-sections,--build-id=none,--no-undefined,-Map,build/kernel.map $(OBJECTS) -lgcc -o $@

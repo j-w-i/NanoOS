@@ -106,6 +106,9 @@ static int count_stages(const gl2_program *p,uint32_t *stages_out,uint32_t *rows
     *stages_out = stages; *rows_out = rows;
     return 0;
 }
+#ifndef GL2_TRILINEAR
+#define GL2_TRILINEAR 0
+#endif
 extern uint32_t (*gl2_prof_clock)(void); extern uint32_t gl2_prof2[8];
 const uint32_t *gl2_hdr_memo_out; static const uint32_t *gl2_hdr_memo_code; static uint32_t gl2_hdr_memo_n, gl2_hdr_memo_k, gl2_hdr_memo_rot;
 static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
@@ -204,7 +207,9 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
         uint32_t cm=0;if(tex[u].storage&GL2_TEX_CLAMP_S)cm|=1u<<31;if(tex[u].storage&GL2_TEX_CLAMP_T)cm|=1u<<29;
         uint32_t filt=0x12;if(tex[u].storage&GL2_TEX_LINEAR)filt=0x92;
         if(tex[u].storage&GL2_TEX_MIP_NEAREST)filt=(tex[u].storage&GL2_TEX_LINEAR)?0xb2u:0x32u;
-        else if(tex[u].storage&GL2_TEX_MIP_LINEAR)filt=(tex[u].storage&GL2_TEX_LINEAR)?0xceu:0x4eu;
+        /* Trilinear (0xce/0x4e) faulted every frame on hardware (run545, OpenLara filter MEDIUM):
+         * GL2_TRILINEAR 0 samples the nearest mip level instead (0xb2/0x32). */
+        else if(tex[u].storage&GL2_TEX_MIP_LINEAR)filt=GL2_TRILINEAR?((tex[u].storage&GL2_TEX_LINEAR)?0xceu:0x4eu):((tex[u].storage&GL2_TEX_LINEAR)?0xb2u:0x32u);
         out[k++] = (lw << 24) | (lh << 20) | (fmt<<12) | 0x600u | cm | ((p->dot3_mask&(1u<<u))?1u<<13:0); out[k++] = (filt<<24) | (tex[u].va >> 7); out[k++] = (w2_of(p->plan + 12 * u)&~0x7fffu)|(p->custom_alpha?p->alpha[u]:0x4610u);
     }
     out[k++] = 0x2003801au; out[k++] = (p->pack_pos ? 8u : 4u) | p->normal_input << 4 | (p->omit_colour ? 0 : 5u << 8) | GL2_UV0W(p) << 12 | ((p->pack_uv1 ? 5u : p->uv1_input) << 16); out[k++] = 0;

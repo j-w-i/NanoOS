@@ -275,6 +275,8 @@ typedef struct gl2_ctx {
     /* Optional immediate two-span submission; exactly one primitive packet.
      * The callback must consume both spans before returning. */
     int (*submit_parts)(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words,void *user); uint32_t *seg; uint32_t seg_cap;
+    /* optional: like submit_parts, but the vertex span may still be read (DMA) after return; used when parts_stable is set (converted-vertex cache) */
+    int (*submit_parts_async)(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words,void *user); void (*submit_sync)(void *user); void (*submit_pump)(void *user); uint8_t parts_stable;
     uint8_t state_cache_enabled, cached_hdr_valid;
     uint32_t buffer_gen;
     uint32_t cached_hdr_words, cached_hdr[GL2_MAX_HEADER_WORDS];

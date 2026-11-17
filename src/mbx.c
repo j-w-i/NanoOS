@@ -51,6 +51,20 @@ static inline __attribute__((always_inline)) void ack_bits(uint32_t bits){
 #define GRID (((NY - 1) << 16) | (NX - 1))
 #define PB_BYTES 0x10000u
 #include "mbx_dma_fifo.inc"
+#ifndef MBX_FIFO_QUEUE
+/* Software FIFO queue for mbx_submit_parts_async (see fq_pump), fed by a 20 us FIQ (MBX_FIFO_FIQ).
+ * Fed only at GL calls it gained nothing (run537: the GPU drains the 123-word FIFO in ~25 us). */
+#define MBX_FIFO_QUEUE 1
+#endif
+#ifndef MBX_FIFO_FIQ
+#define MBX_FIFO_FIQ 1
+#endif
+#if MBX_FIFO_DMA != 2 && MBX_FIFO_QUEUE
+static void fq_clear(void);
+#endif
+#if MBX_FIFO_DMA == 2
+static uint32_t fa_pending, fa_bell, fa_off;   /* async vertex DMA in flight, doorbell owed, disabled */
+#endif
 #define SCENE_OFFSET 0x1004u
 static uint32_t scene_timing[12];
 #ifndef MBX_FIFO_PROFILE
@@ -343,6 +357,12 @@ static void reset(uint32_t us, uint32_t passes) {
 void mbx_halt(void) {
 #if MBX_FRAME_PIPELINE
     async_pending=async_events=0;
+#endif
+#if MBX_FIFO_DMA == 2
+    if(fa_pending){FDMA(0x110)=0;fdma_barrier();fa_pending=fa_bell=0;}
+#elif MBX_FIFO_QUEUE
+    mbx_fiq_disarm();
+    fq_clear();
 #endif
     fdma_close();
     reset(500u, 16u);
@@ -917,6 +937,246 @@ static void fail(uint32_t reason) {
     }
     scene_failed = 1;
 }
+static int fifo_room(void);
+/* ---- asynchronous flow-controlled vertex spans (MBX_FIFO_DMA 2) ----
+ * The CPU writes a draw's header, then DMA engine 2 channel 0 streams the vertex span
+ * into the TA FIFO in memory-to-peripheral mode, paced by the GPU's DMA request (engine 2
+ * request 1, as RetailOS's driver programs it: config = flow 1 << 11 | dest request << 6 |
+ * 0x8001). The call returns at once, so the CPU runs the application while the GPU
+ * consumes the span. The packet's doorbell is owed until the transfer ends: every later
+ * FIFO access (fa_sync) waits for the channel, checks FIFO overflow and rings it first.
+ * A timeout or overflow aborts the channel, fails the scene (gl2 recovers) and disables
+ * the feature for the session; spans then go through the CPU as before. */
+#ifndef MBX_FIFO_ASYNC_CFG
+#define MBX_FIFO_ASYNC_CFG 0x8841u
+#endif
+#ifndef MBX_FIFO_ASYNC_MIN
+#define MBX_FIFO_ASYNC_MIN 256u     /* shorter spans are written by the CPU */
+#endif
+#ifndef MBX_FIFO_ASYNC_TIMEOUT_US
+#define MBX_FIFO_ASYNC_TIMEOUT_US 100000u
+#endif
+/* 0 mode (2 when compiled in), 1 spans, 2 words, 3 sync wait us, 4 syncs that waited,
+ * 5 disabled reason (1 timeout, 2 overflow, 3 channel busy, 4 not owned), 6 CPU-fallback spans, 7 max wait us */
+uint32_t mbx_fifo_async_stats[24];   /* 8..: config tried, then per failed attempt (cfg,remaining,ch cfg,int,err,raw tc,raw err,+0x12c) of the last one */
+#if MBX_FIFO_DMA == 2
+static const uint32_t fa_cfgs[]={MBX_FIFO_ASYNC_CFG,0x8803u,0xa841u,0xa803u,0x9041u,0x9003u};   /* dest req1 M2P; src field; periph-flow; ...; flow 2 */
+#define FA_NCFG (sizeof fa_cfgs/sizeof fa_cfgs[0])
+static uint32_t fa_try;
+#endif
+#if MBX_FIFO_DMA == 2
+static void fa_abort(uint32_t why){
+    uint32_t *d=mbx_fifo_async_stats+9;
+    d[0]=fa_cfgs[fa_try%FA_NCFG];d[1]=FDMA(0x114);d[2]=FDMA(0x110);d[3]=FDMA(0x04);d[4]=FDMA(0x0c);d[5]=FDMA(0x14);d[6]=FDMA(0x18);d[7]=CORE(0x12c);
+    d[8]=FDMA(0x100);d[9]=FDMA(0x104);d[10]=FDMA(0x10c);d[11]=FDMA(0x30);d[12]=*(volatile uint32_t *)0x3c500048u;
+    FDMA(0x110)=0;fdma_barrier();
+    if(fdma_wait_idle(20000)){FDMA(0x30)=0;fdma_barrier();}
+    FDMA(0x08)=1;fdma_barrier();
+    fa_pending=fa_bell=0;mbx_fifo_async_stats[5]=why;fail(15);
+    /* try the next channel configuration in a later scene; give up after all */
+    if(++fa_try>=FA_NCFG)fa_off=1;
+    mbx_fifo_async_stats[8]=fa_try;
+}
+static void fa_sync(void){
+    if(!fa_pending)return;
+    uint32_t start=USEC,waited=0;
+    for(uint32_t spins=0;FDMA(0x110)&1u;++spins){
+        waited=1;
+        if(!(spins&15u)&&(USEC-start>=MBX_FIFO_ASYNC_TIMEOUT_US||(CORE(0x12c)&OVERFLOW))){fa_abort((CORE(0x12c)&OVERFLOW)?2u:1u);return;}
+    }
+    uint32_t w=USEC-start;mbx_fifo_async_stats[3]+=w;if(waited)++mbx_fifo_async_stats[4];if(w>mbx_fifo_async_stats[7])mbx_fifo_async_stats[7]=w;
+    FDMA(0x08)=1;
+    if(CORE(0x12c)&OVERFLOW){fa_abort(2);return;}
+    fa_pending=0;
+    barrier();
+    if(fa_bell){DOORBELL=1;++scene_bells;fa_bell=0;}
+    barrier();
+}
+/* 0 started (doorbell owed), -1 not taken: the caller submits the span itself */
+static int fa_start(const void *src,uint32_t words){
+    uintptr_t a=(uintptr_t)src,end=a+words*4u;
+    if(fa_off||!fdma_owned||!fdma_ready||words<MBX_FIFO_ASYNC_MIN||words>0xffffu||(a&3u)||a<MM_DRAM||end<a||end>MM_DRAM+0x04000000u)return -1;
+    if(FDMA(0x110)&1u){fa_off=1;mbx_fifo_async_stats[5]=3;return -1;}
+    for(uintptr_t line=a&~31u;line<end;line+=32)__asm__ volatile("mcr p15,0,%0,c7,c10,1"::"r"(line):"memory");  /* clean for the DMA master */
+    fdma_barrier();
+    FDMA(0x08)=1;FDMA(0x100)=(uint32_t)a;FDMA(0x104)=MBX_FIFO_DMA_PORT;FDMA(0x108)=0;FDMA(0x10c)=MBX_FIFO_DMA_CFG;FDMA(0x114)=words;fdma_barrier();
+    FDMA(0x110)=fa_cfgs[fa_try%FA_NCFG];fdma_barrier();
+    fa_pending=1;fa_bell=1;++mbx_fifo_async_stats[1];mbx_fifo_async_stats[2]+=words;
+    return 0;
+}
+#elif MBX_FIFO_QUEUE
+/* ---- software FIFO queue (MBX_FIFO_QUEUE, default) ----
+ * mbx_submit_parts_async queues the draw (header words copied, vertex span referenced:
+ * the caller keeps it unchanged until mbx_fifo_sync or the next synchronous FIFO use)
+ * and feeds the FIFO only as far as it has room, without waiting. mbx_fifo_pump, called by
+ * the runtime at every GL entry, feeds more. The GPU so keeps consuming queued vertices
+ * while the CPU runs the application between draws instead of the CPU spinning on a full
+ * FIFO and the GPU idling during application work. Every synchronous FIFO write and the
+ * EOL first drain the queue (fa_sync), so packet order and one doorbell per packet hold. */
+#ifndef MBX_FQ_ENTRIES
+#define MBX_FQ_ENTRIES 256u
+#endif
+#ifndef MBX_FQ_HDR_WORDS
+#define MBX_FQ_HDR_WORDS 8192u   /* 140 KB of queue broke the NanoEmu boot; 37 KB here */
+#endif
+static struct { uint32_t hoff, nh; const uint32_t *v; uint32_t nv, done; } fq[MBX_FQ_ENTRIES];
+static uint32_t fq_hdr[MBX_FQ_HDR_WORDS];
+static uint32_t fq_head, fq_tail, fq_hw, fq_hr;   /* entry ring; header words written / released (monotonic) */
+static volatile uint32_t fq_busy;   /* main code is in a FIFO section: the FIQ feeder stays out */
+#if MBX_FIFO_DMA == 3
+static uint32_t fqd_n;
+static void fqd_abort(void);
+#endif
+static void fq_clear(void){
+#if MBX_FIFO_DMA == 3
+    if(fqd_n)fqd_abort();
+#endif
+    fq_head=fq_tail=fq_hw=fq_hr=0;}
+/* Feed queued packets. block: wait for room (bounded) until the queue is empty. */
+#if MBX_FIFO_DMA == 3
+/* DMA copying (MBX_FIFO_DMA 3): a vertex chunk of up to the FIFO's free room is copied by DMA
+ * engine 2 channel 0 in memory-to-memory mode (software-paced, the mode runs 156-163 validated;
+ * source AHB master 2 as run159's fastest), so the CPU only programs it. The chunk never exceeds
+ * the room read before it starts, and nothing else writes the FIFO while it is in flight. */
+#ifndef MBX_FQ_DMA_MIN
+#define MBX_FQ_DMA_MIN 32u          /* shorter chunks are stored by the CPU */
+#endif
+#ifndef MBX_FQ_DMA_CTRL
+#define MBX_FQ_DMA_CTRL 0x85489000u /* TC irq flag, src incr, 32-bit, burst 4, src master 2, fixed dst */
+#endif
+uint32_t mbx_fq_dma_stats[4];       /* chunks, words, polls that found it busy, aborts */
+static void fqd_abort(void){FDMA(0x110)=0;fdma_barrier();if(fdma_wait_idle(20000)){FDMA(0x30)=0;fdma_barrier();}FDMA(0x08)=1;fqd_n=0;++mbx_fq_dma_stats[3];}
+/* 1: a chunk is still in flight (non-blocking); 0: none (the finished one is accounted) */
+static int fqd_poll(int block){
+    if(!fqd_n)return 0;
+    if(FDMA(0x110)&1u){
+        if(!block){++mbx_fq_dma_stats[2];return 1;}
+        uint32_t t0=USEC;
+        for(uint32_t spins=0;FDMA(0x110)&1u;++spins)if(!(spins&15u)&&USEC-t0>=20000u){fqd_abort();fail(16);return 0;}
+    }
+    FDMA(0x08)=1;
+    fq[fq_head%MBX_FQ_ENTRIES].done+=fqd_n;fqd_n=0;
+    return 0;
+}
+static int fqd_start(const uint32_t *src,uint32_t n){
+    uintptr_t a=(uintptr_t)src,end=a+n*4u;
+    if(!fdma_owned||!fdma_ready||n<MBX_FQ_DMA_MIN||a<MM_DRAM||end>MM_DRAM+0x04000000u)return -1;
+    for(uintptr_t line=a&~31u;line<end;line+=32)__asm__ volatile("mcr p15,0,%0,c7,c10,1"::"r"(line):"memory");
+    fdma_barrier();                 /* cleaned source and earlier CPU FIFO stores land first */
+    FDMA(0x08)=1;FDMA(0x100)=(uint32_t)a;FDMA(0x104)=MBX_FIFO_DMA_PORT;FDMA(0x108)=0;FDMA(0x10c)=MBX_FQ_DMA_CTRL;FDMA(0x114)=n;fdma_barrier();
+    FDMA(0x110)=0x8001u;fdma_barrier();
+    fqd_n=n;++mbx_fq_dma_stats[0];mbx_fq_dma_stats[1]+=n;
+    return 0;
+}
+#endif
+static void fq_pump(int block){
+    while(fq_head!=fq_tail){
+        if(scene_failed){fq_clear();return;}
+#if MBX_FIFO_DMA == 3
+        if(fqd_poll(block))return;
+#endif
+        uint32_t e=fq_head%MBX_FQ_ENTRIES,total=fq[e].nh+fq[e].nv;
+        while(fq[e].done<total){
+#if MBX_FIFO_DMA == 3
+            if(fqd_poll(block))return;
+            if(fq[e].done>=total)break;
+#endif
+            uint32_t room;
+            if(block){int r=fifo_room();if(r<0){fq_clear();return;}room=(uint32_t)r;}
+            else{
+#if MM_MBX_FIFO_DEVICE
+                barrier();
+#endif
+                uint32_t st=CORE(0x12c);if(st&OVERFLOW){fail(2);fq_clear();return;}
+                uint32_t occ=st>>16&0xffu;if(occ>=0x7bu){++mbx_fifo_async_stats[4];return;}
+                room=0x7bu-occ;
+            }
+            uint32_t d=fq[e].done;
+            if(d<fq[e].nh){const uint32_t *h=fq_hdr+(fq[e].hoff+d)%MBX_FQ_HDR_WORDS;uint32_t n=fq[e].nh-d;if(n>room)n=room;
+                uint32_t till=MBX_FQ_HDR_WORDS-(fq[e].hoff+d)%MBX_FQ_HDR_WORDS;if(n>till)n=till;
+                for(uint32_t i=0;i<n;++i){TA_FIFO=h[i];}
+                fq[e].done+=n;continue;}
+            const uint32_t *src=fq[e].v+(d-fq[e].nh);uint32_t n=total-d;if(n>room)n=room;uint32_t i=0;
+#if MBX_FIFO_DMA == 3
+            if(!fqd_start(src,n)){if(!block)return;continue;}
+#endif
+            for(;n-i>=8u;i+=8u){const uint32_t *p8=src+i;
+                __asm__ volatile("ldmia %0!, {r2-r9}\n\tstmia %1, {r2-r9}" : "+&r"(p8) : "r"(0x3b800000u) : "r2","r3","r4","r5","r6","r7","r8","r9","memory");}
+            for(;i<n;++i)TA_FIFO=src[i];
+            fq[e].done+=n;
+        }
+        barrier();DOORBELL=1;++scene_bells;barrier();
+        fq_hr=fq[e].hoff+fq[e].nh;++fq_head;
+    }
+}
+static void fa_sync(void){if(fq_head!=fq_tail){++fq_busy;uint32_t t=USEC;fq_pump(1);uint32_t w=USEC-t;mbx_fifo_async_stats[3]+=w;if(w>mbx_fifo_async_stats[7])mbx_fifo_async_stats[7]=w;--fq_busy;}}
+#if MBX_FIFO_FIQ
+/* ---- FIQ feeder ----
+ * Timer channel B (0x3c700020, 3 MHz, as RetailOS's scheduler tick: CON 0x1140 = periodic +
+ * interrupt enable, pending bits 16..18 W1C, CMD bit0 run / bit1 clear) raises VIC IRQ 8. The
+ * feeder selects IRQ 8 as FIQ (INTSELECT bit 8) and unmasks only FIQ on the CPU, so the IRQ
+ * sources RetailOS left enabled stay masked. While the queue holds work the timer fires every
+ * MBX_FIQ_PERIOD_TICKS and nano_fiq_handler tops the FIFO up (fq_pump(0)) unless main code is
+ * inside a FIFO section (fq_busy). Armed on the first queued draw, disarmed by mbx_halt / game exit. */
+#ifndef MBX_FIQ_PERIOD_TICKS
+#define MBX_FIQ_PERIOD_TICKS 30u   /* 10 us at 3 MHz (walk: 20 us 17.3 ms, 10 us 17.1 ms, 5 us 17.7 ms; runs 541-544) */
+#endif
+#define TMRB(o) (*(volatile uint32_t *)(0x3c700020u + (o)))
+#define VIC0(o) (*(volatile uint32_t *)(0x38e00000u + (o)))
+extern uint32_t nano_vectors[], nano_vec_old[];
+uint32_t nano_vbar_get(void); void nano_vbar_set(uint32_t); uint32_t nano_sctlr_get(void); void nano_sctlr_set(uint32_t);
+void nano_fiq_stack(uint32_t); void nano_fiq_enable(void); void nano_fiq_disable(void);
+static uint32_t fiq_stack[256] __attribute__((aligned(8)));
+static uint32_t fiq_armed, fiq_old_vbar, fiq_old_sctlr, fiq_old_select, fiq_old_enable, fiq_running;
+uint32_t mbx_fiq_stats[8];   /* ticks, ticks that fed, ticks skipped (busy), arms, FIFO empty, 1..61 words, 62+ words (MBX_FIQ_SAMPLE) */
+#ifndef MBX_FIQ_SAMPLE
+#define MBX_FIQ_SAMPLE 0   /* 1: keep the timer running and sample TA FIFO occupancy every tick (GPU starvation probe) */
+#endif
+static void fiq_timer_stop(void){TMRB(0x04)=0;TMRB(0x00)=0x1140u|0x70000u;fiq_running=0;}
+static void fiq_timer_start(void){if(fiq_running)return;TMRB(0x04)=2;TMRB(0x04)=1;fiq_running=1;}
+static void fiq_arm(void){
+    if(fiq_armed)return;
+    uint32_t sctlr=nano_sctlr_get();
+    fiq_old_sctlr=sctlr;fiq_old_vbar=nano_vbar_get();
+    uint32_t old=(sctlr&(1u<<13))?0xffff0000u:fiq_old_vbar;
+    for(unsigned i=0;i<8;++i)nano_vec_old[i]=old+4u*i;
+    barrier();
+    nano_fiq_stack((uint32_t)(uintptr_t)(fiq_stack+256));
+    TMRB(0x04)=0;TMRB(0x10)=0;TMRB(0x08)=MBX_FIQ_PERIOD_TICKS;TMRB(0x00)=0x1140u|0x70000u;fiq_running=0;
+    fiq_old_select=VIC0(0x0c);fiq_old_enable=VIC0(0x10);
+    VIC0(0x0c)=fiq_old_select|(1u<<8);VIC0(0x10)=1u<<8;
+    if(sctlr&(1u<<13))nano_sctlr_set(sctlr&~(1u<<13));
+    nano_vbar_set((uint32_t)(uintptr_t)nano_vectors);
+    fiq_armed=1;++mbx_fiq_stats[3];
+    nano_fiq_enable();
+    if(MBX_FIQ_SAMPLE)fiq_timer_start();
+}
+void mbx_fiq_disarm(void){
+    if(!fiq_armed)return;
+    nano_fiq_disable();
+    fiq_timer_stop();
+    if(!(fiq_old_enable&(1u<<8)))VIC0(0x14)=1u<<8;
+    VIC0(0x0c)=fiq_old_select;
+    nano_vbar_set(fiq_old_vbar);
+    if(fiq_old_sctlr&(1u<<13))nano_sctlr_set(nano_sctlr_get()|(1u<<13));
+    fiq_armed=0;
+}
+void nano_fiq_handler(void){
+    TMRB(0x00)=0x1140u|0x70000u;               /* acknowledge the tick */
+    ++mbx_fiq_stats[0];
+#if MBX_FIQ_SAMPLE
+    {uint32_t occ=CORE(0x12c)>>16&0xffu;++mbx_fiq_stats[occ==0?4:occ<62?5:6];}
+#endif
+    if(fq_busy){++mbx_fiq_stats[2];}
+    else{if(fq_head!=fq_tail){fq_pump(0);++mbx_fiq_stats[1];}if(fq_head==fq_tail&&!MBX_FIQ_SAMPLE)fiq_timer_stop();}
+    *(volatile uint32_t *)0x38e02008u=1u<<8;   /* VIC glue edge clear (bank 0), as RetailOS after each handler */
+}
+#else
+void mbx_fiq_disarm(void){}
+#endif
+#else
+static void fa_sync(void){}
+#endif
 /* USEC is read only once the FIFO is found full (the timeout start) */
 static int fifo_room(void) {
 #if MM_MBX_FIFO_DEVICE
@@ -960,9 +1220,24 @@ static int fifo_word(uint32_t word){if(fifo_room()<0)return -1;TA_FIFO=word;retu
 static uint32_t fifo_log[MBX_LOG_WORDS];
 /* returns the words stored */
 typedef uint32_t mbx_fifo_word __attribute__((may_alias));
+#if MBX_FIFO_DMA != 2 && MBX_FIFO_QUEUE
+static uint32_t submit_body(const uint32_t *fifo, uint32_t words, int bell, uint32_t log);
+#endif
 static uint32_t submit(const uint32_t *fifo, uint32_t words, int bell) {
     const mbx_fifo_word *data=(const mbx_fifo_word *)fifo;
     uint32_t log = mbx_variant & MBX_V_DIAG, i=0;
+    fa_sync();
+#if MBX_FIFO_DMA != 2 && MBX_FIFO_QUEUE
+    (void)data;
+    ++fq_busy;
+    i = submit_body(fifo, words, bell, log);
+    --fq_busy;
+    return i;
+}
+static uint32_t submit_body(const uint32_t *fifo, uint32_t words, int bell, uint32_t log) {
+    const mbx_fifo_word *data=(const mbx_fifo_word *)fifo;
+    uint32_t i=0;
+#endif
     if (scene_failed) return 0;
 #if MBX_PROBE
     if (t_sub && USEC - t_sub > mbx_probe.gap_max_us) {
@@ -980,7 +1255,7 @@ static uint32_t submit(const uint32_t *fifo, uint32_t words, int bell) {
             int room=fifo_room();if(room<0){scene_words+=i;return i;}
             uint32_t count=words-i;if(count>(uint32_t)room)count=(uint32_t)room;
             if(count>MBX_FIFO_BURST)count=MBX_FIFO_BURST;
-#if MBX_FIFO_DMA
+#if MBX_FIFO_DMA == 1
             if(fdma_ready&&count>=32u){
                 if(fdma_span(data+i,count)){scene_words+=i;fail(14);return i;}
                 i+=count;continue;
@@ -1047,10 +1322,11 @@ static void submit_rec(const uint32_t *fifo, uint32_t words, uint32_t c, int bel
 }
 void mbx_submit_seg(const uint32_t *fifo, uint32_t words, uint32_t c) { ++seg_n; submit_rec(fifo, words, c, 1); }
 static void flush_bell(void) {
+    fa_sync();
     if (!pend_words || scene_failed) return;
     pend_words = 0;
     barrier();
-    DOORBELL = 1;
+    DOORBELL = 1;   /* the queue is empty here, so the FIQ feeder writes nothing meanwhile */
     ++scene_bells;
     if (mbx_variant & MBX_V_DIAG) ++mbx_dbg.bells;
     barrier();
@@ -1078,6 +1354,59 @@ void mbx_submit_parts(const uint32_t *header,uint32_t nh,const void *vertices,ui
 #endif
     scene_timing[1]+=USEC-start;
 }
+/* As mbx_submit_parts, but the vertex span may still be read after the call returns
+ * (MBX_FIFO_DMA 2): it must stay unchanged until the next mbx_* FIFO call or render. */
+void mbx_submit_parts_async(const uint32_t *header,uint32_t nh,const void *vertices,uint32_t nv){
+#if MBX_FIFO_DMA == 2
+    uint32_t start=USEC;
+    if((nh&&!header)||(nv&&!vertices)||((uintptr_t)header&3u)||((uintptr_t)vertices&3u)||nh>UINT32_MAX-nv){fail(13);return;}
+    flush_bell();++seg_n;
+    submit_rec(header,nh,MBX_CK_N,0);
+    if(!scene_failed&&!(mbx_variant&MBX_V_DIAG)&&!fa_start(vertices,nv)){scene_words+=nv;scene_timing[1]+=USEC-start;return;}
+    ++mbx_fifo_async_stats[6];
+    if(!scene_failed)submit_rec((const uint32_t *)vertices,nv,MBX_CK_N,1);
+    scene_timing[1]+=USEC-start;
+#elif MBX_FIFO_QUEUE
+    uint32_t start=USEC;
+    if((nh&&!header)||(nv&&!vertices)||((uintptr_t)header&3u)||((uintptr_t)vertices&3u)||nh>UINT32_MAX-nv){fail(13);return;}
+    if(scene_failed||(mbx_variant&MBX_V_DIAG)||nh>MBX_FQ_HDR_WORDS/4u){mbx_submit_parts(header,nh,vertices,nv);return;}
+    if(pend_words)flush_bell();
+    ++fq_busy;
+#if MBX_FIFO_FIQ
+    fiq_arm();
+#endif
+    /* room in both rings, else feed (blocking) until there is */
+    if(fq_tail-fq_head>=MBX_FQ_ENTRIES||MBX_FQ_HDR_WORDS-(fq_hw-fq_hr)<nh){uint32_t t=USEC;fq_pump(1);mbx_fifo_async_stats[3]+=USEC-t;}
+    if(scene_failed){--fq_busy;return;}
+    uint32_t e=fq_tail%MBX_FQ_ENTRIES,off=fq_hw;
+    for(uint32_t i=0;i<nh;++i)fq_hdr[(off+i)%MBX_FQ_HDR_WORDS]=header[i];
+    fq[e].hoff=off;fq[e].nh=nh;fq[e].v=(const uint32_t *)vertices;fq[e].nv=nv;fq[e].done=0;
+    fq_hw=off+nh;++fq_tail;++seg_n;scene_words+=nh+nv;
+    ++mbx_fifo_async_stats[1];mbx_fifo_async_stats[2]+=nv;
+    fq_pump(0);
+#if MBX_FIFO_FIQ
+    if(fq_head!=fq_tail)fiq_timer_start();
+#endif
+    --fq_busy;
+    scene_timing[1]+=USEC-start;
+#else
+    mbx_submit_parts(header,nh,vertices,nv);
+#endif
+}
+void mbx_fifo_pump(void){
+#if MBX_FIFO_DMA != 2 && MBX_FIFO_QUEUE
+    if(fq_head!=fq_tail){++fq_busy;fq_pump(0);--fq_busy;}
+#endif
+}
+void mbx_fifo_sync(void){fa_sync();}
+const uint32_t *mbx_fifo_async_info(void){mbx_fifo_async_stats[0]=MBX_FIFO_DMA==2?2u:MBX_FIFO_QUEUE?(MBX_FIFO_FIQ?4u:3u):0u;
+#if MBX_FIFO_DMA != 2 && MBX_FIFO_QUEUE && MBX_FIFO_FIQ
+    for(unsigned i=0;i<4;++i)mbx_fifo_async_stats[16+i]=mbx_fiq_stats[MBX_FIQ_SAMPLE?4+i%3:i];
+#if MBX_FIFO_DMA == 3
+    for(unsigned i=0;i<4;++i)mbx_fifo_async_stats[20+i]=mbx_fq_dma_stats[i];
+#endif
+#endif
+   return mbx_fifo_async_stats;}   /* 24 words */
 const uint32_t *mbx_fifo_log(void) { return fifo_log; }
 /* Overflow takes precedence over completion. Bound every poll even if the
  * microsecond timer stops. Acknowledge only after saving the final status. */

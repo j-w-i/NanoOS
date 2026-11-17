@@ -136,7 +136,7 @@
  * their order; a v13 game checks NGAME_API_TABLE(api)>=13. */
 /* v15 adds nand_read_words variant 8 (stock 3072-byte boot reader).
  * No table fields move; existing variants keep their numeric values. */
-#define NGAME_API_VERSION 23u
+#define NGAME_API_VERSION 24u
 #define NGAME_API_TABLE(api) (((api)->flags >> 16) & 0xffu)
 /* The first 32 bytes of game.bin (game/mkgame.py fills size and crc). */
 struct ngame_hdr {
@@ -492,5 +492,13 @@ struct nanoos_api {
      * call lcd_service to progress/retry.0 accepted,-1 invalid,-2 busy. */
     int (*lcd_present_buffer)(const uint32_t *);
     int (*lcd_buffer_busy)(const uint32_t *,uint32_t);
+    /* v24: as mbx_submit_parts, but the vertex span may be streamed into the FIFO by DMA
+     * after the call returns (the CPU continues meanwhile): it must stay unchanged until
+     * mbx_fifo_sync or the next synchronous mbx_* FIFO call. fifo_sync finishes an in-flight span (call before reusing its
+     * memory). fifo_async_info: 8 stats words (see mbx.c). */
+    void (*mbx_submit_parts_async)(const uint32_t *,uint32_t,const void *,uint32_t);
+    void (*mbx_fifo_sync)(void);
+    const uint32_t *(*mbx_fifo_async_info)(void);
+    void (*mbx_fifo_pump)(void);   /* feed queued spans without waiting: call often while the CPU works */
 };
 #endif
