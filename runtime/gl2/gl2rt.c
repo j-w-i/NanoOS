@@ -1,4 +1,7 @@
 #include "gl2rt.h"
+uint32_t gl2_isp_or;   /* test knob: OR-ed into every draw's ISP word (bit 24: vertex fog) */
+uint32_t gl2_ctl_or;   /* test knob: OR-ed into every draw's VGP control word */
+uint32_t gl2_w3_or;    /* test knob: OR-ed into the word after the ISP word (0xe0000000) */
 static uint32_t f2u(float f) { union { float f; uint32_t u; } c; c.f = f; return c.u; }
 static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static float rdf(const uint8_t *p) { union { uint32_t u; float f; } c; c.u = rd32(p); return c.f; }
@@ -184,6 +187,7 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
     for (uint32_t i = 0; i < p->clay_n; ++i) { const float *v = p->clay_val[i]; uint32_t ci = p->clay_idx[i]; out[k++] = 0xa0000000u | (ci << 16) | ci; out[k++] = f2u(v[0]); out[k++] = f2u(v[1]); out[k++] = f2u(v[2]); out[k++] = f2u(v[3]); }
     uint32_t isp = two ? 0x22650200u : 0x22620200u;
     isp &= ~(0xFC000000u | 0xE00u | 0x80u | 0x2000u);
+    isp |= gl2_isp_or;
     uint32_t cmask = color_mask & 0xfu, layer = 0x10000000u | (0xf7u | (two ? 0x08u : 0u));
     if (cmask != 0xfu) {
         uint32_t lcm = ((cmask & 4u) ? 1u : 0u) | ((cmask & 2u) ? 2u : 0u) |
@@ -197,7 +201,7 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
     if (!st->depth_test || !st->depth_write) isp |= 0x80u;
     if (st->blend) { int s = tsp(st->src, 1), d = tsp(st->dst, 0); if (s < 0 || d < 0) return -3; isp |= ((uint32_t)s << 29) | ((uint32_t)d << 26) | 0x2000u; }
     else isp |= 1u << 29;
-    out[k++] = layer; out[k++] = isp; out[k++] = 0xe0000000u;
+    out[k++] = layer; out[k++] = isp; out[k++] = 0xe0000000u | gl2_w3_or;
     for (uint32_t u = 0; u < (two ? 2u : 1u); ++u) {
         uint32_t l2w = tex[u].log2size & 0xffu;
         uint32_t l2h = (tex[u].log2size >> 8) ? ((tex[u].log2size >> 8) & 0xffu) : l2w;
@@ -206,7 +210,11 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
         if (fmt!=0x19u && fmt!=GL2_TEX_RGB565 && fmt!=GL2_TEX_ARGB4444 && fmt!=GL2_TEX_ARGB1555 && fmt!=GL2_TEX_AL88 && fmt!=0x20u && fmt!=0x38u) return -4;
         uint32_t cm=0;if(tex[u].storage&GL2_TEX_CLAMP_S)cm|=1u<<31;if(tex[u].storage&GL2_TEX_CLAMP_T)cm|=1u<<29;
         uint32_t filt=0x12;if(tex[u].storage&GL2_TEX_LINEAR)filt=0x92;
-        if(tex[u].storage&GL2_TEX_MIP_NEAREST)filt=(tex[u].storage&GL2_TEX_LINEAR)?0xb2u:0x32u;
+#ifndef GL2_NO_MIP
+#define GL2_NO_MIP 0   /* diagnostic: sample level 0 only */
+#endif
+        if(GL2_NO_MIP){}
+        else if(tex[u].storage&GL2_TEX_MIP_NEAREST)filt=(tex[u].storage&GL2_TEX_LINEAR)?0xb2u:0x32u;
         /* Trilinear (0xce/0x4e) faulted every frame on hardware (run545, OpenLara filter MEDIUM):
          * GL2_TRILINEAR 0 samples the nearest mip level instead (0xb2/0x32). */
         else if(tex[u].storage&GL2_TEX_MIP_LINEAR)filt=GL2_TRILINEAR?((tex[u].storage&GL2_TEX_LINEAR)?0xceu:0x4eu):((tex[u].storage&GL2_TEX_LINEAR)?0xb2u:0x32u);
@@ -225,7 +233,7 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
         else { ox = vx + hw; sx = hw; oy = th - vy - hh; sy = -hh; }
         out[k++] = f2u(ox); out[k++] = f2u(sx); out[k++] = f2u(oy); out[k++] = f2u(sy); out[k++] = f2u(0.5f); out[k++] = f2u(0.5f);
     }
-    out[k++] = mode == 4 ? 0x70000000u : mode == 5 ? 0x40020000u : 0x50020000u; out[k++] = 0xf0020004u | (two ? 1u << 13 : 0) | p->clip_ctl;
+    out[k++] = mode == 4 ? 0x70000000u : mode == 5 ? 0x40020000u : 0x50020000u; out[k++] = 0xf0020004u | (two ? 1u << 13 : 0) | p->clip_ctl | gl2_ctl_or;
     return (int)k;
 }
 int gl2_build_draw_views_mask(const gl2_program *p,const gl2_state *st,int mode,uint32_t n,

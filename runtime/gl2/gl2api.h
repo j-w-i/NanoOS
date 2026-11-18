@@ -208,7 +208,22 @@ typedef struct {                     /* precompiled fragment shader */
     uint8_t uv_divide; /* bit0/1: sampler UV of slot 3/4 is divided by the same varying's other half (v.xy / v.zw): done per vertex on the GPU path */
     uint8_t uv_approx; /* texture2D at a computed UV was approximated by the UV0 sample (see gl2fsc.inc) */
     float fold_const[3]; /* nonzero: colour lane r,g,b multiplied per vertex by this constant (TSP has no per-lane constant multiply) */
+    /* Fog: mix(uniform fog colour, colour, t) with t a vertex varying. Colour lanes in fog_mask are
+     * multiplied per vertex by fog_name.fog_comp (exact for black fog; coloured fog fades to black). */
+    uint8_t fog_mask, fog_comp; const char *fog_name;
 } gl2_fs_entry;
+#if !defined(GL2_WAIT_SCALE) && (defined(NANO_EMU) || defined(NANO_EMU_FILES_ADDR))
+#define GL2_WAIT_SCALE 100u   /* NanoEmu build (see below) */
+#endif
+#ifndef GL2_WAIT_SCALE
+/* Multiplies the runtime's GPU/display wait budgets (50 ms GPU frame, 200 ms display buffer).
+ * 1 on the device. NanoEmu's GPU model is far slower: emulator builds pass a large value so a
+ * slow frame is not mistaken for a hung GPU (that fault stopped OpenLara after ~3 frames). */
+#define GL2_WAIT_SCALE 1u
+#endif
+#ifndef GL2_FOLD_FOG
+#define GL2_FOLD_FOG 1     /* fold vertex-varying fog factors of mix(fog, colour, t) into the colour */
+#endif
 #ifndef GL2_SPEC_SLOTS
 #define GL2_SPEC_SLOTS 8   /* zero-uniform program variants cached per program (>= 1) */
 #endif
@@ -221,7 +236,7 @@ typedef struct {                     /* precompiled fragment shader */
 #ifndef GL2_SPEC
 #define GL2_SPEC 1         /* zero-uniform specialisation on/off */
 #endif
-typedef struct {gl2_fs_entry e;char samplers[2][32],varyings[3][32],uniforms[16][32],fold_vary[32];gl2_soft_program software;} gl2_fs_owned;
+typedef struct {gl2_fs_entry e;char samplers[2][32],varyings[3][32],uniforms[16][32],fold_vary[32],fog_vary[32];gl2_soft_program software;} gl2_fs_owned;
 typedef struct { uint32_t type, src_hash, ok, used, attachments, delete_pending, source_length; char log[64]; const char *src; vsc_result *vs; const gl2_fs_entry *fs; } gl2_shader;
 typedef struct { uint32_t used, ok, vsh, fsh, delete_pending, executable, validate_status; gl2_program prog; vsc_result vs; const gl2_fs_entry *fs; gl2_fs_owned fs_owned; uint8_t sampler_unit[2],fragment_vertex_alias[16];float fragment_values[16][4]; uint8_t attr_bind[5], nbind; char bind_name[8][32]; uint8_t bind_loc[8]; uint32_t blob[1]; char log[64]; uint32_t gpu_code[VSC_MAX_INSTR][2]; /* vs.code pruned to what the native TSP reads */ uint32_t gpu_nlit; uint16_t gpu_lit_idx[VSC_MAX_LIT]; float gpu_lit_val[VSC_MAX_LIT][4]; uint8_t full_normal_input, full_uv1_input, full_omit_colour; /* input layout of the unpruned code (software path) */
     /* zero-uniform specialisation (gl2api.c spec_select): candidate constant rows, cached variants */

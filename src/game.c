@@ -293,6 +293,7 @@ static const struct nanoos_api api = {
     lcd_present_buffer, lcd_buffer_busy,
     mbx_submit_parts_async, mbx_fifo_sync, mbx_fifo_async_info, mbx_fifo_pump,
     g_nand_read_ppn_direct, g_nand_volume_handoff,
+    mbx_set_scene_reg,
 };
 
 static int outside(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi) {

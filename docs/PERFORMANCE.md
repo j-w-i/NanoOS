@@ -250,3 +250,55 @@ launcher choose (`LARA_FILTER`, playable default 1 = bilinear). Bilinear costs n
 Trilinear (TSP filter 0xce) faulted on every frame on hardware (run545, 300 recoveries), so the runtime
 samples the nearest mip level instead (`GL2_TRILINEAR 0`). Shadows above LOW (shadow maps) and per-pixel
 specular are not possible on the MBX combiner; OpenLara's LOW blob shadows already render.
+
+## 11. Distance fog (2026-11-18, landscape walk, stock clocks)
+
+OpenLara's LOW shaders fade to the level's fog colour with `mix(uFogParams.xyz, color, f)`, `f` a per-vertex
+`1/exp(distance)`. The fragment stripper used to drop that `mix` (no fog at all). It now folds `f` per vertex into
+the colour (`gl2_fs_entry.fog_*`, `GL2_FOLD_FOG`): rooms read it from `vDiffuse.w`, entities from `vNormal.w`.
+Exact for black fog (TR1 levels 1, 2, 3B, 10A); coloured fog (sandy/green/red/mist, at most 0.25) fades to black.
+Emulator frame 4 against ANGLE: mean diff 6.4 -> 2.9, pixels off 1.0% -> 0.3%.
+
+Cost was +11 VGP instructions per entity vertex (+1.4 ms). Three exact compiler rewrites in `gl2vsc.c` cut it to +8:
+value-range tracking (`>= 0`, `<= 1` through constants, `length`, `v.v`, `exp2`, products), `1/exp2(y)` -> one EX2 of
+`-y`, and `max(x,0)`/`min(x,1)` dropped when the range is known (so `clamp(1/exp(len), 0, 1)` costs one EX2).
+`vs_opt_check.py` reports max diff 0 on every OpenLara program.
+
+| Run | avg | median |
+|---|---|---|
+| run-fog-nofog (`GL2_FOLD_FOG=0`) | 17.6 ms | 16.4 ms |
+| run-fog-fog (first fold) | 19.0 ms | 18.5 ms |
+| run-fog-fog2 (with the rewrites) | **18.3 ms** | 17.4 ms |
+
+The VGP has a fog output (slot 2); if the TSP applies it with a fog colour, coloured fog would become exact and
+the colour multiply free. Not explored yet.
+
+## 12. OpenLara detail tiers above LOW (investigation, 2026-11-18)
+
+`Game::init` loaded the saved settings over the launcher's choice; Nano builds now take lighting/shadows/water
+from `nano7_detail[]` (`-DLARA_LIGHTING/-DLARA_SHADOWS/-DLARA_WATER`, default 0 = LOW; `tools/host_ref` reads
+`HOST_LIGHTING/HOST_SHADOWS/HOST_WATER`). ANGLE frame 4 (landscape, bilinear) against LOW, and what the NanoOS GL2
+compilers make of each tier's new shaders:
+
+| Tier | Adds | Frame 4 vs LOW | NanoOS today |
+|---|---|---|---|
+| Lighting HIGH | `OPT_AMBIENT`: per-entity ambient cube (vertex shader) + `AmbientCache` | 0.4 (Lara tinted/darkened by her surroundings) | vertex code compiles (137-151 instr). The cache renders the room 6x per new sector into 64x64 FBOs (CPU-rasterised on NanoOS), downsamples with `FILTER_DOWNSAMPLE` (loops: fragment compile fails) to 1x1 and reads back: needs fragment loops, <16 px FBO readback, and a GPU FBO path to avoid per-sector stalls |
+| Shadows MEDIUM | `OPT_SHADOW`: shadow map, per-pixel depth compare | 1.4 | impossible as written on the MBX combiner (vertex output slots and fragment varyings run out; no per-pixel compare). A projected shadow texture (two-stage T0*T1 with per-vertex projected UVs) would be an engine-side rewrite |
+| Shadows HIGH | + `OPT_CONTACT` contact AO (per-pixel loop over 15 contacts) | 2.2 | same, plus per-pixel loop |
+| Water MEDIUM | `OPT_UNDERWATER_FOG` (per-pixel underwater fog + specular) + `WaterCache` surface effects | 0 here (no water in view) | fog part foldable per vertex; specular per pixel not possible; water surface simulate/caustics shaders fail (multi-sampler, sampler arithmetic) |
+| Water HIGH | + `OPT_CAUSTICS` (caustics texture) | 0 here | caustics texture comes from the water simulation (fails) |
+
+### 12a. Lighting HIGH on the Nano (2026-11-18)
+
+The ambient cube per map sector (`AmbientCache`) is now filled one of three ways (`nano7AmbientMode`, `cache.h`):
+- 0: OpenLara's own path. Needs `FILTER_DOWNSAMPLE` (fragment loops, offset taps, division: not compiled by NanoOS).
+- 1: the six 64x64 environment views rendered on the GPU (render-to-texture), read back after each face, and
+  downsampled on the CPU with FILTER_DOWNSAMPLE's exact arithmetic. ANGLE: identical to OpenLara's shader path.
+  On the iPod each new sector costs 6 synchronous GPU scenes: walk frames of 0.8-5 s (run-amb-li2). Not usable.
+- 2 (default): estimated on the CPU from the room's faces (texture average x baked vertex light, solid angle per
+  cube-map pixel, luminance weighting as the downsample). No GPU work. Against mode 1 along the walk (147 sectors):
+  mean abs error 0.016 on values averaging 0.116, scale 0.95 fitted; rendered walk frames differ by <= 0.1.
+
+The cube is applied per vertex in the GPU vertex program (`OPT_AMBIENT`, `calcAmbient`). iPod walk (run-amb-low2
+vs run-amb-est, same tree): 19.3 -> 19.5 ms average, no faults or GL errors. Playable builds default to
+lighting HIGH (`LARA_LIGHTING`), the bench keeps LOW.

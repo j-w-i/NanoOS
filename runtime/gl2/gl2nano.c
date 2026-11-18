@@ -241,7 +241,7 @@ int gl2_nano_finish(gl2_nano *b,uint32_t **completed){
  if(!owned(b)||b->cpu_active)return GL2_NANO_STATE;
  if(b->fault)return GL2_NANO_FAULT;
  if(!b->pending_valid)return GL2_NANO_OK;
- if(b->api->mbx_wait_done(50000))return queue_fault(b);
+ if(b->api->mbx_wait_done(50000u*GL2_WAIT_SCALE))return queue_fault(b);
  uint32_t *target=b->pending_target;b->retired_target=target;b->pending_target=0;b->pending_valid=0;++b->frames;
  b->retired_width=b->pending_width;b->retired_height=b->pending_height;b->retired_stride=b->pending_stride;
  if(!b->frame_open&&target==b->target)b->completed=1;
@@ -290,7 +290,7 @@ int gl2_nano_end(gl2_nano *b) {
         b->draws+=b->ctx->soft_draws-b->software_draw_start;b->ctx->soft_target=0;b->ctx->soft_depth=0;b->frame_open=0;b->completed=1;++b->frames;++b->software_frames;return GL2_NANO_OK;
     }
     int r=b->api->mbx_render(b->target,b->width,b->height,b->stride);
-    if (!r) r=b->api->mbx_wait_done(50000);
+    if (!r) r=b->api->mbx_wait_done(50000u*GL2_WAIT_SCALE);
     b->frame_open=0;
     if (r) { b->fault=1;b->completed=0;++b->errors;b->api->mbx_halt();return GL2_NANO_DRIVER; }
     b->completed=1;++b->frames;return GL2_NANO_OK;
@@ -329,7 +329,7 @@ void gl2_nano_close(gl2_nano *b) {
         uint32_t start=b->api->usec?b->api->usec():0;
         for(unsigned pass=0;pass<128&&display_busy(b,(const uint32_t *)MM_GAME_GPU,MM_GAME_GPU_END-MM_GAME_GPU);++pass){
             if(b->api->lcd_service)b->api->lcd_service();
-            if(b->api->usec&&b->api->usec()-start>=200000u)break;
+            if(b->api->usec&&b->api->usec()-start>=200000u*GL2_WAIT_SCALE)break;
         }
         if(display_busy(b,(const uint32_t *)MM_GAME_GPU,MM_GAME_GPU_END-MM_GAME_GPU)){b->fault=1;++b->errors;return;}
     }

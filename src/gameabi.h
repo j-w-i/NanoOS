@@ -136,7 +136,7 @@
  * their order; a v13 game checks NGAME_API_TABLE(api)>=13. */
 /* v15 adds nand_read_words variant 8 (stock 3072-byte boot reader).
  * No table fields move; existing variants keep their numeric values. */
-#define NGAME_API_VERSION 25u
+#define NGAME_API_VERSION 26u
 #define NGAME_API_TABLE(api) (((api)->flags >> 16) & 0xffu)
 /* The first 32 bytes of game.bin (game/mkgame.py fills size and crc). */
 struct ngame_hdr {
@@ -507,5 +507,8 @@ struct nanoos_api {
      * (runtime/storage/handoff.h), or NULL; nano_fs_mount adopts it instead of remounting. */
     int (*nand_read_ppn_direct)(unsigned ce, uint32_t row, unsigned count, void *buf, uint32_t meta[16]);
     const void *(*nand_volume_handoff)(void);
+    /* v26: write an extra 3D-setup register (unused gaps of 0x600..0x6fc only) with every
+     * scene's ISP list, e.g. the vertex-fog colour. slot 0..3; off 0 clears. 0 ok, -1 refused. */
+    int (*mbx_set_scene_reg)(unsigned slot, uint32_t off, uint32_t val);
 };
 #endif

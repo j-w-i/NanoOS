@@ -130,6 +130,23 @@ static void trk(uint32_t st) {
  * 20 ms; +4 when it hit the EOL word), raw +0x12c, us since mbx_begin. */
 static uint32_t fail_reason, fail_status, fail_us;
 static uint32_t background;
+/* v26: extra 3D-setup registers written every scene with the ISP list (fog colour probing).
+ * Only unused gaps of 0x600..0x6fc are accepted (never a register isp_list owns, never the
+ * 0x680 kick). */
+static uint32_t scene_reg_off[4], scene_reg_val[4];
+int mbx_set_scene_reg(unsigned slot, uint32_t off, uint32_t val) {
+    /* 0x644, 0x64c and 0x674 are written 0 with the ISP list (as RetailOS does) but may be
+     * overridden: the scene registers are written after them. */
+    static const uint16_t owned[] = { 0x608, 0x60c, 0x610, 0x614, 0x618, 0x61c, 0x63c, 0x648,
+                                      0x650, 0x654, 0x658, 0x65c, 0x660, 0x680, 0x6d0, 0x6dc, 0x6ec };
+    if (slot >= 4) return -1;
+    if (off) {
+        if (off < 0x600 || off > 0x6fc || (off & 3u)) return -1;
+        for (unsigned i = 0; i < sizeof owned / sizeof owned[0]; ++i) if (off == owned[i]) return -1;
+    }
+    scene_reg_off[slot] = off; scene_reg_val[slot] = val;
+    return 0;
+}
 /* The GPU-visible buffers (tables, PB, parameter pool and workspace) are in
  * the uncached kernel .dma (memmap.h MM_DMA), inside the first 32 MB of
  * DRAM mapped by these eight page tables. */
@@ -736,6 +753,7 @@ static void isp_list(const uint32_t *target, uint32_t w, uint32_t h, uint32_t st
     CORE(0x6d0) = 1;
     CORE(0x6dc) = 0x3f800001u;
     CORE(0x860) = GRID;
+    for (unsigned i = 0; i < 4; ++i) if (scene_reg_off[i]) CORE(scene_reg_off[i]) = scene_reg_val[i];
     CORE(0x60c) = mbx_variant & MBX_V_60C ? MBX_VA(pb) + 0x3d00u : MBX_VA(mbx_param);
 }
 static const uint32_t *isp_target;

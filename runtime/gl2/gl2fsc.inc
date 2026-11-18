@@ -17,6 +17,19 @@ static struct {const char *cursor;char token[32];char *log;int error,depth;uint1
 #define F_EXTRA_BASE GL2_SOFT_INPUTS
 static char f_extra_name[4][32];static unsigned f_extra_n,f_fold_lane;static int f_fold_j[4],f_fold_k[4];static float f_fold_c[4];  /* per colour lane constant folded into vDiffuse (1 = none) */
 static int f_tex_sampler=-1;  /* the one sampler texture2D uses */
+static int f_fog_j=-1,f_fog_k;static uint8_t f_fog_mask;  /* fog factor folded per vertex (see gl2_fs_entry.fog_name) */
+/* t of a stripped mix(fog, colour, t) when it is one component of an extra varying: record it
+ * as the fog fold (one varying component for all lanes) and report success. */
+static int f_take_fog(uint16_t t){
+ if(!GL2_FOLD_FOG||!t||f_fold_lane>=3u)return 0;
+ f_node *x=&f.nodes[t];if(x->op!=F_INPUT)return 0;
+ int j,k;
+ if(x->a==3){j=-2;k=3;}   /* the colour varying's own alpha (OpenLara rooms: vDiffuse.w) */
+ else if(x->a>=F_EXTRA_BASE&&x->a<F_EXTRA_BASE+16u){j=(int)((x->a-F_EXTRA_BASE)/4u);k=(int)((x->a-F_EXTRA_BASE)%4u);}
+ else return 0;
+ if(f_fog_j!=-1&&(f_fog_j!=j||f_fog_k!=k))return 0;
+ f_fog_j=j;f_fog_k=k;f_fog_mask|=(uint8_t)(1u<<f_fold_lane);return 1;
+}
 static void f_fail(const char *s){if(!f.error){f.error=1;scpy(f.log,s,64);}}
 static int f_id(char c){return(c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_';}
 static int f_digit(char c){return c>='0'&&c<='9';}
@@ -416,8 +429,8 @@ static uint16_t f_strip_mix(uint16_t id){
   {int ca=f.nodes[n.a].deps&0xffu, cb=f.nodes[n.b].deps&0xffu;
    if(!da&&!db){if(!ca&&cb&&f_mix_t(n.a))da=1;else if(!cb&&ca&&f_mix_t(n.b))db=1;}}
   /* the blend factor goes before recursing, or a fold could take it for lighting */
-  if(da&&!db){uint16_t t=f_mix_t(n.a);int ok=0;uint16_t keep=t?f_drop_factor(n.b,t,&ok):n.b;uint16_t r=f_strip_mix(keep);return ok?r:f_drop_in3(r);}
-  if(db&&!da){uint16_t t=f_mix_t(n.b);int ok=0;uint16_t keep=t?f_drop_factor(n.a,t,&ok):n.a;uint16_t r=f_strip_mix(keep);return ok?r:f_drop_in3(r);}
+  if(da&&!db){uint16_t t=f_mix_t(n.a);int ok=0;uint16_t keep=t?f_drop_factor(n.b,t,&ok):n.b;if(ok)f_take_fog(t);uint16_t r=f_strip_mix(keep);return ok?r:f_drop_in3(r);}
+  if(db&&!da){uint16_t t=f_mix_t(n.b);int ok=0;uint16_t keep=t?f_drop_factor(n.a,t,&ok):n.a;if(ok)f_take_fog(t);uint16_t r=f_strip_mix(keep);return ok?r:f_drop_in3(r);}
   /* any other mix(x, y, t) with a varying t: take t = 1 (y), as for fog (OpenLara's
    * underwater entities tint everything below the water plane: the whole entity is tinted) */
   {uint16_t t=f_mix_t(n.a);if(t&&f.nodes[t].op!=F_CONST){int ok=0;uint16_t keep=f_drop_factor(n.b,t,&ok);if(ok)return f_strip_mix(keep);}
@@ -460,14 +473,19 @@ static int compile_fragment(const char *source,gl2_fs_owned *out,char *log){
   else if(!f.error&&!f_lower_two(target,out->e.plan,alpha))gpu=2;
  }
  if(!gpu&&(deps&~255u)){
-  f_value st=target;for(unsigned k=0;k<4;++k){f_fold_j[k]=-1;f_fold_k[k]=0;}for(unsigned k=0;k<4;++k){f_fold_c[k]=1;f_fold_lane=k;st.v[k]=f_strip_mix(target.v[k]);}f_fold_lane=4;
+  f_value st=target;f_fog_j=-1;f_fog_k=0;f_fog_mask=0;for(unsigned k=0;k<4;++k){f_fold_j[k]=-1;f_fold_k[k]=0;}for(unsigned k=0;k<4;++k){f_fold_c[k]=1;f_fold_lane=k;st.v[k]=f_strip_mix(target.v[k]);}f_fold_lane=4;
   unsigned sdeps=0;for(unsigned k=0;k<4;++k)sdeps|=f_dependencies(st.v[k]);
   if((sdeps&0xffu)&&!(sdeps&~255u)){
    if(!f_lower(st,out->e.plan[0],0,0)&&!f_lower(st,alpha[0],1,0)){gpu=1;deps=sdeps;}
    else if(!f.error&&!f_lower_two(st,out->e.plan,alpha)){gpu=2;deps=sdeps;}
    if(gpu){int j=-1;for(unsigned k=0;k<3;++k)if(f_fold_j[k]>=0){if(j<0)j=f_fold_j[k];if(f_fold_j[k]==j){out->e.fold_mask|=(uint8_t)(1u<<k);out->e.fold_comp[k]=(uint8_t)f_fold_k[k];}}
     if(j>=0){scpy(out->fold_vary,f_extra_name[j],32);out->e.fold_name=out->fold_vary;}
-    for(unsigned k=0;k<3;++k)if(f_fold_c[k]!=1)out->e.fold_const[k]=f_fold_c[k];}
+    for(unsigned k=0;k<3;++k)if(f_fold_c[k]!=1)out->e.fold_const[k]=f_fold_c[k];
+    if(f_fog_j!=-1&&f_fog_mask){
+     const char *nm=0;
+     if(f_fog_j>=0)nm=f_extra_name[f_fog_j];
+     else if(!(deps&8u))for(unsigned i=0;i<f.ns;++i)if(f.symbols[i].storage==1&&f.symbols[i].slot==1)nm=f.symbols[i].name;  /* colour alpha: only if the plan no longer reads it */
+     if(nm){scpy(out->fog_vary,nm,32);out->e.fog_name=out->fog_vary;out->e.fog_comp=(uint8_t)f_fog_k;out->e.fog_mask=f_fog_mask;}}}
   }
  }
  f.error=0;

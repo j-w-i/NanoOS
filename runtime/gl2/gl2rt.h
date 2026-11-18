@@ -6,7 +6,13 @@
 #ifndef GL2RT_H
 #define GL2RT_H
 #include <stdint.h>
-#define GL2_MAX_UNI 16
+/* Uniform slots per program. The vertex compiler registers every array element as its own
+ * uniform (VSC_MAX_UNI = 96): OpenLara's entity program has 83 (uBasis[64], lights, uAmbient[6]).
+ * At 16, glUniform* on locations >= 16 wrote past uval[] into the program object, and sampler
+ * locations (GL2_MAX_UNI + i) collided with vertex uniforms 16/17. */
+#ifndef GL2_MAX_UNI
+#define GL2_MAX_UNI 96
+#endif
 #define GL2_BLOB_MAGIC 0x32504c47u            /* "GLP2" */
 typedef struct {
     uint32_t nstage, nplan;                    /* vertex program instruction count, combiner stages (1 or 2) */
@@ -40,6 +46,10 @@ void gl2_program_scan_constants(gl2_program *p); /* fill cused from the compiled
 #define GL2_UV0W(p) ((p)->uv0_input > 2u ? (p)->uv0_input : 2u)
 #define GL2_VW(p) (((p)->pack_pos ? 2u : 4u) + (p)->normal_input + ((p)->omit_colour ? 0u : 1u) + GL2_UV0W(p) + ((p)->pack_uv1 ? 1u : (p)->uv1_input))
 typedef struct { uint32_t blend, src, dst, depth_test, depth_func, depth_write; } gl2_state;   /* GL enums */
+extern uint32_t gl2_isp_or;    /* test knobs (fog probe): ISP word bits OR-ed into every draw */
+extern uint32_t gl2_ctl_or;    /* VGP control word bits OR-ed into every draw */
+extern uint32_t gl2_w3_or;     /* bits OR-ed into the word after the ISP word */
+extern uint32_t gl2_live_or;   /* VGP outputs kept live at link in addition to what the plan reads */
 /* Zero preserves the legacy ARGB8888 descriptor. Other values are the measured
  * MBX texture-format field, not public GL transfer enums. */
 #define GL2_TEX_LINEAR 0x80000000u /* sampling flag in storage; format bits unchanged */

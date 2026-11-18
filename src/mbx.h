@@ -152,6 +152,7 @@ uint32_t mbx_f32(int v);  /* IEEE single of a small int (no libgcc) */
  * tiles no object covers. Default 0. Bring-up: a distinct colour shows
  * whether the ISP wrote the target while all geometry was rejected. */
 void mbx_set_background(uint32_t word);
+int mbx_set_scene_reg(unsigned slot, uint32_t off, uint32_t val);
 /* MBX_V_ISP: the target mbx_begin() preloads into the ISP registers */
 void mbx_set_target(const uint32_t *target, uint32_t w, uint32_t h, uint32_t stride);
 /* FIFO0 startup prefix (first-launch trace #16..#225) streamed, no

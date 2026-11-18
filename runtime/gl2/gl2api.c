@@ -4,11 +4,11 @@ static void scpy(char *d, const char *s, int n) { int i = 0; for (; i < n - 1 &&
 uint32_t gl2_hash(const char *s) { uint32_t h = 2166136261u; while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; } return h; }
 #include "gl2fsc.inc"
 static void fs_copy(gl2_fs_owned *dst,const gl2_fs_entry *src){
- dst->e=*src;if(src->fold_name){scpy(dst->fold_vary,src->fold_name,32);dst->e.fold_name=dst->fold_vary;}if(src->software){dst->software=*src->software;dst->e.software=&dst->software;}for(unsigned i=0;i<src->nsampler;++i){scpy(dst->samplers[i],src->sampler_names[i],32);dst->e.sampler_names[i]=dst->samplers[i];}
+ dst->e=*src;if(src->fold_name){scpy(dst->fold_vary,src->fold_name,32);dst->e.fold_name=dst->fold_vary;}if(src->fog_name){scpy(dst->fog_vary,src->fog_name,32);dst->e.fog_name=dst->fog_vary;}if(src->software){dst->software=*src->software;dst->e.software=&dst->software;}for(unsigned i=0;i<src->nsampler;++i){scpy(dst->samplers[i],src->sampler_names[i],32);dst->e.sampler_names[i]=dst->samplers[i];}
  for(unsigned i=0;i<src->nuniform;++i){scpy(dst->uniforms[i],src->uniform_names[i],32);dst->e.uniform_names[i]=dst->uniforms[i];}
  for(unsigned i=0;i<src->nvary;++i){scpy(dst->varyings[i],src->vary_names[i],32);dst->e.vary_names[i]=dst->varyings[i];}
 }
-static void fs_rebase(gl2_prog_obj *p){p->fs=&p->fs_owned.e;if(p->fs_owned.e.fold_name)p->fs_owned.e.fold_name=p->fs_owned.fold_vary;if(p->fs->software)p->fs_owned.e.software=&p->fs_owned.software;for(unsigned i=0;i<p->fs->nuniform;++i)p->fs_owned.e.uniform_names[i]=p->fs_owned.uniforms[i];for(unsigned i=0;i<p->fs->nsampler;++i)p->fs_owned.e.sampler_names[i]=p->fs_owned.samplers[i];for(unsigned i=0;i<p->fs->nvary;++i)p->fs_owned.e.vary_names[i]=p->fs_owned.varyings[i];p->prog.plan=&p->fs->plan[0][0];}
+static void fs_rebase(gl2_prog_obj *p){p->fs=&p->fs_owned.e;if(p->fs_owned.e.fold_name)p->fs_owned.e.fold_name=p->fs_owned.fold_vary;if(p->fs_owned.e.fog_name)p->fs_owned.e.fog_name=p->fs_owned.fog_vary;if(p->fs->software)p->fs_owned.e.software=&p->fs_owned.software;for(unsigned i=0;i<p->fs->nuniform;++i)p->fs_owned.e.uniform_names[i]=p->fs_owned.uniforms[i];for(unsigned i=0;i<p->fs->nsampler;++i)p->fs_owned.e.sampler_names[i]=p->fs_owned.samplers[i];for(unsigned i=0;i<p->fs->nvary;++i)p->fs_owned.e.vary_names[i]=p->fs_owned.varyings[i];p->prog.plan=&p->fs->plan[0][0];}
 uint32_t (*gl2_prof_clock)(void);uint32_t gl2_prof[8];
 /* finer per-draw profile: 0 header build us, 1 delta compare us, 2 vc signature us, 3 header words built,
  * 4 header words sent, 5 vertex words sent, 6 full-header sends, 7 delta sends */
@@ -282,6 +282,12 @@ static const vsc_result *gpu_variant(gl2_ctx *c,gl2_prog_obj *P){
             dm[m]=sm[m]=0;
             k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,".");k=sappend(add,k,sizeof add,dm);k=sappend(add,k,sizeof add,"*=");
             k=sappend(add,k,sizeof add,P->fs->fold_name);k=sappend(add,k,sizeof add,".");k=sappend(add,k,sizeof add,sm);k=sappend(add,k,sizeof add,";");}}
+    if(GL2_FOLD_COLOUR&&GL2_FOLD_FOG&&P->fs->fog_mask&&P->fs->fog_name&&vs_has_out(P,P->fs->fog_name)){const char *d=vs_out_name(P,1u);
+        if(d){static const char lane[3]={'x','y','z'},comp[4]={'x','y','z','w'};char dm[4],sm[4];uint32_t m=0;
+            for(uint32_t l=0;l<3;++l)if(P->fs->fog_mask>>l&1u){dm[m]=lane[l];sm[m]=comp[P->fs->fog_comp&3u];++m;}
+            dm[m]=sm[m]=0;
+            k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,".");k=sappend(add,k,sizeof add,dm);k=sappend(add,k,sizeof add,"*=");
+            k=sappend(add,k,sizeof add,P->fs->fog_name);k=sappend(add,k,sizeof add,".");k=sappend(add,k,sizeof add,sm);k=sappend(add,k,sizeof add,";");}}
     if(GL2_FOLD_COLOUR&&(P->fs->fold_const[0]!=0||P->fs->fold_const[1]!=0||P->fs->fold_const[2]!=0)){const char *d=vs_out_name(P,1u);
         if(d){static const char lane[3]={'x','y','z'};
             for(uint32_t l=0;l<3;++l){float v=P->fs->fold_const[l];if(v==0)continue;
@@ -305,8 +311,9 @@ static const vsc_result *gpu_variant(gl2_ctx *c,gl2_prog_obj *P){
 /* VGP outputs the native TSP reads for this fragment plan: position (0),
  * clip distances (5), the plan's varyings, colour when the combiner takes the
  * vertex colour, UV0 when it samples, UV1 for a second stage. */
+uint32_t gl2_live_or;
 static uint32_t native_outputs(const gl2_fs_entry *fs){
-    uint32_t m=0x21u;
+    uint32_t m=0x21u|gl2_live_or;
     for(uint32_t i=0;i<fs->nvary;++i)if(fs->vary_slots[i]<8)m|=1u<<fs->vary_slots[i];
     if(fs->needs_colour||fs->has_constp)m|=2u;
     if(fs->nsampler)m|=8u;
@@ -322,6 +329,22 @@ static uint32_t native_outputs(const gl2_fs_entry *fs){
 #ifndef GL2_VS_OPT_OUT
 #define GL2_VS_OPT_OUT 1  /* let non-MOV ops write VGP outputs directly */
 #endif
+#ifndef GL2_VS_PAD
+#define GL2_VS_PAD 0      /* diagnostic: mask-0 MOV between a temp's producer and an immediately following reader */
+#endif
+static uint32_t vs_pad(uint32_t (*c)[2],uint32_t n){
+#if GL2_VS_PAD
+    static uint32_t t[VSC_MAX_INSTR][2];uint32_t m=0;
+    for(uint32_t i=0;i<n;++i){
+        if(i&&m<VSC_MAX_INSTR){uint32_t pd=c[i-1][1]>>26,B=c[i][1];int rd=0;
+            if(pd>=16)for(unsigned k=0;k<3;++k)if((B>>(16+2*k)&3u)==2u&&16u+(B>>(4*k)&15u)==pd)rd=1;
+            if(rd){t[m][0]=1u|0xe4u<<8|0xe4u<<16|0xe4u<<24;t[m][1]=13u+16u<<26|0u<<22|3u<<16|3u<<18|3u<<20;++m;}}
+        if(m<VSC_MAX_INSTR){t[m][0]=c[i][0];t[m][1]=c[i][1];++m;}}
+    for(uint32_t i=0;i<m;++i){c[i][0]=t[i][0];c[i][1]=t[i][1];}return m;
+#else
+    (void)c;return n;
+#endif
+}
 int gl2_vs_opt=GL2_VS_OPT,gl2_vs_opt_out=GL2_VS_OPT_OUT;
 static uint32_t prune_native(gl2_prog_obj *P,uint32_t ncode){
     uint32_t live=native_outputs(P->fs),wrote=0;
@@ -332,7 +355,7 @@ static uint32_t prune_native(gl2_prog_obj *P,uint32_t ncode){
         P->gpu_code[n][1]=d<<26|15u<<22|3u<<16|3u<<18|3u<<20;            /* all lanes <- zero operand */
         ++n;
     }
-    return n;
+    return vs_pad(P->gpu_code,n);
 }
 /* Target size in GL window coordinates: an FBO's colour image, else the window surface
  * (432x240 when shown landscape). */
@@ -423,7 +446,7 @@ static uint32_t spec_finish(gl2_prog_obj *P,uint32_t (*code)[2],uint32_t n){
     for(uint32_t i=0;i<n;++i){uint32_t d=code[i][1]>>26;if(d<16)have|=1u<<d;}
     for(uint32_t d=1;d<=4;++d)if((wrote>>d&1u)&&!(have>>d&1u)&&n<VSC_MAX_INSTR){
         code[n][0]=1u|0xe4u<<8|0xe4u<<16|0xe4u<<24;code[n][1]=d<<26|15u<<22|3u<<16|3u<<18|3u<<20;++n;}
-    return n;
+    return vs_pad(code,n);
 }
 static uint32_t spec_build(gl2_prog_obj *P,const uint8_t *zero_rows,uint32_t (*out)[2]){
     for(uint32_t i=0;i<P->base_nstage;++i){out[i][0]=P->gpu_code[i][0];out[i][1]=P->gpu_code[i][1];}
@@ -529,6 +552,8 @@ static void link_build(gl2_ctx *c,gl2_prog_obj *P) {
     g->clip_has = (uint8_t)(gv->clip_lit >= 0); g->clip_slot = (uint8_t)(gv->clip_lit >= 0 ? gv->clip_lit : 0);
     sync_prog_target(c, P);
     g->nlit = P->gpu_nlit; g->lit_idx = P->gpu_lit_idx; g->lit_val = &P->gpu_lit_val[0][0]; g->nuni = P->vs.nuni;
+    if (g->nuni > GL2_MAX_UNI) g->nuni = GL2_MAX_UNI;   /* unreachable: GL2_MAX_UNI >= VSC_MAX_UNI (static assert below) */
+    _Static_assert(GL2_MAX_UNI >= VSC_MAX_UNI, "every compiled vertex uniform needs a slot in gl2_program.uval");
     /* All vertex tables belong to this linked program snapshot, not a global program-ID slot. */
     g->dot3_mask=(P->fs->has_alpha>>1)&1u;
     g->repeat_uv0=P->fs->software&&g->nplan==2&&P->fs->nsampler==1;g->custom_alpha=P->fs->has_alpha&1u;g->alpha[0]=P->fs->alpha[0];g->alpha[1]=P->fs->alpha[1];g->normal_input=0;g->uv1_input=g->nplan>1?2u:0u;g->omit_colour=!P->fs->has_constp;for(uint32_t i=0;i<P->vs.nattr;++i){if(P->vs.attr_slot[i]==1)g->normal_input=P->vs.attr_w[i];if(P->vs.attr_slot[i]==4&&P->vs.attr_w[i]>g->uv1_input)g->uv1_input=P->vs.attr_w[i];if(P->vs.attr_slot[i]==2)g->omit_colour=0;}

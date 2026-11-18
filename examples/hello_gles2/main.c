@@ -2,12 +2,15 @@
 #include "nano_app.h"
 #include "EGL/egl.h"
 #include "GLES2/gl2.h"
-#ifdef HELLO_VIEWPORT_CLIP
+#if defined(HELLO_VIEWPORT_CLIP) || defined(HELLO_FOGPROBE)
 #define HELLO_BENCH 1
+#endif
+#ifdef HELLO_FOGPROBE
+#include "gl2rt.h"
 #endif
 #ifdef HELLO_BENCH
 #include "report.h"
-static char report[1024];
+static char report[4096];
 static unsigned rused;
 static void rtext(const char *s) { while (*s && rused + 1 < sizeof report) report[rused++] = *s++; }
 static void rword(uint32_t x) {
@@ -48,6 +51,65 @@ int nano_example_main(const struct nanoos_api *api) {
     if (!eglMakeCurrent(dpy, sfc, sfc, ctx)) return 5;
 
 
+#ifdef HELLO_FOGPROBE
+    {
+        /* MBX vertex fog probe: ISP bit 24 on, fog factor written to VGP output 2 (varying vFog),
+         * red quad over blue. Per case: fog factor, extra scene register (+0x640 candidate for the
+         * fog colour), centre pixel read back. */
+        rtext("NANOOS GL2 GAME build " __DATE__ " " __TIME__ "\nFOGPROBE api ");
+        rword(NGAME_API_TABLE(api)); rtext("\n");
+        if (NGAME_API_TABLE(api) < 26) { rtext("needs v26\nHELLO FAIL\n"); goto fog_out; }
+        gl2_live_or = 4u;          /* keep output 2 (fog) at link */
+
+        static const char *pfs = "precision mediump float;\nvarying vec4 vColor;\nvoid main(){ gl_FragColor = vColor; }\n";
+        static const float q[24] = { -1,-1,0,1, 1,-1,0,1, -1,1,0,1,  1,-1,0,1, 1,1,0,1, -1,1,0,1 };
+        static const float qc[24] = { 1,0,0,1, 1,0,0,1, 1,0,0,1, 1,0,0,1, 1,0,0,1, 1,0,0,1 };
+        /* Fog colour register sweep: full fog (output 2 lane x = 0, ISP bits 24:23, control 0x8) is
+         * black; each candidate MBX core register gets 0xff00ff00 for two frames, then its old value
+         * back. Any non-black centre pixel, or a GPU fault, is logged. The report is re-saved every 32
+         * registers so a hard hang still shows how far the sweep got. */
+        static const char *ovs = "attribute vec4 aPos;\nattribute vec4 aCol;\nuniform vec4 uF;\nvarying vec4 vColor;\nvarying vec4 vFog;\nvoid main(){ vColor = aCol; vFog = uF; gl_Position = aPos; }\n";
+        gl2_isp_or = 3u << 23; gl2_ctl_or = 0x8u;
+        GLuint pv = compile_shader(GL_VERTEX_SHADER, ovs), pf = compile_shader(GL_FRAGMENT_SHADER, pfs);
+        GLuint pp = glCreateProgram(); glAttachShader(pp, pv); glAttachShader(pp, pf); glLinkProgram(pp);
+        glUseProgram(pp); GLint lp = glGetAttribLocation(pp, "aPos"), lc = glGetAttribLocation(pp, "aCol"), lf = glGetUniformLocation(pp, "uF");
+        for (unsigned a = 0; a < 5; ++a) glDisableVertexAttribArray(a);
+        glVertexAttribPointer((GLuint)lc, 4, GL_FLOAT, GL_FALSE, 0, qc); glEnableVertexAttribArray((GLuint)lc);
+        glVertexAttribPointer((GLuint)lp, 4, GL_FLOAT, GL_FALSE, 0, q); glEnableVertexAttribArray((GLuint)lp);
+        static const float full[4] = { 0, 0, 0, 0 };
+        glUniform4fv(lf, 1, full);
+        uint32_t tested = 0, hits = 0;
+        static const uint32_t offs[] = { 0x644, 0x64c, 0x674 };
+        static const uint32_t vals[] = { 0xff00ff00u, 0x0000ff00u, 0x00ff00ffu, 0x3f800000u, 0xffffffffu };
+        for (unsigned o = 0; o < 3; ++o) for (unsigned v = 0; v < 5; ++v) {
+            int rc = api->mbx_set_scene_reg(0, offs[o], vals[v]);
+            uint8_t b[4] = {0,0,0,0}; uint32_t f0 = 0, f1 = 0, sw = 0, fr = 0; nano_app_gfx_stats(&fr, &sw, &f0);
+            for (unsigned f = 0; f < 2; ++f) {
+                glClearColor(0.0f, 0.0f, 1.0f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                if (f == 1u) glReadPixels(120, 216, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b);
+                eglSwapBuffers(dpy, sfc);
+            }
+            api->mbx_set_scene_reg(0, 0, 0);
+            nano_app_gfx_stats(&fr, &sw, &f1); ++tested;
+            uint32_t px = (uint32_t)b[0] << 16 | (uint32_t)b[1] << 8 | b[2];
+            if (px || f1 != f0) ++hits;
+            rtext("R "); rword(offs[o]); rword(vals[v]); rtext("rc "); rword((uint32_t)rc); rtext("px "); rword(px); rtext("fault "); rword(f1 - f0); rtext("\n");
+        }
+        rtext("SWEEP tested "); rword(tested); rtext("hits "); rword(hits); rtext("\n");
+        gl2_isp_or = 0; gl2_ctl_or = 0;
+        api->mbx_set_scene_reg(0, 0, 0);
+        uint32_t fr = 0, sw = 0, fault = 0; nano_app_gfx_stats(&fr, &sw, &fault);
+        rtext("FOGPROBE frames/sw/fault "); rword(fr); rword(sw); rword(fault); rtext("\n");
+        rtext(fault == 0u ? "HELLO PASS\n" : "HELLO FAIL\n");
+    fog_out:
+        report[rused] = 0;
+        rpt_mirror_write(report, rused, rpt_sum(report, rused));
+        nano_app_dcache_clean();
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        return 0;
+    }
+#endif
 #ifdef HELLO_VIEWPORT_CLIP
     {
         /* Viewport / scissor clipping check (GL clips draws to the viewport and scissor; the SDK

@@ -17,7 +17,7 @@ static int wait_lcd(void){
  uint32_t start=g_api->usec?g_api->usec():0;
  for(unsigned i=0;!g_api->lcd_ready();++i){
   g_api->lcd_service();
-  if((g_api->usec&&g_api->usec()-start>=200000u)||i>=1000000u)return -1;
+  if((g_api->usec&&g_api->usec()-start>=200000u*GL2_WAIT_SCALE)||i>=1000000u*GL2_WAIT_SCALE)return -1;
  }
  return 0;
 }
@@ -41,7 +41,7 @@ static int queue_supported(void){
 }
 static int wait_source(uint32_t *buf){
  uint32_t start=g_api->usec();
- while(g_api->lcd_buffer_busy(buf,EQ_BYTES)){g_api->lcd_service();if(g_api->usec()-start>=200000u)return -1;}
+ while(g_api->lcd_buffer_busy(buf,EQ_BYTES)){g_api->lcd_service();if(g_api->usec()-start>=200000u*GL2_WAIT_SCALE)return -1;}
  return 0;
 }
 static const uint32_t *last_presented;
@@ -52,7 +52,7 @@ static int present_q(uint32_t *buf){
   int rc=gl2_nano_present_buffer(&b,buf);
   if(rc==GL2_NANO_OK){last_presented=buf;return 0;}
   if(rc!=GL2_NANO_BUSY)return rc;
-  g_api->lcd_service();if(g_api->usec()-start>=200000u)return -1;
+  g_api->lcd_service();if(g_api->usec()-start>=200000u*GL2_WAIT_SCALE)return -1;
  }
 }
 static uint32_t stat_frames,stat_software,stat_fault;
@@ -91,7 +91,7 @@ static void ensure_frame(void){
  else if(window_surface&&queued){
   uint32_t *buf=qbuf(qi);uint32_t start=g_api->usec();
   rc=wait_source(buf);
-  while(!rc){rc=gl2_nano_begin_target(&b,buf,240,432,240,0);if(rc!=GL2_NANO_BUSY)break;g_api->lcd_service();if(g_api->usec()-start>=200000u){rc=-1;break;}}
+  while(!rc){rc=gl2_nano_begin_target(&b,buf,240,432,240,0);if(rc!=GL2_NANO_BUSY)break;g_api->lcd_service();if(g_api->usec()-start>=200000u*GL2_WAIT_SCALE){rc=-1;break;}}
  }
  else if(window_surface){rc=wait_lcd();if(!rc)rc=gl2_nano_begin(&b,g_api->lcd_back(),0);}
  else rc=gl2_nano_begin_target(&b,target,width,height,width,0);

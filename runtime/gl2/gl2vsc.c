@@ -2,7 +2,13 @@
 #define MAXTOK 2400
 #define MAXVTEMP (VSC_MAX_INSTR * 2)
 #define TLEN 32
-typedef struct { int f, i, w, hascv, mat; int sw[4]; float cv[4]; } V;           /* f: 0 input 1 const 2 temp 3 zero */
+typedef struct { int f, i, w, hascv, mat; int sw[4]; float cv[4]; int rng; } V;  /* f: 0 input 1 const 2 temp 3 zero */
+/* rng: known bounds of every lane (exact algebra only, used to drop redundant clamps) */
+#define RNG_NN 1   /* >= 0 */
+#define RNG_LE1 2  /* <= 1 */
+#ifndef VSC_RANGE_OPT
+#define VSC_RANGE_OPT 1   /* range-based rewrites: 1/exp2 -> exp2(-x), dropped max(x,0)/min(x,1) */
+#endif
 typedef struct { int op, dst, mask, hi, neg[3]; V s[3]; } Ins;
 enum { MOV = 1, ADD = 2, MAD = 3, MUL = 4, RCP = 5, RSQ = 6, DP3 = 7, DP4 = 8, MIN = 9, MAX = 10, SGE = 12, EX2 = 0x13 };
 extern int vsc_copyprop_enabled;
@@ -55,7 +61,7 @@ static float atof_(const char *s) {
     return v;
 }
 /* ---- value helpers */
-static V mkv(int f, int i, int w) { V v; v.f = f; v.i = i; v.w = w; v.hascv = 0; v.mat = 0; for (int k = 0; k < 4; ++k) { v.sw[k] = k < w ? k : w - 1; v.cv[k] = 0; } return v; }
+static V mkv(int f, int i, int w) { V v; v.f = f; v.i = i; v.w = w; v.hascv = 0; v.mat = 0; v.rng = 0; for (int k = 0; k < 4; ++k) { v.sw[k] = k < w ? k : w - 1; v.cv[k] = 0; } return v; }
 static V cnst(const float *vals, int w) {
     float key[4] = { 0, 0, 0, 0 }; for (int k = 0; k < w; ++k) key[k] = vals[k];
     int idx = -1;
@@ -64,7 +70,9 @@ static V cnst(const float *vals, int w) {
         if (R->nlit >= VSC_MAX_LIT || nc >= 112) { fail("out of constants"); idx = 0; }
         else { idx = nc++; R->lit_idx[R->nlit] = (uint16_t)idx; for (int k = 0; k < 4; ++k) R->lit_val[R->nlit][k] = key[k]; ++R->nlit; }
     }
-    V v = mkv(1, idx, w); v.hascv = 1; for (int k = 0; k < w; ++k) v.cv[k] = vals[k]; return v;
+    V v = mkv(1, idx, w); v.hascv = 1; v.rng = RNG_NN | RNG_LE1;
+    for (int k = 0; k < w; ++k) { v.cv[k] = vals[k]; if (!(vals[k] >= 0)) v.rng &= ~RNG_NN; if (!(vals[k] <= 1)) v.rng &= ~RNG_LE1; }
+    return v;
 }
 static V swz(V v, const int *idx, int n) {
     V o = v; for (int k = 0; k < n; ++k) { o.sw[k] = v.sw[idx[k]]; o.cv[k] = v.cv[idx[k]]; }
@@ -88,7 +96,31 @@ static void emit(int op, int dst, int mask, V *srcs, int nsrc, int neg0, int neg
     if (ncode >= VSC_MAX_INSTR) { fail("too many instructions"); return; }
     code[ncode++] = in;
 }
-static V tmp(int op, V *s, int ns, int w, int neg0, int neg1) { int r = newtmp(); emit(op, 16 + r, (1 << w) - 1, s, ns, neg0, neg1); return mkv(2, r, w); }
+/* Common subexpressions: every temp is written in full before it is read and never rewritten
+ * afterwards (lane assignments and per-lane ops build new temps), so an op already emitted on
+ * identical sources (inputs, constants, temps), negations and width can reuse its result.
+ * OpenLara: dot(lv, lv) in both normalize(lv) and the light attenuation. */
+#ifndef VSC_CSE
+#define VSC_CSE 1
+#endif
+#define CSE_MAX 1024
+static struct { int op, ns, w, neg0, neg1, res; V s[3]; } cse_tab[CSE_MAX];
+static int ncse;
+static int vsame(const V *a, const V *b) {
+    if (a->f != b->f || a->i != b->i || a->mat != b->mat) return 0;
+    for (int k = 0; k < 4; ++k) if (a->sw[k] != b->sw[k]) return 0;
+    return 1;
+}
+static V tmp(int op, V *s, int ns, int w, int neg0, int neg1) {
+    if (VSC_CSE) for (int e = ncse - 1; e >= 0; --e) {
+        if (cse_tab[e].op != op || cse_tab[e].ns != ns || cse_tab[e].w != w || cse_tab[e].neg0 != neg0 || cse_tab[e].neg1 != neg1) continue;
+        int k = 0; for (; k < ns; ++k) if (!vsame(&cse_tab[e].s[k], &s[k])) break;
+        if (k == ns) return mkv(2, cse_tab[e].res, w);
+    }
+    int r = newtmp(); emit(op, 16 + r, (1 << w) - 1, s, ns, neg0, neg1);
+    if (VSC_CSE && ncse < CSE_MAX) { cse_tab[ncse].op = op; cse_tab[ncse].ns = ns; cse_tab[ncse].w = w; cse_tab[ncse].neg0 = neg0; cse_tab[ncse].neg1 = neg1; cse_tab[ncse].res = r; for (int k = 0; k < ns; ++k) cse_tab[ncse].s[k] = s[k]; ++ncse; }
+    return mkv(2, r, w);
+}
 static V bc(V v, int w) { if (v.w == w) return v; if (v.w != 1) { fail("vector size mismatch"); return v; } V o = v; o.w = w; for (int k = 0; k < 4; ++k) { o.sw[k] = v.sw[0]; o.cv[k] = v.cv[0]; } return o; }
 static V snap(V v, int w) { v = bc(v, w); if (v.f == 2) { V s[1] = { v }; return tmp(MOV, s, 1, w, 0, 0); } return v; }
 static int allval(const V *a, float x, int w) { if (!a->hascv) return 0; for (int k = 0; k < w; ++k) if (a->cv[k] != x) return 0; return 1; }
@@ -106,10 +138,27 @@ static V binop(char op, V a, V b) {
     if (op == '*' && (allval(&a, 0, w) || allval(&b, 0, w))) { float z[4] = { 0, 0, 0, 0 }; return cnst(z, w); }
     if (op == '/') {
         if (b.hascv) { float r[4]; for (int k = 0; k < w; ++k) r[k] = b.cv[k] != 0 ? 1.0f / b.cv[k] : 3.0e38f; return binop('*', a, cnst(r, w)); }
+        /* 1/exp2(y) = exp2(-y): one EX2 with a negated source instead of EX2 + RCP (the first
+         * EX2 is then dead unless used elsewhere, and pruning drops it). Temps are written once. */
+        if (VSC_RANGE_OPT && original_b.w == 1 && original_b.f == 2 && allval(&a, 1, w)) {
+            for (int j = ncode - 1; j >= 0; --j) {
+                if (code[j].dst != 16 + original_b.i) continue;
+                if (code[j].op == EX2 && code[j].mask == 1 && original_b.sw[0] == 0) {
+                    V s[1] = { code[j].s[0] }; int neg = !code[j].neg[0];
+                    V e = tmp(EX2, s, 1, 1, neg, 0);
+                    e.rng = RNG_NN | (neg && (s[0].rng & RNG_NN) ? RNG_LE1 : 0);
+                    return bc(e, w);
+                }
+                break;
+            }
+        }
         if(original_b.w==1){V s[1]={original_b};return binop('*',a,tmp(RCP,s,1,1,0,0));}
         int r=newtmp();for(int k=0;k<w;++k){int ix[1]={k};V lane=swz(b,ix,1);emit(RCP,16+r,1<<k,&lane,1,0,0);}return binop('*',a,mkv(2,r,w));
     }
-    V s[2] = { a, b }; return tmp(op == '*' ? MUL : ADD, s, 2, w, 0, op == '-');
+    V s[2] = { a, b }; V r = tmp(op == '*' ? MUL : ADD, s, 2, w, 0, op == '-');
+    if (op == '*') r.rng = (a.rng & b.rng & RNG_NN) ? (RNG_NN | (a.rng & b.rng & RNG_LE1)) : 0;
+    else if (op == '+') r.rng = a.rng & b.rng & RNG_NN;
+    return r;
 }
 static V dot_(V a, V b) {
     if(a.w!=b.w){fail("dot operands have different widths");return a;}
@@ -118,7 +167,9 @@ static V dot_(V a, V b) {
     if (n == 1) return binop('*', a, b);
     V s[2] = { a, b };
     if (n == 2) { V m = tmp(MUL, s, 2, 2, 0, 0); int i0[1] = { 0 }, i1[1] = { 1 }; V t[2] = { swz(m, i0, 1), swz(m, i1, 1) }; return tmp(ADD, t, 2, 1, 0, 0); }
-    return tmp(n == 3 ? DP3 : DP4, s, 2, 1, 0, 0);
+    V d = tmp(n == 3 ? DP3 : DP4, s, 2, 1, 0, 0);
+    if (a.f == b.f && a.i == b.i && a.sw[0] == b.sw[0] && a.sw[1] == b.sw[1] && a.sw[2] == b.sw[2] && a.sw[3] == b.sw[3]) d.rng = RNG_NN;   /* v . v */
+    return d;
 }
 /* ---- parser */
 static V expr(void);
@@ -171,7 +222,17 @@ static V call(const char *name, V *a, int n) {
         if (n != 2) { fail("min/max args"); return z; }
         int w2 = a[0].w > a[1].w ? a[0].w : a[1].w; V x = bc(a[0], w2), y = bc(a[1], w2);
         if (x.hascv && y.hascv) { float r[4]; for (int k = 0; k < w2; ++k) r[k] = seq(name, "min") ? (x.cv[k] < y.cv[k] ? x.cv[k] : y.cv[k]) : (x.cv[k] > y.cv[k] ? x.cv[k] : y.cv[k]); return cnst(r, w2); }
-        V s[2] = { x, y }; return tmp(seq(name, "min") ? MIN : MAX, s, 2, w2, 0, 0);
+        int mn = seq(name, "min");
+        /* max(x, 0) with x >= 0, min(x, 1) with x <= 1 (either operand order): x itself */
+        if (VSC_RANGE_OPT && !mn && allval(&y, 0, w2) && (x.rng & RNG_NN)) return x;
+        if (VSC_RANGE_OPT && !mn && allval(&x, 0, w2) && (y.rng & RNG_NN)) return y;
+        if (VSC_RANGE_OPT && mn && allval(&y, 1, w2) && (x.rng & RNG_LE1)) return x;
+        if (VSC_RANGE_OPT && mn && allval(&x, 1, w2) && (y.rng & RNG_LE1)) return y;
+        V s[2] = { x, y }; V r = tmp(mn ? MIN : MAX, s, 2, w2, 0, 0);
+        if (!mn && ((x.hascv && allval(&x, 0, w2)) || (y.hascv && allval(&y, 0, w2)))) r.rng = RNG_NN | (x.rng & y.rng & RNG_LE1);
+        else if (mn) r.rng = ((x.rng | y.rng) & RNG_LE1) | (x.rng & y.rng & RNG_NN);
+        else r.rng = (x.rng | y.rng) & RNG_NN;
+        return r;
     }
     if (seq(name, "abs")) {
         if (n != 1) { fail("abs args"); return z; }
@@ -255,13 +316,13 @@ static V call(const char *name, V *a, int n) {
         V c = cnst(&k, 1); return binop('*', a[0], c);
     }
     if (seq(name, "inversesqrt")) { if (n != 1) { fail("args"); return z; } return scalar_math(RSQ,a[0]); }
-    if (seq(name, "sqrt")) { if(n!=1){fail("sqrt args");return z;} return scalar_math(RCP,scalar_math(RSQ,a[0])); }
-    if (seq(name, "length")) { if (n != 1) { fail("args"); return z; } V d = dot_(a[0], a[0]); return scalar_math(RCP,scalar_math(RSQ,d)); }
+    if (seq(name, "sqrt")) { if(n!=1){fail("sqrt args");return z;} V r = scalar_math(RCP,scalar_math(RSQ,a[0])); r.rng = RNG_NN; return r; }
+    if (seq(name, "length")) { if (n != 1) { fail("args"); return z; } V d = dot_(a[0], a[0]); V r = scalar_math(RCP,scalar_math(RSQ,d)); r.rng = RNG_NN; return r; }
     if (seq(name, "normalize")) {
         if (n != 1 || (a[0].w<2 || a[0].w>4)) { fail("normalize needs vec2/vec3/vec4"); return z; }
         V d = dot_(a[0], a[0]); V s[1] = { d }; V r = tmp(RSQ, s, 1, 1, 0, 0); return binop('*', a[0], r);
     }
-    if (seq(name, "exp2")) { if (n != 1) { fail("args"); return z; } return scalar_math(EX2,a[0]); }
+    if (seq(name, "exp2")) { if (n != 1) { fail("args"); return z; } V r = scalar_math(EX2,a[0]); r.rng = RNG_NN; return r; }
     /* No FRC/FLR on the VGP: round to nearest with the IEEE single trick (x + 1.5*2^23) - 1.5*2^23
      * (|x| < 2^22), then floor = r - 1 + step(r, x). sin/cos reduce to [-pi, pi] and use the odd
      * Taylor series to y^11 (max error ~5e-4). */
@@ -433,7 +494,7 @@ static int parse_block(Block *b){
         eat("=");V v=expr();eat(";");int full=outs[oi].w,slot=outs[oi].slot;
         for(int k=0;k<nm;++k)if(mask[k]>=full){fail("output mask out of range");return 0;}
         if(!nm)for(int k=0;k<full;++k)mask[nm++]=k;
-        if(slot==2){nm=1;mask[0]=3;}
+        if(slot==2&&full==1){nm=1;mask[0]=3;}   /* a float in the fog slot lives in .w; wider varyings keep their lanes */
         if(v.w==1&&nm>1)v=bc(v,nm);
         if(v.w<nm){fail("width mismatch");return 0;}
         bput_out(b,name,1,mask,nm,v);
@@ -708,7 +769,11 @@ static void stmt(void) {
     int full = pos ? 4 : outs[oi].w, slot = pos ? 0 : outs[oi].slot;
     for(int k=0;k<nm;++k)if(mask[k]>=full){fail("output mask out of range");return;}
     if (!nm) for (int k = 0; k < full; ++k) mask[nm++] = k;
-    if (slot == 2) { nm = 1; mask[0] = 3; }
+    /* Output 2 is the fog slot: a float varying there lives in .w. A wider varying that lands in
+     * slot 2 (spare slots 6/7 taken, e.g. OpenLara's entity vNormal) keeps all its lanes: it is a
+     * VGP-internal value (read back by later statements / per-vertex folds), not sent as fog.
+     * Forcing those writes to .w lost vNormal.xyz: entities got no light and black ambient. */
+    if (slot == 2 && full == 1) { nm = 1; mask[0] = 3; }
     if (v.w == 1 && nm > 1) v = bc(v, nm);
     if (v.w < nm) { fail("width mismatch"); return; }
     int sw[4]; for (int k = 0; k < 4; ++k) sw[k] = v.sw[0];
@@ -1174,7 +1239,7 @@ int gl2_preprocess(const char *src, char *out, uint32_t cap) {
 
 int gl2vsc_compile(const char *src, vsc_result *out) {
     static char pp_buf[16384];
-    R = out; R->ncode=R->nconst=R->ntemps=0; R->err[0] = 0; R->nlit = R->nuni = R->nattr = R->nvary = 0; err_flag = 0; nc = 0; nreg = 0; ncode = 0; nvars = 0; nouts = 0; tp = 0; written_pos = 0; nufn = 0; R->clip_lit = -1;
+    R = out; R->ncode=R->nconst=R->ntemps=0; R->err[0] = 0; R->nlit = R->nuni = R->nattr = R->nvary = 0; err_flag = 0; nc = 0; nreg = 0; ncse = 0; ncode = 0; nvars = 0; nouts = 0; tp = 0; written_pos = 0; nufn = 0; R->clip_lit = -1;
     gl2_preprocess(src, pp_buf, sizeof(pp_buf));
     tokenize(pp_buf); if (err_flag) return -1;
     while (tp < ntk && !err_flag) {
@@ -1330,6 +1395,15 @@ uint32_t vsc_prune(uint32_t (*code)[2], uint32_t n, uint32_t live_out) {
  * Hardware rules kept: at most one distinct constant row and one distinct input
  * register per instruction; no new scratch registers; zero operands are not moved
  * into other instructions. Outputs (dst < 16) are only retargeted if allow_out. */
+#ifndef VSC_ZERO_OPERAND
+#define VSC_ZERO_OPERAND 0   /* 1: old fold of dead temps to operand file 3 (NOT 0.0 on hardware; diagnostic only) */
+#endif
+#ifndef VSC_OPT_FWD
+#define VSC_OPT_FWD 1
+#endif
+#ifndef VSC_OPT_BACK
+#define VSC_OPT_BACK 1
+#endif
 typedef struct { unsigned op, dst, mask, f[3], idx[3], sw[3][4], neg[3]; } vins;
 static unsigned v_nsrc(unsigned op) { return op == MAD ? 3u : (op == MOV || op == RCP || op == RSQ || op == EX2) ? 1u : 2u; }
 static int v_bcast(unsigned op) { return op == DP3 || op == DP4 || op == RCP || op == RSQ || op == EX2; }
@@ -1440,8 +1514,8 @@ uint32_t vsc_optimize(uint32_t (*code)[2], uint32_t n, uint32_t live_out, int al
     if (n > VSC_MAX_INSTR) return n;
     for (unsigned it = 0; it < 6; ++it) {
         for (unsigned i = 0; i < n; ++i) v_dec(code[i], &v[i]);
-        int ch = v_fwd(v, n);
-        unsigned nn = n; ch |= v_back(v, &nn, allow_out);
+        int ch = VSC_OPT_FWD ? v_fwd(v, n) : 0;
+        unsigned nn = n; if (VSC_OPT_BACK) ch |= v_back(v, &nn, allow_out);
         static uint32_t tmpc[VSC_MAX_INSTR][2];
         for (unsigned i = 0; i < nn; ++i) if (v_enc(&v[i], tmpc[i])) return n;   /* should not happen: keep original */
         for (unsigned i = 0; i < nn; ++i) { code[i][0] = tmpc[i][0]; code[i][1] = tmpc[i][1]; }
@@ -1463,6 +1537,11 @@ uint32_t vsc_fold_zero(uint32_t (*code)[2], uint32_t n, const uint8_t *zero_rows
     static vins v[VSC_MAX_INSTR];
     if (n > VSC_MAX_INSTR) return n;
     uint8_t zr[32]; for (unsigned r = 0; r < 32; ++r) zr[r] = 0;   /* known-zero lanes of outputs (0..15) and temps (16..31) */
+    int zrow = -1; unsigned zlane = 0;                              /* a constant lane known to be 0.0 */
+    for (unsigned r = 0; r < 256 && zrow < 0; ++r) if (zero_rows[r]) { zrow = (int)r; while (!(zero_rows[r] >> zlane & 1u)) ++zlane; }
+#if !VSC_ZERO_OPERAND
+    if (zrow < 0) return n;
+#endif
     for (unsigned i = 0; i < n; ++i) {
         v_dec(code[i], &v[i]); vins *u = &v[i];
         if (!v_known(u->op) || u->dst >= 32) return n;
@@ -1487,8 +1566,15 @@ uint32_t vsc_fold_zero(uint32_t (*code)[2], uint32_t n, const uint8_t *zero_rows
         case MIN: case MAX: res = zl[0] & zl[1]; break;
         default: res = 0; break;
         }
-        if ((res & M) == M && !(u->op == MOV && u->f[0] == 3u)) {   /* all written lanes are zero */
+        if ((res & M) == M && !(u->op == MOV && (u->f[0] == 3u || (u->f[0] == 1u && zrow >= 0 && u->idx[0] == (unsigned)zrow)))) {   /* all written lanes are zero */
+#if VSC_ZERO_OPERAND
             u->op = MOV; u->f[0] = 3u; u->idx[0] = 0; u->neg[0] = 0; for (unsigned l = 0; l < 4; ++l) u->sw[0][l] = l;
+#else
+            /* Copy a constant lane this variant's key proves zero. Operand file 3 is not
+             * proven to read 0.0 on the VGP: folding temps to it lit OpenLara's rooms with
+             * the zero-colour lights (device frames brighter and flatter than NanoEmu). */
+            u->op = MOV; u->f[0] = 1u; u->idx[0] = (unsigned)zrow; u->neg[0] = 0; for (unsigned l = 0; l < 4; ++l) u->sw[0][l] = zlane;
+#endif
         }
         if (u->op == MOV) for (unsigned k = 1; k < 3; ++k) { u->f[k] = 3u; u->idx[k] = 0; u->neg[k] = 0; for (unsigned l = 0; l < 4; ++l) u->sw[k][l] = l; }
         zr[u->dst] = (uint8_t)((zr[u->dst] & ~M) | (res & M));

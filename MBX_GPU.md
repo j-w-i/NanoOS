@@ -104,3 +104,38 @@ checks, not a claim that the current build has passed them.
   cache maintenance, or timeout recovery. NanoOS currently runs with CPU
   MMU/caches disabled. NanoEmu clears targets to black before rendering;
   the test explicitly draws its colored background.
+
+## Vertex fog (hardware probes run-fogprobe-1..5, 2026-11-18)
+
+Matches RetailOS with `glEnable(GL_FOG)` (NanoEmu session 42), with corrections:
+- Enable: ISP word bit 24 **and** VGP control word bit 3 (`0x8`, the extra vertex output). ISP bit 23 is what
+  RetailOS also sets; with control bit 3 the draw needs bit 23 or 24 (neither: the primitive is not drawn).
+  Bit 23 alone draws unfogged.
+- Factor: VGP output 2 **lane x** (not w as the NanoEmu model reads). Lanes y/z/w have no visible effect: no
+  offset/specular colour. pixel = f * colour + (1 - f) * fog colour (f = 0.5 on red gave 0x800000).
+- Fog colour: black by default. Not any free 3D-setup register: writing 0xff00ff00 to each of the 44
+  registers in 0x600..0x6fc that NanoOS does not own (`mbx_set_scene_reg`, kernel API v26) left fully fogged
+  pixels black; 0x640 included. RetailOS never programs it (its driver has no glFog*). Location unknown.
+- Tools: `examples/hello_gles2 -DHELLO_FOGPROBE`, runtime knobs `gl2_isp_or`, `gl2_ctl_or`, `gl2_live_or`.
+- Wider sweep (run-fogsweep-1..4): every MBX core register in 0x000..0xefc that NanoOS does not write
+  (0x200-0x5fc, 0x700-0x7fc, 0x900-0xefc: 704; 0x800-0x8fc and 0x000-0x1fc: 171) was set to 0xff00ff00 for two
+  fully fogged frames and restored: fogged pixels stayed black. Only side effect: 0x8bc caused one recovered
+  GPU fault. The ISP-list registers written 0 every scene (0x644, 0x64c, 0x674) were overridden after the list
+  with five values each: still black. Not tested: 0xf00..0xffc (ID/version area) and registers NanoOS writes
+  non-zero. The word after the ISP word (0xe0000000) does not carry a fog colour in bits 0..27 (0xe000ff00,
+  0xe0ff00ff, 0xefffffff stay black); 0xe0800000 dropped the primitive and left later draws dropped too, so
+  avoid bit 23 there. Conclusion: on this MBX Lite the vertex-fog colour is not CPU-programmable through the
+  core registers (fixed black, or held outside the register file); coloured fog stays a per-vertex fold.
+
+## VGP operand file 3 is not zero (2026-11-18)
+
+Source operand file 3 (bits 17:16 + 2k = 3) was assumed to read 0.0. It does not.
+Specialised OpenLara room programs folded dead light chains to `MOV temp <- file3`,
+and the device rendered every room brighter and flatter than NanoEmu and ANGLE
+(hw-reports/flight-sb-*: `GL2_SPEC=0`, `GL2_VS_OPT=0` and the constant-zero fold
+all matched the reference; output retargeting, CSE and the forward/backward copy passes
+did not change it). The fold now copies a constant lane that the variant's key
+proves is 0.0 (`VSC_ZERO_OPERAND 0`). File 3 is still used only for writes to
+outputs the fragment plan does not read, where the value is irrelevant. The exact value is not
+measured: the brightening fits ~1.0, which NanoEmu (`NANO7_MBXR_FILE3`, default 1.0)
+and vs_opt_check.c now model, so code that depends on file 3 reading zero fails in both.

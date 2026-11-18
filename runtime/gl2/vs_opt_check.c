@@ -15,7 +15,7 @@ static void rd(const char*p,char*b){FILE*f=fopen(p,"rb");size_t n=fread(b,1,6553
 static float cst[256][4];static int nonfinite;
 static void run(const uint32_t *code,unsigned n,float in[8][4],float out[8][4]){float t[16][4];memset(t,0,sizeof t);memset(out,0,32*4);
  for(unsigned i=0;i<n;++i){unsigned A=code[2*i],B=code[2*i+1],op=A&31,dst=B>>26,mask=(B>>22)&15;float s[3][4],res[4]={0,0,0,0};
-  for(int k=0;k<3;++k){unsigned f=(B>>(16+2*k))&3,idx=(B>>(4*k))&15,swz=(A>>(8+8*k))&255;const float *v;static const float zero[4];
+  for(int k=0;k<3;++k){unsigned f=(B>>(16+2*k))&3,idx=(B>>(4*k))&15,swz=(A>>(8+8*k))&255;const float *v;static const float zero[4]={1,1,1,1}; /* operand file 3: not 0.0 on hardware (NanoEmu models 1.0) */
    if(f==0)v=in[idx&7];else if(f==1)v=cst[((B>>12)&15)<<4|idx];else if(f==2)v=t[idx];else v=zero;
    for(int q=0;q<4;++q){s[k][q]=v[(swz>>(2*q))&3];if(A&(1u<<(5+k)))s[k][q]=-s[k][q];}}
   switch(op){case 1:for(int q=0;q<4;++q)res[q]=s[0][q];break;case 2:for(int q=0;q<4;++q)res[q]=s[0][q]+s[1][q];break;case 3:for(int q=0;q<4;++q)res[q]=s[0][q]*s[1][q]+s[2][q];break;case 4:for(int q=0;q<4;++q)res[q]=s[0][q]*s[1][q];break;

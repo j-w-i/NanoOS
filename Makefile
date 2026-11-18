@@ -14,6 +14,9 @@ THUMB_OBJS := $(addprefix build/,main.o devmode.o fmt.o spi.o touch.o buttons.o 
 $(THUMB_OBJS): CFLAGS += -mthumb
 # MBX: register pokes and a test page, no divisions: -Os
 build/mbx.o build/mbx_test.o build/mmu.o build/game.o build/asset.o: CFLAGS += -Os
+# The kernel's own GL2 runtime copy only serves the built-in GPU test fixtures (games link their
+# own SDK copy at -O2): size over speed keeps the image under the 0x08040000 limit.
+build/gl2api.o build/gl2vsc.o: CFLAGS += -Os
 .PHONY: all clean
 CFLAGS += $(KERNEL_DEFS)
 all: build/kernel.bin
