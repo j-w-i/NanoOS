@@ -32,7 +32,7 @@ static void init_map(struct ns_sftl *map,struct ns_run *r,struct ns_update *u,un
 static int setup(struct source *s,unsigned limit){
  memset(media,255,sizeof media);memset(states,9,sizeof states);memset(masks,15,sizeof masks);
  states[7]=states[8]=states[9]=1;masks[8]=8;masks[9]=6;
- init_map(&m,runs,updates,12);struct ns_write_io io={s,inspect,program,0,usec};
+ init_map(&m,runs,updates,12);struct ns_write_io io={s,inspect,program,0,usec,0};
  return ns_append_open(&a,&w,&m,states,leases,sizeof leases,&io,stage,sr,scratch,rr,1000000,limit);
 }
 static int put(unsigned seq){for(unsigned i=0;i<4096;++i)data[i]=seq*65537u+i;return ns_append_page(&a,lb,ep,data);}
@@ -54,7 +54,7 @@ static void recover(unsigned seq){
 }
 static unsigned fill(struct source *s,unsigned mask,unsigned tail,int fragmented){
  assert(!setup(s,0));masks[7]=mask;w.active=0;
- struct ns_write_io io={s,inspect,program,0,usec};assert(!ns_append_open(&a,&w,&m,states,leases,sizeof leases,&io,stage,sr,scratch,rr,1000000,0));
+ struct ns_write_io io={s,inspect,program,0,usec,0};assert(!ns_append_open(&a,&w,&m,states,leases,sizeof leases,&io,stage,sr,scratch,rr,1000000,0));
  unsigned pages=__builtin_popcount(mask)*128-tail/4;
  if(fragmented){lb[0]=0;lb[1]=2;lb[2]=1;lb[3]=3;}else for(unsigned i=0;i<4;++i)lb[i]=i;
  for(unsigned seq=1;seq<=pages;++seq)assert(!put(seq));

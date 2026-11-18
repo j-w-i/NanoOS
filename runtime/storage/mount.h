@@ -9,6 +9,13 @@ struct ns_mount_io {
  ns_page_read inspect;
  int (*context)(void *,unsigned block,unsigned page,unsigned view,unsigned count,void *,uint32_t *);
  uint32_t (*usec)(void *);
+ /* Optional fast read (nand_read_ppn_direct): DMA straight into data (32-byte aligned; NULL =
+  * records only), count = sectors 1..4 from column zero, later records 0xffffffff. Same
+  * 0/-2/negative contract as inspect. When set, mount and ns_mount_page_read use it. */
+ int (*direct)(void *,uint32_t ce,uint32_t row,unsigned count,void *data,uint32_t *record16);
+ /* Sectors survey() transfers per first page (0 = 4). 1 reads only sector 0 and its record:
+  * a quarter of the bus time. Needs direct. */
+ uint32_t survey_sectors;
 };
 struct ns_root {uint32_t block,gen,key;};
 struct ns_mount {
@@ -27,6 +34,7 @@ struct ns_mount {
   * READY block may be skipped; no later programmed page may follow it. */
  uint32_t recovery_enabled,array_error,recovered_pages,quarantine_block,bad_ce,bad_row;
  uint8_t deferred[2088];
+ uint32_t stage_us[6]; /* time spent in context, survey, load_root, replay, (unused), total */
 };
 /* Fixed N31 geometry:2088physical blocks,2084SFTL blocks; the reserved tail
  * is accepted only with0x08240824 in both context-body copies.

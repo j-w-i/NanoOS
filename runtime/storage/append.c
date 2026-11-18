@@ -38,7 +38,10 @@ int ns_append_page(struct ns_append *a,const uint32_t lba[4],const uint32_t epoc
   if(lb[i]>=m->sectors||g==0xffffffffu||ep[i]>g)return NS_ARGUMENT;
   for(unsigned j=0;j<i;++j)if(lb[j]==lb[i])return NS_ARGUMENT;
  }
- int rc=ns_sftl_compact(m);if(rc){a->poisoned=1;return rc;}
+ /* Compacting re-sorts every replay update; do it only when replay space runs short.
+  * Lookups resolve to the newest update either way. */
+ int rc=0;
+ if(m->update_capacity-m->nupdates<m->update_capacity/4u+8u){rc=ns_sftl_compact(m);if(rc){a->poisoned=1;return rc;}}
  if(w->next){rc=ns_write_resume_compacted(w);if(rc)return rc;}
  else w->expected_updates=m->nupdates;
  if(m->update_capacity-m->nupdates<4)return NS_SPACE;

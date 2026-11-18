@@ -29,7 +29,7 @@ APP_ALL_CXXFLAGS := $(CPPFLAGS) $(APP_CPPFLAGS) $(ARCH) -Os -ffreestanding -fno-
 
 GL2_PREFIX := -include $(NANO_GL2)/std/gl2prefix.h
 
-SDK_STOR_FILES := sftl.c disk.c mount.c hfs.c partition.c write.c fmc_program.c fmc_erase.c reclaim.c append.c collect.c btoc.c checkpoint_plan.c
+SDK_STOR_FILES := sftl.c disk.c mount.c handoff.c hfs.c partition.c write.c fmc_program.c fmc_erase.c reclaim.c append.c collect.c btoc.c checkpoint_plan.c
 SDK_LIB_FILES := game.c nano_game.c save.c
 
 SDK_OBJS := \

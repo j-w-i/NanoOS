@@ -13,6 +13,7 @@
 #include "../runtime/storage/disk.h"
 #include "../runtime/storage/partition.h"
 #include "../runtime/storage/hfs.h"
+#include "../runtime/storage/handoff.h"
 static const struct ngame_hdr *game;
 static uint32_t usec(void) { return USEC; }
 static void dcache_clean(void) { dcache_clean_all(); }
@@ -250,6 +251,15 @@ static int g_nand_inspect_ppn_page(unsigned ce, uint32_t row, void *buf, uint32_
     ninfo_sync();
     return r;
 }
+static int g_nand_read_ppn_direct(unsigned ce, uint32_t row, unsigned count, void *buf, uint32_t meta[16]) {
+    nand_passive = 1;
+    int r = nand_read_ppn_direct(ce, row, count, buf, meta);
+    ninfo_sync();
+    return r;
+}
+/* Set only by a successful nand_game_boot mount in THIS boot (game_boot clears the window). */
+static const void *volume_handoff;
+static const void *g_nand_volume_handoff(void) { return volume_handoff; }
 
 static const struct nanoos_api api = {
     NGAME_ABI, NGAME_API_VERSION << 16 | (NANOOS_MMU ? NGAME_API_MMU : 0),
@@ -282,6 +292,7 @@ static const struct nanoos_api api = {
     mbx_queue_capacity, mbx_render_async,
     lcd_present_buffer, lcd_buffer_busy,
     mbx_submit_parts_async, mbx_fifo_sync, mbx_fifo_async_info, mbx_fifo_pump,
+    g_nand_read_ppn_direct, g_nand_volume_handoff,
 };
 
 static int outside(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi) {
@@ -318,9 +329,13 @@ struct nand_boot_ws {
     struct ns_update updates[NB_UPDATES];
     uint8_t mask[2088], states[2088], leases[2088];
     uint32_t fg[2088], fk[2088];
-    uint32_t page[4096], record[16], cache[4096], cache_record[16];
+    uint32_t page[4096] __attribute__((aligned(32))), record[16];
+    uint32_t cache[4096] __attribute__((aligned(32))), cache_record[16];
     unsigned char cat[32768], ext[32768];
+    uint16_t order[NB_UPDATES];
 };
+_Static_assert(MM_GAME_HEAP + 0x00400000u + sizeof(struct nand_boot_ws) <= NS_HANDOFF_ADDR,
+               "kernel mount workspace overlaps the volume handoff window");
 
 static uint32_t nb_clock_us(void *p) { (void)p; return USEC; }
 static int nb_inspect(void *p, uint32_t ce, uint32_t row, void *data, uint32_t *r) {
@@ -328,6 +343,9 @@ static int nb_inspect(void *p, uint32_t ce, uint32_t row, void *data, uint32_t *
 }
 static int nb_context(void *p, unsigned b, unsigned pg, unsigned view, unsigned n, void *data, uint32_t *r) {
     (void)p; return g_nand_read_ppn_context(b, pg, view, n, data, r);
+}
+static int nb_direct(void *p, uint32_t ce, uint32_t row, unsigned n, void *data, uint32_t *r) {
+    (void)p; return g_nand_read_ppn_direct(ce, row, n, data, r);
 }
 static int nb_read_bytes(void *p, uint64_t off, void *out, uint32_t n) {
     struct nand_boot_ws *ws = p;
@@ -347,19 +365,37 @@ static int nand_game_boot(void) {
     uint8_t *z = (uint8_t *)ws;
     for (uint32_t i = 0; i < sizeof *ws; ++i) z[i] = 0;
 
-    struct ns_mount_io io = { ws, nb_inspect, nb_context, nb_clock_us };
-    uint32_t budget = 150000000u, began = USEC;
-    int rc = ns_mount_n31(&ws->mount, &io, ws->mask, ws->states, ws->fg, ws->fk,
-                          ws->page, ws->record, ws->runs, NB_RUNS,
-                          ws->updates, NB_UPDATES, budget);
-    if (rc == NS_IO || rc == NS_FORMAT) {
+    /* Fast path first: controller DMA straight into the cached page buffer, one sector of
+     * each block's first page for the survey. Any failure retries the whole mount with the
+     * original copy-out reads, so a fast-path problem costs time, never the boot. */
+    struct ns_mount_io fast = { ws, nb_inspect, nb_context, nb_clock_us, nb_direct, 1u };
+    struct ns_mount_io slow = { ws, nb_inspect, nb_context, nb_clock_us, 0, 0 };
+    uint32_t budget = 150000000u, began = USEC, flags = NS_HANDOFF_F_DIRECT;
+    int strict = 0, rc = NS_IO;
+    for (unsigned pass = 0; pass < 2 && rc; ++pass) {
+        const struct ns_mount_io *io = pass ? &slow : &fast;
+        if (pass) flags = 0;
         uint32_t elapsed = USEC - began;
         if (elapsed >= budget) return 0;
-        rc = ns_mount_n31_recover(&ws->mount, &io, ws->mask, ws->states, ws->fg, ws->fk,
-                                  ws->page, ws->record, ws->runs, NB_RUNS,
-                                  ws->updates, NB_UPDATES, budget - elapsed);
+        rc = strict = ns_mount_n31(&ws->mount, io, ws->mask, ws->states, ws->fg, ws->fk,
+                                   ws->page, ws->record, ws->runs, NB_RUNS,
+                                   ws->updates, NB_UPDATES, budget - elapsed);
+        if (rc == NS_IO || rc == NS_FORMAT) {
+            elapsed = USEC - began;
+            if (elapsed >= budget) return 0;
+            rc = ns_mount_n31_recover(&ws->mount, io, ws->mask, ws->states, ws->fg, ws->fk,
+                                      ws->page, ws->record, ws->runs, NB_RUNS,
+                                      ws->updates, NB_UPDATES, budget - elapsed);
+            if (!rc) flags |= NS_HANDOFF_F_RECOVERED;
+        }
     }
     if (rc) return 0;
+    ns_sftl_index(&ws->mount.map, ws->order, NB_UPDATES);
+    if (!ns_handoff_save((void *)(uintptr_t)NS_HANDOFF_ADDR, NS_HANDOFF_BYTES, &ws->mount, strict,
+                         USEC - began, flags)) {
+        dcache_clean_all();
+        volume_handoff = (const void *)(uintptr_t)NS_HANDOFF_ADDR;
+    }
     if (ns_disk_init(&ws->disk, &ws->mount.map, ns_mount_page_read, &ws->mount, ws->cache, ws->cache_record)) return 0;
     uint64_t prefix = (uint64_t)0xc040u << 12;
     uint64_t size_bytes = (uint64_t)ws->mount.map.sectors << 12;
@@ -368,11 +404,25 @@ static int nand_game_boot(void) {
     if (ns_partition_hfs(nb_read_bytes, ws, prefix, size_bytes - prefix, &off, &bytes)) return 0;
     if (ns_hfs_mount(&ws->fs, nb_read_bytes, ws, off, bytes, ws->cat, ws->ext)) return 0;
 
+    /* A per-game Home-screen app (stage_game_app.py in the workspace) embeds an NPAK "game.path"
+     * naming its own image, e.g. /Apps/Data/OpenLara/game.bin; it loads only that.
+     * Without one, the generic NanoOS app takes the shared slots. */
     static const char *const paths[] = { "/Apps/Data/Game/game.bin", "/Apps/NanoOS/game.bin" };
+    char own[128];
+    const char *list[2] = { paths[0], paths[1] };
+    unsigned count = 2;
+    uint32_t plen = 0;
+    const char *p = asset_find("game.path", &plen);
+    if (p) {
+        if (plen < 2 || plen >= sizeof own || p[0] != '/') return 0;
+        for (uint32_t i = 0; i < plen; ++i) own[i] = p[i];
+        own[plen] = 0;
+        list[0] = own; count = 1;
+    }
     struct ns_file file;
     int opened = 0;
-    for (unsigned i = 0; i < 2; ++i) {
-        if (ns_hfs_open(&ws->fs, paths[i], &file) == 0) { opened = 1; break; }
+    for (unsigned i = 0; i < count; ++i) {
+        if (ns_hfs_open(&ws->fs, list[i], &file) == 0) { opened = 1; break; }
     }
     if (!opened || file.fork.size < sizeof(struct ngame_hdr) || file.fork.size > MM_GAME_END - MM_GAME) return 0;
 
@@ -401,6 +451,10 @@ static int nand_game_boot(void) {
  * falls back to loading an NGM1 executable from NAND HFS+ storage. */
 int game_boot(void) {
     game = 0;
+    /* A volume handoff is only ever from this boot's own mount (RetailOS may have written the
+     * flash since an earlier one). */
+    volume_handoff = 0;
+    ns_handoff_clear((void *)(uintptr_t)NS_HANDOFF_ADDR);
     const volatile uint32_t *h = (const volatile uint32_t *)N7_HANDOFF_ADDR;
     if (h[0] != N7_HANDOFF_MAGIC || h[1] != 1 || h[6] != sizeof(struct nboot_game)) {
         if (asset_game_boot()) return 1;

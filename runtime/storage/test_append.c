@@ -28,7 +28,7 @@ static void init_map(struct ns_sftl *map,struct ns_run *r,struct ns_update *u,un
 static int setup(struct source *s,unsigned limit){
  memset(media,255,sizeof media);memset(states,9,sizeof states);memset(masks,15,sizeof masks);
  states[7]=states[8]=states[9]=1;masks[8]=8;masks[9]=6;
- init_map(&m,runs,updates,12);struct ns_write_io io={s,inspect,program,0,usec};
+ init_map(&m,runs,updates,12);struct ns_write_io io={s,inspect,program,0,usec,0};
  return ns_append_open(&a,&w,&m,states,leases,sizeof leases,&io,stage,sr,scratch,rr,1000000,limit);
 }
 static int put(unsigned seq){for(unsigned i=0;i<4096;++i)data[i]=seq*65537u+i;return ns_append_page(&a,lb,ep,data);}
@@ -84,7 +84,7 @@ int main(void){
  s=(struct source){0};assert(!setup(&s,0));assert(ns_append_rotate(&a)==NS_NOT_READY);
  assert(!put(1)&&!ns_append_rotate(&a)&&w.block==8&&w.next==0);
  assert(!put(2));remount(2);
- struct ns_write_io io={&s,inspect,program,0,usec};
+ struct ns_write_io io={&s,inspect,program,0,usec,0};
  assert(ns_append_open(&a,&w,&m,states,states,sizeof states,&io,stage,sr,scratch,rr,100000,1)==NS_ARGUMENT);
  puts("PASS append MODEL: full natural bank-masked capacities, reserved-tail preservation, three-block rotation, bounded RAM compaction, independent full replay; no-space/invalid/stale/dirty/uncertain-mutation guards");
 }

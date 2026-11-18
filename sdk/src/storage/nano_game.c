@@ -5,6 +5,7 @@
 static uint32_t clock_us(void *p){return ((const struct nanoos_api *)p)->usec();}
 static int inspect(void *p,uint32_t ce,uint32_t row,void *data,uint32_t *r){return ((const struct nanoos_api *)p)->nand_inspect_ppn_page(ce,row,data,r);}
 static int context(void *p,unsigned b,unsigned pg,unsigned view,unsigned n,void *data,uint32_t *r){return ((const struct nanoos_api *)p)->nand_read_ppn_context(b,pg,view,n,data,r);}
+static int direct(void *p,uint32_t ce,uint32_t row,unsigned n,void *data,uint32_t *r){return ((const struct nanoos_api *)p)->nand_read_ppn_direct(ce,row,n,data,r);}
 static uint32_t reg_read(void *p,uint32_t off){(void)p;return *(volatile uint32_t *)(uintptr_t)(0x38a00000u+off);}
 static void reg_write(void *p,uint32_t off,uint32_t v){(void)p;*(volatile uint32_t *)(uintptr_t)(0x38a00000u+off)=v;}
 static void clean(void *p){((const struct nanoos_api *)p)->dcache_clean();}
@@ -18,8 +19,14 @@ static int erase(void *p,uint32_t ce,uint32_t row){
 }
 int ns_nano_game_mount(struct ns_game *g,const struct nanoos_api *api){
  if(!g||!api||api->abi!=NGAME_ABI||NGAME_API_TABLE(api)<19||!api->nand_probe||!api->nand_info||!api->nand_inspect_ppn_page||!api->nand_read_ppn_context||!api->usec||!api->dcache_clean)return NS_UNSUPPORTED;
- if(!api->nand_probe())return NS_IO;
+ /* A v25 kernel that hands over its mount probed and mounted the NAND this boot; probing
+  * again only costs ~0.1 s. Without a handoff, probe first as before. */
+ const void *handoff=NGAME_API_TABLE(api)>=25&&api->nand_volume_handoff?api->nand_volume_handoff():0;
+ if(!handoff&&!api->nand_probe())return NS_IO;
  if(api->nand_info->caus!=2||api->nand_info->blocks!=2088||api->nand_info->pages!=128)return NS_UNSUPPORTED;
- struct ns_mount_io read={(void *)api,inspect,context,clock_us};struct ns_write_io write={(void *)api,inspect,program,erase,clock_us};
- return ns_game_mount(g,&read,&write,150000000u);
+ struct ns_mount_io read={(void *)api,inspect,context,clock_us,0,0};struct ns_write_io write={(void *)api,inspect,program,erase,clock_us,0};
+ /* v25 kernels: DMA-direct reads, one-sector survey, and the volume the kernel mounted to
+  * load this game (adopted instead of a second full mount). */
+ if(NGAME_API_TABLE(api)>=25&&api->nand_read_ppn_direct){read.direct=direct;read.survey_sectors=1;write.direct=direct;}
+ return ns_game_mount_from(g,handoff,&read,&write,150000000u);
 }

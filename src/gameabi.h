@@ -136,7 +136,7 @@
  * their order; a v13 game checks NGAME_API_TABLE(api)>=13. */
 /* v15 adds nand_read_words variant 8 (stock 3072-byte boot reader).
  * No table fields move; existing variants keep their numeric values. */
-#define NGAME_API_VERSION 24u
+#define NGAME_API_VERSION 25u
 #define NGAME_API_TABLE(api) (((api)->flags >> 16) & 0xffu)
 /* The first 32 bytes of game.bin (game/mkgame.py fills size and crc). */
 struct ngame_hdr {
@@ -500,5 +500,12 @@ struct nanoos_api {
     void (*mbx_fifo_sync)(void);
     const uint32_t *(*mbx_fifo_async_info)(void);
     void (*mbx_fifo_pump)(void);   /* feed queued spans without waiting: call often while the CPU works */
+    /* v25 storage. nand_read_ppn_direct: nand_inspect_ppn_page's results, but the controller
+     * DMAs into buf itself (32-byte aligned cached DRAM, count*4096 bytes; NULL = records
+     * only); count = sectors 1..4, later records read 0xffffffff; buf undefined on failure.
+     * nand_volume_handoff: the NAND volume the kernel mounted THIS boot to load the game
+     * (runtime/storage/handoff.h), or NULL; nano_fs_mount adopts it instead of remounting. */
+    int (*nand_read_ppn_direct)(unsigned ce, uint32_t row, unsigned count, void *buf, uint32_t meta[16]);
+    const void *(*nand_volume_handoff)(void);
 };
 #endif

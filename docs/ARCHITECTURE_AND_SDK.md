@@ -63,6 +63,19 @@ NanoOS is a bare-metal single-address-space kernel for the iPod Nano 7 (`S5L8740
 - **NAND PPN Driver (`src/nand.c`):** Removed redundant 4,096-word uncached `ppn_dma` pre-fill and replaced single-word copies with `burst_copy_4096()` (8-word unrolled transfers).
 - **SFTL Mount (`runtime/storage/mount.c`):** Non-recovery `survey()` reads only the first usable bank of `page 0` per block (~2,084 vs ~8,336 reads), and `erased()` checks the 16-word spare record before scanning the 16 KiB page buffer.
 - **Disk Cache (`runtime/storage/disk.c`):** 16-page (256 KiB) LRU sector cache + 32-bit `fast_copy()`.
+- **v25 direct-DMA reads (`nand_read_ppn_direct`):** the FMC DMA lands straight in a 32-byte aligned cached buffer
+  (clean+invalidate by MVA around it) instead of strongly-ordered scratch plus a CPU copy: 0.73 ms per 16 KiB page
+  (was 1.39 ms), 0.24 ms for one sector. Mount, the disk cache and write blank-checks/read-backs use it.
+- **Mount (`mount.c`):** `survey()` transfers only sector 0 of each block's first page (`survey_sectors=1`), and
+  `replay()` proves the erased tail of open blocks with one-sector reads. Per-stage times in `ns_mount.stage_us`.
+- **Kernel to game handoff (`handoff.c`, 0x0a5c0000):** the kernel's boot mount is serialised for the game;
+  `nano_fs_mount()` adopts it (no second mount, no re-probe). Cleared at every boot.
+- **Lookup index (`ns_sftl_index`):** replay updates sorted by LBA, O(log n) per sector instead of a full scan.
+- **Writes:** `ns_sftl_finish` skips sorting already-ordered lists, append compacts only when update space is short,
+  new-block selection marks referenced blocks in one pass.
+- **Measured (`examples/nandbench`, runs nand-1..3 / nandwrite-1):** kernel mount 4.5 s -> 1.38 s; game mount
+  4.5 s -> 31 ms (adopted); file reads 10.5 -> 19 MB/s; save store ~114 -> 21 ms per 16 KiB page. All maps
+  byte-identical to the old path; stock RetailOS reads the native saves after reboot.
 - **HFS+ Catalog Lookup (`runtime/storage/hfs.c`):** Index-node binary search from `cat_tree.root` (`OPEN_COLD`: `299.26 ms -> 28.81 ms`, with cache `13.01 ms`; `OPEN_WARM`: `1.15 ms`).
 
 ## 5. Application SDK Reference (`NanoOS/sdk/`)

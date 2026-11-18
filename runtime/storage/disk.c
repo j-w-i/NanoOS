@@ -52,12 +52,10 @@ static int sector(struct ns_disk *d,uint32_t lba,const unsigned char **data) {
     if((type!=1&&type!=2)||(m[0]&0x200u)||m[1]==0xffffffffu||
        m[2]!=lba||m[3]>m[1]){s->valid=0;return NS_FORMAT;}
     int replay=0;
-    for(uint32_t i=d->map->nupdates;i;--i) {
-        const struct ns_update *u=d->map->updates+i-1;
-        if(u->lba!=lba)continue;
+    const struct ns_update *u=ns_sftl_newest(d->map,lba);
+    if(u){
         replay=1;
         if(m[1]!=u->generation||(m[0]>>16)!=u->key){s->valid=0;return NS_CONFLICT;}
-        break;
     }
     if(!replay&&(m[1]>d->map->checkpoint_generation||
        (m[1]==d->map->checkpoint_generation&&

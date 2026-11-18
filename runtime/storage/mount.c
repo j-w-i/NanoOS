@@ -6,20 +6,25 @@
 #define DATA_BLOCKS 2084u
 static int later(uint32_t g,uint32_t k,uint32_t og,uint32_t ok){return g>og||(g==og&&k>ok);}
 static int expired(struct ns_mount *m){return m->io.usec&&m->io.usec(m->io.opaque)-m->start>=m->budget;}
-static int erased(const uint32_t *p,const uint32_t *r){
- for(unsigned i=0;i<16;++i)if(r[i]!=0xffffffffu)return 0;
- for(unsigned i=0;i<4096;++i)if(p[i]!=0xffffffffu)return 0;
+static uint32_t now(struct ns_mount *m){return m->io.usec?m->io.usec(m->io.opaque):0;}
+/* count = sectors transferred (records past it are not compared). */
+static int erased(const uint32_t *p,const uint32_t *r,unsigned count){
+ for(unsigned i=0;i<count*4u;++i)if(r[i]!=0xffffffffu)return 0;
+ for(unsigned i=0;i<count*1024u;++i)if(p[i]!=0xffffffffu)return 0;
  return 1;
 }
 /* Return1 ONLY for completely transferred all-FF bytes/records, never for a
  * timeout or an arbitrary device error. Non-erased errored data is rejected. */
-static int read_page(struct ns_mount *m,uint32_t ce,uint32_t row){
+static int read_sectors(struct ns_mount *m,uint32_t ce,uint32_t row,unsigned count){
  if(expired(m))return NS_TIMEOUT;
  ++m->reads;
- int rc=m->io.inspect(m->io.opaque,ce,row,m->page,m->record);m->array_error=rc==-2;
- if(rc==0||rc==-2){if(erased(m->page,m->record)){++m->erased;return 1;}if(!rc)return 0;}
+ int rc=m->io.direct?m->io.direct(m->io.opaque,ce,row,count,m->page,m->record)
+                    :m->io.inspect(m->io.opaque,ce,row,m->page,m->record);
+ m->array_error=rc==-2;
+ if(rc==0||rc==-2){if(erased(m->page,m->record,count)){++m->erased;return 1;}if(!rc)return 0;}
  ++m->errors;return NS_IO;
 }
+static int read_page(struct ns_mount *m,uint32_t ce,uint32_t row){return read_sectors(m,ce,row,4);}
 static uint32_t popcount(uint32_t v){uint32_t n=0;for(unsigned k=0;k<4;++k)n+=(v>>k)&1u;return n;}
 static uint32_t row_for(uint32_t block,uint32_t bank,uint32_t page){return (bank%2u)<<19|block<<7|page;}
 static int context(struct ns_mount *m){
@@ -62,10 +67,15 @@ static void candidate(struct ns_mount *m,uint32_t block,const uint32_t *r){
  for(unsigned i=m->roots-1;i>pos;--i)m->candidate[i]=m->candidate[i-1];
  m->candidate[pos]=(struct ns_root){block,r[1],r[0]>>16};
 }
+/* survey_sectors=1 reads only sector 0 of each first page. Its record still names a
+ * checkpoint root, and first_gen comes from record 0 instead of the newest of the four.
+ * That only differs for a first page the checkpoint caught mid-write, i.e. the block open
+ * at checkpoint time, which the checkpoint itself marks state 4 and replay() reads fully. */
 static int survey(struct ns_mount *m){
+ unsigned cnt=m->io.direct&&m->io.survey_sectors>=1u&&m->io.survey_sectors<=4u?m->io.survey_sectors:4u;
  for(unsigned b=0;b<DATA_BLOCKS;++b){m->first_gen[b]=m->first_key[b]=0;
   for(unsigned bank=0;bank<4;++bank){if(!(m->mask[b]&(1u<<bank)))continue;
-   int rc=read_page(m,bank/2,row_for(b,bank,0));
+   int rc=read_sectors(m,bank/2,row_for(b,bank,0),cnt);
    if(rc==NS_TIMEOUT)return rc;
    /* A bad or unreadable usable-bank first page cannot be silently skipped. */
    if(rc<0){
@@ -73,15 +83,15 @@ static int survey(struct ns_mount *m){
     m->detail=b;return rc;
    }if(rc==1){if(!m->recovery_enabled)break;continue;}
    int partial=0;
-   for(unsigned k=0;k<4;++k){const uint32_t *r=m->record+k*4;
+   for(unsigned k=0;k<cnt;++k){const uint32_t *r=m->record+k*4;
     if(r[0]==0xffffffffu&&r[1]==0xffffffffu&&r[2]==0xffffffffu&&r[3]==0xffffffffu)partial=1;
    }
    if(partial){if(!m->recovery_enabled){m->detail=b;return NS_FORMAT;}m->deferred[b]=1;}
-   for(unsigned k=0;k<4;++k){const uint32_t *r=m->record+k*4;unsigned type=r[0]&255u;
+   for(unsigned k=0;k<cnt;++k){const uint32_t *r=m->record+k*4;unsigned type=r[0]&255u;
     if(type!=1&&type!=2&&type!=0x1f)m->deferred[b]|=2;
    }
    candidate(m,b,m->record);
-   for(unsigned k=0;k<4;++k){const uint32_t *r=m->record+k*4;unsigned type=r[0]&255u;
+   for(unsigned k=0;k<cnt;++k){const uint32_t *r=m->record+k*4;unsigned type=r[0]&255u;
     if(type==1||type==2){if(r[1]==0xffffffffu||r[3]>r[1])return NS_FORMAT;
      if(later(r[1],r[0]>>16,m->first_gen[b],m->first_key[b])){m->first_gen[b]=r[1];m->first_key[b]=r[0]>>16;}}
    }
@@ -181,7 +191,10 @@ static int replay(struct ns_mount *m){
   int hole=0,have=0;
   for(unsigned p=0;p<128;++p)for(unsigned bank=0;bank<4;++bank){if(!(m->mask[b]&(1u<<bank)))continue;
    m->detail=0x30000000u|(b<<9)|(p<<2)|bank;
-   int rc=read_page(m,bank/2,row_for(b,bank,p));
+   /* Past the block's first erased page every page must be erased too. Pages are
+    * programmed whole, so proving that needs only sector 0 and its record: a quarter of
+    * the transfer. A programmed sector 0 there still fails the mount as before. */
+   int rc=read_sectors(m,bank/2,row_for(b,bank,p),hole&&m->io.direct?1u:4u);
    if(rc<0){if(rc==NS_IO&&m->array_error&&!hole&&!drop_tail(m,b,bank,p)){hole=1;continue;}return rc;}
    ++m->replay_pages;
    if(rc==1){hole=1;continue;}
@@ -211,15 +224,19 @@ static int mount_n31(struct ns_mount *m,const struct ns_mount_io *io,uint8_t *ma
  if(!io||!io->inspect||!io->context||!mask||!states||!fg||!fk||!data||!record||!runs||!nr||!budget)return NS_ARGUMENT;
  m->io=*io;m->mask=mask;m->states=states;m->first_gen=fg;m->first_key=fk;m->page=data;m->record=record;m->blocks=BLOCKS;m->budget=budget;
  m->start=io->usec?io->usec(io->opaque):0;m->stage=1;
- int rc=context(m);if(rc)goto bad;
- m->stage=2;rc=survey(m);if(rc)goto bad;
+ uint32_t t=m->start;
+#define LAP(i) do{uint32_t n_=now(m);m->stage_us[i]=n_-t;t=n_;}while(0)
+ int rc=context(m);LAP(0);if(rc)goto bad;
+ m->stage=2;rc=survey(m);LAP(1);if(rc)goto bad;
  m->stage=3;rc=NS_INCOMPLETE;
- for(unsigned i=0;i<m->roots;++i){rc=load_root(m,m->candidate[i],runs,nr,updates,nu);if(!rc)break;if(rc==NS_TIMEOUT||rc==NS_IO)goto bad;}
- if(rc)goto bad;
- m->stage=4;rc=replay(m);if(rc)goto bad;
+ for(unsigned i=0;i<m->roots;++i){rc=load_root(m,m->candidate[i],runs,nr,updates,nu);if(!rc)break;if(rc==NS_TIMEOUT||rc==NS_IO)break;}
+ LAP(2);if(rc)goto bad;
+ m->stage=4;rc=replay(m);LAP(3);if(rc)goto bad;
  for(unsigned b=1;b<DATA_BLOCKS;++b)if(!ns_sftl_ready_block(&m->map,b,m->states[b])){m->ready_block=b;break;}
+ LAP(4);m->stage_us[5]=t-m->start;
  m->stage=5;m->detail=0;return 0;
- bad:m->map.ready=0;return rc;
+ bad:m->stage_us[5]=now(m)-m->start;m->map.ready=0;return rc;
+#undef LAP
 }
 int ns_mount_n31(struct ns_mount *m,const struct ns_mount_io *io,uint8_t *mask,uint8_t *states,uint32_t *fg,uint32_t *fk,uint32_t *data,uint32_t *record,struct ns_run *runs,uint32_t nr,struct ns_update *updates,uint32_t nu,uint32_t budget){
  return mount_n31(m,io,mask,states,fg,fk,data,record,runs,nr,updates,nu,budget,0);
@@ -228,6 +245,8 @@ int ns_mount_n31_recover(struct ns_mount *m,const struct ns_mount_io *io,uint8_t
  return mount_n31(m,io,mask,states,fg,fk,data,record,runs,nr,updates,nu,budget,1);
 }
 int ns_mount_page_read(void *opaque,uint32_t ce,uint32_t row,void *out,uint32_t *record){
- struct ns_mount *m=opaque;int rc=m->io.inspect(m->io.opaque,ce,row,out,record);
+ struct ns_mount *m=opaque;
+ int rc=m->io.direct&&!((uintptr_t)out&31u)?m->io.direct(m->io.opaque,ce,row,4,out,record)
+                                           :m->io.inspect(m->io.opaque,ce,row,out,record);
  return rc?NS_IO:0;
 }

@@ -9,6 +9,9 @@ struct ns_write_io {
  int (*program)(void *,uint32_t ce,uint32_t row,const void *,const uint32_t *);
  int (*erase)(void *,uint32_t ce,uint32_t block_row);
  uint32_t (*usec)(void *);
+ /* Optional: same contract as ns_mount_io.direct. Blank proofs and program read-backs use
+  * it (count 4) when the scratch buffer is 32-byte aligned. */
+ int (*direct)(void *,uint32_t ce,uint32_t row,unsigned count,void *data,uint32_t *record16);
 };
 struct ns_writer {
  struct ns_sftl *map;struct ns_write_io io;

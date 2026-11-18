@@ -344,7 +344,25 @@ static int ppn_dma_wait(void) {
 }
 static uint32_t ppn_records[16];
 static unsigned ppn_transport_complete;
-static int ppn_page(unsigned ce, uint32_t row, unsigned count) {
+/* Data-cache maintenance by address for DMA into cached (write-back) DRAM. The buffer must
+ * start and end on cache lines (callers pass 32-byte aligned multiples of 4096 bytes), so
+ * the invalidate never discards a neighbour's data. */
+static uint32_t dline(void) {
+    uint32_t ctr;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 1" : "=r"(ctr));
+    return 4u << ((ctr >> 16) & 15u);
+}
+static void dc_range(const void *p, uint32_t n, int clean) {
+    uint32_t l = dline(), a = (uint32_t)(uintptr_t)p & ~(l - 1u), e = (uint32_t)(uintptr_t)p + n;
+    for (; a < e; a += l) {
+        if (clean) __asm__ volatile("mcr p15, 0, %0, c7, c14, 1" :: "r"(a) : "memory"); /* DCCIMVAC */
+        else __asm__ volatile("mcr p15, 0, %0, c7, c6, 1" :: "r"(a) : "memory");        /* DCIMVAC */
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+static int ppn_page_to(unsigned ce, uint32_t row, unsigned count, uint32_t *dst);
+static int ppn_page(unsigned ce, uint32_t row, unsigned count) { return ppn_page_to(ce, row, count, ppn_dma); }
+static int ppn_page_to(unsigned ce, uint32_t row, unsigned count, uint32_t *dst) {
     ppn_transport_complete = 0;
     nand_passive = 1;
     nand.ph = 0;
@@ -406,7 +424,7 @@ static int ppn_page(unsigned ce, uint32_t row, unsigned count) {
         nand.ppn_stage = 5 + sector * 8;
         FMC(0xc54) = 0xc;
         __asm__ volatile("dsb sy" ::: "memory");
-        FMC(0x34) = (uint32_t)(uintptr_t)(ppn_dma + sector * 1024);
+        FMC(0x34) = (uint32_t)(uintptr_t)(dst + sector * 1024);
         FMC(0x38) = 7;
         r = wt(8);
         for (unsigned i = 0; !r && i < 3; ++i) {
@@ -503,6 +521,23 @@ int nand_inspect_ppn_page(unsigned ce, uint32_t row, void *buf, uint32_t meta[16
         return r;
     }
     /* -2 specifically promises transport-complete diagnostic bytes here. */
+    return r == -2 ? -1 : r;
+}
+/* v25 direct read: the controller DMAs straight into the caller's cached buffer (no copy
+ * out of strongly-ordered memory), or into private scratch when buf is NULL (records only).
+ * count = sectors to transfer from column zero (1..4); records past count read 0xffffffff.
+ * Same results as nand_inspect_ppn_page; buf contents are undefined after a failure. */
+int nand_read_ppn_direct(unsigned ce, uint32_t row, unsigned count, void *buf, uint32_t meta[16]) {
+    if (!count || count > 4u || ((uintptr_t)buf & 31u) ||
+        ppn_args(ce, row, buf ? buf : (void *)ppn_dma, meta)) return -3;
+    uint32_t *dst = buf ? (uint32_t *)buf : ppn_dma;
+    if (buf) dc_range(buf, count * 4096u, 1);
+    int r = ppn_page_to(ce, row, count, dst);
+    if (buf) dc_range(buf, count * 4096u, 0);
+    if (ppn_transport_complete) {
+        for (unsigned i = 0; i < 16; ++i) meta[i] = i < count * 4u ? ppn_records[i] : 0xffffffffu;
+        return r;
+    }
     return r == -2 ? -1 : r;
 }
 int nand_read_ppn(unsigned ce, uint32_t row, unsigned sector,

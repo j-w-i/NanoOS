@@ -1,4 +1,5 @@
 #include "game.h"
+#include "handoff.h"
 static int external(struct ns_game *g,const void *p,uint32_t n){
  uintptr_t a=(uintptr_t)p,b=(uintptr_t)g;return a<=UINTPTR_MAX-n&&(!n||a>=b+sizeof *g||a+n<=b);
 }
@@ -6,6 +7,9 @@ static int read_bytes(void *p,uint64_t off,void *out,uint32_t n){
  struct ns_game *g=p;uint32_t done;int rc=ns_disk_pread(&g->disk,off,out,n,&done);return rc?rc:done==n?0:NS_IO;
 }
 int ns_game_mount(struct ns_game *g,const struct ns_mount_io *read,const struct ns_write_io *write,uint32_t budget){
+ return ns_game_mount_from(g,0,read,write,budget);
+}
+int ns_game_mount_from(struct ns_game *g,const void *handoff,const struct ns_mount_io *read,const struct ns_write_io *write,uint32_t budget){
  if(!g||!read||!budget||!read->inspect||!read->context)return NS_ARGUMENT;
  if(write&&(write->inspect!=read->inspect||write->opaque!=read->opaque))return NS_ARGUMENT;
  struct ns_mount_io ri=*read;struct ns_write_io wi=write?*write:(struct ns_write_io){0};
@@ -13,18 +17,29 @@ int ns_game_mount(struct ns_game *g,const struct ns_mount_io *read,const struct 
  unsigned char *b=(unsigned char *)g;for(unsigned i=0;i<sizeof *g;++i)b[i]=0;
  g->io=wi;g->budget_us=budget;
  uint32_t began=ri.usec?ri.usec(ri.opaque):0;
- int rc=ns_mount_n31(&g->mount,&ri,g->mask,g->states,g->fg,g->fk,g->page,g->record,g->runs,NS_GAME_RUNS,g->updates,NS_GAME_UPDATES,budget);
- g->strict_mount_rc=rc;
- if(rc==NS_IO||rc==NS_FORMAT){uint32_t elapsed=ri.usec?ri.usec(ri.opaque)-began:0;if(elapsed>=budget)return NS_TIMEOUT;
-  rc=ns_mount_n31_recover(&g->mount,&ri,g->mask,g->states,g->fg,g->fk,g->page,g->record,g->runs,NS_GAME_RUNS,g->updates,NS_GAME_UPDATES,budget-elapsed);
+ int rc=NS_NOT_READY;
+ if(handoff){
+  const struct ns_handoff *h=0;int strict=0;
+  rc=ns_handoff_load(handoff,NS_HANDOFF_BYTES,&g->mount,&ri,g->mask,g->states,g->fg,g->fk,g->page,g->record,
+                     g->runs,NS_GAME_RUNS,g->updates,NS_GAME_UPDATES,&strict,&h);
+  if(!rc){g->strict_mount_rc=strict;g->adopted=1;g->kernel_mount_us=h->mount_us;}
+ }
+ if(rc){
+  rc=ns_mount_n31(&g->mount,&ri,g->mask,g->states,g->fg,g->fk,g->page,g->record,g->runs,NS_GAME_RUNS,g->updates,NS_GAME_UPDATES,budget);
+  g->strict_mount_rc=rc;
+  if(rc==NS_IO||rc==NS_FORMAT){uint32_t elapsed=ri.usec?ri.usec(ri.opaque)-began:0;if(elapsed>=budget)return NS_TIMEOUT;
+   rc=ns_mount_n31_recover(&g->mount,&ri,g->mask,g->states,g->fg,g->fk,g->page,g->record,g->runs,NS_GAME_RUNS,g->updates,NS_GAME_UPDATES,budget-elapsed);
+  }
  }
  if(rc)return rc;
+ ns_sftl_index(&g->mount.map,g->order,NS_GAME_UPDATES);
  rc=ns_disk_init(&g->disk,&g->mount.map,ns_mount_page_read,&g->mount,g->cache,g->cache_record);if(rc)return rc;
  rc=ns_disk_set_cache(&g->disk,g->cache,g->cache_record,16u);if(rc)return rc;
  uint64_t prefix=(uint64_t)0xc040<<12,size=(uint64_t)g->mount.map.sectors<<12,off,bytes;
  if(size<=prefix)return NS_FORMAT;
  rc=ns_partition_hfs(read_bytes,g,prefix,size-prefix,&off,&bytes);if(rc)return rc;
  rc=ns_hfs_mount(&g->fs,read_bytes,g,off,bytes,g->cat,g->ext);if(rc)return rc;
+ g->mount_us=ri.usec?ri.usec(ri.opaque)-began:0;
  g->mounted=1;return 0;
 }
 int ns_game_open(struct ns_game *g,const char *path,struct ns_file *file){

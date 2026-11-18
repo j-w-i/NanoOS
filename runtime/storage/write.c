@@ -2,10 +2,15 @@
 static unsigned banks(uint32_t m){unsigned n=0;for(unsigned i=0;i<4;++i)n+=(m>>i)&1u;return n;}
 static uint32_t row(uint32_t b,unsigned bank,unsigned page){return (bank&1u)<<19|b<<7|page;}
 static int expired(struct ns_writer *w){return w->io.usec&&w->io.usec(w->io.opaque)-w->start>=w->budget;}
+/* Whole-page inspection into scratch: DMA-direct when available. */
+static int inspect(struct ns_writer *w,uint32_t ce,uint32_t r){
+ if(w->io.direct&&!((uintptr_t)w->scratch&31u))return w->io.direct(w->io.opaque,ce,r,4,w->scratch,w->scratch_record);
+ return w->io.inspect(w->io.opaque,ce,r,w->scratch,w->scratch_record);
+}
 static int blank_page(struct ns_writer *w,unsigned bank,unsigned page){
  if(expired(w))return NS_TIMEOUT;
  w->last_ce=bank/2;w->last_row=row(w->block,bank,page);++w->reads;
- int rc=w->io.inspect(w->io.opaque,w->last_ce,w->last_row,w->scratch,w->scratch_record);
+ int rc=inspect(w,w->last_ce,w->last_row);
  if(rc&&rc!=-2)return NS_IO;
  for(unsigned i=0;i<4096;++i)if(w->scratch[i]!=0xffffffffu)return NS_NOT_BLANK;
  for(unsigned i=0;i<16;++i)if(w->scratch_record[i]!=0xffffffffu)return NS_NOT_BLANK;
@@ -40,7 +45,17 @@ int ns_write_prepare(struct ns_writer *w,struct ns_sftl *m,const uint8_t *states
  }
  w->map=m;w->io=*io;w->stage=stage;w->stage_record=sr;w->scratch=scratch;w->scratch_record=rr;
  w->budget=budget;w->start=io->usec?io->usec(io->opaque):0;
- for(unsigned b=4;b<m->blocks&&b<2084;++b)if(!ns_sftl_ready_block(m,b,states[b])){w->block=b;break;}
+ /* First block >= 4 that ns_sftl_ready_block accepts, found with one pass over the runs and
+  * updates instead of one pass per candidate block. */
+ uint8_t used[4096/8];
+ for(unsigned i=0;i<sizeof used;++i)used[i]=0;
+ for(uint32_t i=0;i<m->nruns;++i)if(m->runs[i].vba!=0x7fffffu){uint32_t b=m->runs[i].vba>>11;if(b<4096u)used[b>>3]|=(uint8_t)(1u<<(b&7u));}
+ for(uint32_t i=0;i<m->nupdates;++i){uint32_t b=m->updates[i].vba>>11;if(b<4096u)used[b>>3]|=(uint8_t)(1u<<(b&7u));}
+ for(unsigned b=4;b<m->blocks&&b<2084;++b){
+  uint8_t mk=m->bank_mask[b];
+  if(states[b]!=1||!mk||(mk&~15u)||(used[b>>3]>>(b&7u)&1u))continue;
+  w->block=b;break;
+ }
  if(w->block==0xffffffffu)return NS_SPACE;
  w->mask=m->bank_mask[w->block];int rc=scan_blank(w);if(rc)return rc;
  w->gen=m->checkpoint_generation;w->key=m->checkpoint_key;
@@ -82,7 +97,7 @@ int ns_write_flush(struct ns_writer *w){
  w->poisoned=1;
  w->map->ready=0;
  rc=w->io.program(w->io.opaque,a.ce,row(w->block,a.ce*2+a.cau,a.page),w->stage,w->stage_record);if(rc)return NS_IO;
- ++w->reads;rc=w->io.inspect(w->io.opaque,a.ce,row(w->block,a.ce*2+a.cau,a.page),w->scratch,w->scratch_record);
+ ++w->reads;rc=inspect(w,a.ce,row(w->block,a.ce*2+a.cau,a.page));
  if(rc)return NS_VERIFY;
  for(unsigned i=0;i<4096;++i)if(w->stage[i]!=w->scratch[i])return NS_VERIFY;
  for(unsigned i=0;i<16;++i)if(w->stage_record[i]!=w->scratch_record[i])return NS_VERIFY;

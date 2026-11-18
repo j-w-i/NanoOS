@@ -15,7 +15,7 @@ class Address(C.Structure):
     _fields_=[(x,C.c_uint32) for x in ('ce','cau','block','page','sector')]
 class Map(C.Structure):
     _fields_=[(x,C.c_uint32) for x in ('blocks','sectors','nruns','nupdates','run_capacity','update_capacity','checkpoint_generation','checkpoint_key','ready')]+[
-        ('error',C.c_int),('bank_mask',C.POINTER(C.c_uint8)),('runs',C.POINTER(Run)),('updates',C.POINTER(Update)),('read_only',C.c_uint32)]
+        ('error',C.c_int),('bank_mask',C.POINTER(C.c_uint8)),('runs',C.POINTER(Run)),('updates',C.POINTER(Update)),('read_only',C.c_uint32),('order',C.POINTER(C.c_uint16)),('order_n',C.c_uint32)]
 
 def main():
     build=HERE/'build';build.mkdir(exist_ok=True)
@@ -26,7 +26,7 @@ def main():
     disk=build/'test_disk'
     subprocess.run(common+['-fsanitize=address,undefined',str(HERE/'test_disk.c'),str(HERE/'disk.c'),str(HERE/'sftl.c'),'-o',str(disk)],check=True)
     subprocess.run([str(disk)],check=True)
-    for name,sources in (('mount',['mount.c','disk.c','sftl.c']),('partition',['partition.c']),('write',['write.c','sftl.c']),('fmc_program',['fmc_program.c']),('fmc_erase',['fmc_erase.c']),('reclaim',['reclaim.c','write.c','sftl.c']),('append',['append.c','write.c','sftl.c']),('collect',['collect.c','append.c','write.c','sftl.c','disk.c']),('btoc',['btoc.c','write.c','sftl.c']),('close',['btoc.c','append.c','write.c','sftl.c']),('checkpoint_plan',['checkpoint_plan.c','sftl.c'])):
+    for name,sources in (('mount',['mount.c','handoff.c','disk.c','sftl.c']),('partition',['partition.c']),('write',['write.c','sftl.c']),('fmc_program',['fmc_program.c']),('fmc_erase',['fmc_erase.c']),('reclaim',['reclaim.c','write.c','sftl.c']),('append',['append.c','write.c','sftl.c']),('collect',['collect.c','append.c','write.c','sftl.c','disk.c']),('btoc',['btoc.c','write.c','sftl.c']),('close',['btoc.c','append.c','write.c','sftl.c']),('checkpoint_plan',['checkpoint_plan.c','sftl.c'])):
         test=build/f'test_{name}'
         subprocess.run(common+['-fsanitize=address,undefined',str(HERE/f'test_{name}.c')]+[str(HERE/s) for s in sources]+['-o',str(test)],check=True)
         subprocess.run([str(test)],check=True)

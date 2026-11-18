@@ -1,4 +1,5 @@
 #include "mount.h"
+#include "handoff.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,17 +64,51 @@ static int inspect(void *opaque,uint32_t ce,uint32_t row,void *out,uint32_t *r){
  return -2;
 }
 static struct ns_mount m;static uint8_t mask[2088],state[2088];
-static uint32_t fg[2088],fk[2088],data[4096],meta[16];
+static uint32_t fg[2088],fk[2088],data[4096] __attribute__((aligned(32))),meta[16];
+/* 0: inspect only; 4/1: direct reads with that many survey sectors. */
+static unsigned g_mode;
+static int direct(void *opaque,uint32_t ce,uint32_t row,unsigned count,void *out,uint32_t *r){
+ static uint32_t tmp[4096],rt[16];
+ assert(count>=1&&count<=4&&!((uintptr_t)out&31u));
+ int rc=inspect(opaque,ce,row,tmp,rt);
+ if(rc&&rc!=-2)return rc;
+ if(out){memcpy(out,tmp,count*4096u);if(count<4)memset((uint32_t *)out+count*1024u,0x5a,(4u-count)*4096u);}
+ for(unsigned i=0;i<16;++i)r[i]=i<count*4u?rt[i]:0xffffffffu;
+ return rc;
+}
 static struct ns_run runs[8192];static struct ns_update updates[1024];
 static int mount(struct source *s,uint32_t budget){
- struct ns_mount_io io={s,inspect,context,clock_read};
+ struct ns_mount_io io={s,inspect,context,clock_read,g_mode?direct:0,g_mode};
  return ns_mount_n31(&m,&io,mask,state,fg,fk,data,meta,runs,8192,updates,1024,budget);
 }
 static int recover(struct source *s){
- struct ns_mount_io io={s,inspect,context,clock_read};
+ struct ns_mount_io io={s,inspect,context,clock_read,g_mode?direct:0,g_mode};
  return ns_mount_n31_recover(&m,&io,mask,state,fg,fk,data,meta,runs,8192,updates,1024,1000000);
 }
-int main(void){
+static unsigned char hbuf[1<<20] __attribute__((aligned(8)));
+static void handoff_roundtrip(struct source *s){
+ assert(!ns_handoff_save(hbuf,sizeof hbuf,&m,0,1234,1));
+ static struct ns_mount m2;static uint8_t mask2[2088],state2[2088];static uint32_t fg2[2088],fk2[2088],data2[4096],meta2[16];
+ static struct ns_run runs2[8192];static struct ns_update updates2[1024];
+ struct ns_mount_io io={s,inspect,context,clock_read,0,0};int strict=-1;const struct ns_handoff *h;
+ assert(!ns_handoff_load(hbuf,sizeof hbuf,&m2,&io,mask2,state2,fg2,fk2,data2,meta2,runs2,8192,updates2,1024,&strict,&h));
+ assert(strict==0&&h->mount_us==1234&&m2.map.ready&&m2.map.runs==runs2&&m2.map.updates==updates2&&m2.map.bank_mask==mask2);
+ assert(m2.map.nruns==m.map.nruns&&!memcmp(runs2,runs,m.map.nruns*sizeof *runs));
+ assert(m2.map.nupdates==m.map.nupdates&&!memcmp(updates2,updates,m.map.nupdates*sizeof *updates));
+ assert(!memcmp(mask2,mask,2088)&&!memcmp(state2,state,2088)&&m2.root==m.root&&m2.open_block==m.open_block);
+ static uint16_t order[1024];assert(!ns_sftl_index(&m2.map,order,1024)&&m2.map.order_n==m2.map.nupdates);
+ for(unsigned lba=0;lba<m.map.sectors;++lba){uint32_t x=0,y=0;int ra=ns_sftl_lookup(&m.map,lba,&x),rb=ns_sftl_lookup(&m2.map,lba,&y);assert(ra==rb&&x==y);
+  assert(ns_sftl_newest(&m.map,lba)-m.map.updates==ns_sftl_newest(&m2.map,lba)-m2.map.updates||(!ns_sftl_newest(&m.map,lba)&&!ns_sftl_newest(&m2.map,lba)));}
+ struct ns_disk disk;uint32_t cache[4096],records[16],a[1024],b[1024];
+ assert(!ns_disk_init(&disk,&m2.map,ns_mount_page_read,&m2,cache,records));
+ struct ns_disk d1;uint32_t c1[4096],r1[16];assert(!ns_disk_init(&d1,&m.map,ns_mount_page_read,&m,c1,r1));
+ for(unsigned lba=0;lba<128;++lba){assert(!ns_disk_read(&disk,lba,a));assert(!ns_disk_read(&d1,lba,b));assert(!memcmp(a,b,4096));}
+ /* Corruption, wrong capacity and a cleared magic are all refused. */
+ hbuf[200]^=1;assert(ns_handoff_load(hbuf,sizeof hbuf,&m2,&io,mask2,state2,fg2,fk2,data2,meta2,runs2,8192,updates2,1024,0,0)==NS_NOT_READY);hbuf[200]^=1;
+ assert(ns_handoff_load(hbuf,sizeof hbuf,&m2,&io,mask2,state2,fg2,fk2,data2,meta2,runs2,8192,updates2,m.map.nupdates?m.map.nupdates-1:0,0,0)==(m.map.nupdates?NS_NOT_READY:0));
+ ns_handoff_clear(hbuf);assert(ns_handoff_load(hbuf,sizeof hbuf,&m2,&io,mask2,state2,fg2,fk2,data2,meta2,runs2,8192,updates2,1024,0,0)==NS_NOT_READY);
+}
+static void suite(void){
  for(unsigned bits=0;bits<8;++bits){struct source s={.masked=bits&1,.old_context=bits&2,.second_open=bits&4};
   assert(!mount(&s,1000000));assert(m.map.ready&&m.root==3&&m.open_block==4&&m.map.nupdates==(s.second_open?8u:4u)&&m.map.sectors==128);
   assert(m.open_count==(s.second_open?2u:1u)&&m.base_head[2]==6&&m.hint_state_words[0]==7);
@@ -82,6 +117,7 @@ int main(void){
   assert(!ns_disk_init(&disk,&m.map,ns_mount_page_read,&m,cache,records));
   for(unsigned lba=0;lba<128;++lba){assert(!ns_disk_read(&disk,lba,out));
    for(unsigned j=0;j<1024;++j)assert(out[j]==(((lba>=3&&lba<=6)||(s.second_open&&lba>=10&&lba<=13))?(0xab000000u|lba*1000+j):lba*1000+j));}
+  handoff_roundtrip(&s);
  }
  struct source broken={.broken_tree=1};assert(mount(&broken,1000000)==NS_FORMAT&&!m.map.ready);
  struct source hole={.hole=1};assert(mount(&hole,1000000)==NS_FORMAT&&!m.map.ready);
@@ -111,5 +147,8 @@ int main(void){
  struct source later={.torn_block=1,.kind=1,.after_tail=1};assert(recover(&later)==NS_FORMAT&&!m.map.ready);
  struct source multiple={.torn_block=1,.kind=1,.second_torn=1};assert(recover(&multiple)==NS_IO&&!m.map.ready);
  struct source malformed={.torn_block=1,.kind=4};assert(recover(&malformed)==NS_FORMAT&&!m.map.ready);
+ }
+int main(void){
+ for(g_mode=0;g_mode<=4;g_mode+=g_mode?3:1){suite();printf("mode %u ok\n",g_mode);}
  puts("PASS mount: redundant contexts, masked banks, complete checkpoint, replay, cached sector data; strict gaps/conflicts/errors/timeouts fail closed; opt-in single READY-tail quarantine, valid-prefix replay; referenced/open/root/transport/multiple/gap/unknown corruption rejected");
 }

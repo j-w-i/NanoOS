@@ -79,6 +79,10 @@ int nand_read_ppn_context(unsigned block, unsigned page, unsigned view, unsigned
  * both return all16KiB+64B. -1/-3 preserve output. An errored non-FF page is
  * NOT valid file data. Kept separate from normal transactional reads. */
 int nand_inspect_ppn_page(unsigned ce, uint32_t row, void *buf, uint32_t meta[16]);
+/* v25: as inspect, but DMA lands directly in buf (32-byte aligned, count*4096 bytes, cached
+ * DRAM; NULL = discard data, records only). count = sectors (1..4) from column zero; records
+ * past count read 0xffffffff. buf is undefined after a failure. */
+int nand_read_ppn_direct(unsigned ce, uint32_t row, unsigned count, void *buf, uint32_t meta[16]);
 /* Raw read of 4 KB (no FTL): page = cau << 19 | block << 7 | page.
  * 0 ok, -1 timeout, -2 status fail bit 0 (data still read). Round 15
  * (RetailOS 0x084ed600): the page's first 4 KB whatever sector says;

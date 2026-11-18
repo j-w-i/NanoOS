@@ -34,7 +34,7 @@ static void write_page(uint32_t salt){
 }
 static void setup(struct source *s,unsigned mask){
  memset(media,255,sizeof media);memset(masks,15,sizeof masks);memset(states,8,sizeof states);states[4]=states[5]=1;masks[4]=mask;
- init_map(&map,runs,updates);io=(struct ns_write_io){s,inspect,program,erase,usec};
+ init_map(&map,runs,updates);io=(struct ns_write_io){s,inspect,program,erase,usec,0};
  assert(!ns_write_prepare(&w,&map,states,&io,stage,sr,scratch,rr,1000000));assert(w.block==4);
  write_page(0xa1000000);assert(!ns_write_seal_page(&w,&a));
  assert(!ns_write_prepare(&w,&map,states,&io,stage,sr,scratch,rr,1000000)&&w.block==5);

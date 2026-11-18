@@ -26,7 +26,11 @@ static int erase(void *p,uint32_t ce,uint32_t row){
 }
 static struct ns_sftl map;static struct ns_run runs[8];static struct ns_update updates[64];
 static uint8_t masks[8],states[8];static struct ns_writer writer;
-static uint32_t stage[4096],sr[16],scratch[4096],rr[16],data[1024];
+static uint32_t stage[4096],sr[16],scratch[4096] __attribute__((aligned(32))),rr[16],data[1024];
+static unsigned g_direct,direct_calls;
+static int direct(void *p,uint32_t ce,uint32_t row,unsigned count,void *out,uint32_t *r){
+ assert(count==4&&out&&!((uintptr_t)out&31u));++direct_calls;return inspect(p,ce,row,out,r);
+}
 static void setup(unsigned mask){
  memset(media,255,sizeof media);memset(masks,15,sizeof masks);memset(states,9,sizeof states);
  masks[7]=mask;states[1]=states[7]=1;states[4]=8;states[5]=4;states[6]=7;
@@ -36,10 +40,10 @@ static void setup(unsigned mask){
  for(unsigned i=0;i<1024;++i)data[i]=0xaa000000u+i;
 }
 static int prepare(struct source *s,unsigned disabled){
- struct ns_write_io io={s,inspect,disabled?0:program,disabled?0:erase,clock_us};
+ struct ns_write_io io={s,inspect,disabled?0:program,disabled?0:erase,clock_us,g_direct?direct:0};
  return ns_write_prepare(&writer,&map,states,&io,stage,sr,scratch,rr,1000000);
 }
-int main(void){
+static void suite(void){
  setup(15);struct source recovered={0};map.read_only=1;assert(prepare(&recovered,0)==NS_NOT_READY&&!writer.active&&!recovered.programs&&!recovered.erases&&!writer.reads);
  for(unsigned mask=11;mask<=15;mask+=4){
   setup(mask);struct source s={0};assert(!prepare(&s,0));
@@ -64,7 +68,7 @@ int main(void){
  }
  setup(15);struct source ro={0};assert(!prepare(&ro,1));
  assert(ns_write_put(&writer,0,9,data)==NS_UNSUPPORTED&&ns_write_erase_candidate(&writer)==NS_UNSUPPORTED&&!ro.programs&&!ro.erases);
- struct ns_write_io alias_io={&ro,inspect,program,erase,clock_us};
+ struct ns_write_io alias_io={&ro,inspect,program,erase,clock_us,0};
  assert(ns_write_prepare(&writer,&map,states,&alias_io,stage,sr,stage+1,rr,1000)==NS_ARGUMENT&&!writer.reads);
  setup(15);struct source dirty={0};media[3][127][4096]=0;assert(prepare(&dirty,0)==NS_NOT_BLANK&&!writer.active&&!dirty.programs);
  setup(15);struct source bad={.fail_read=1};assert(prepare(&bad,0)==NS_IO&&!writer.active);
@@ -81,5 +85,9 @@ int main(void){
  assert(prepare(&live,0)==NS_SPACE&&!writer.active&&!writer.reads);
  setup(15);struct source changed={0};assert(!prepare(&changed,0));++map.nupdates;
  assert(ns_write_put(&writer,1,9,data)==NS_NOT_READY&&!changed.programs);
+ }
+int main(void){
+ for(g_direct=0;g_direct<2;++g_direct)suite();
+ assert(direct_calls>1000);
  puts("PASS write MODEL: guarded READY blank proof, all banks, masked stripes, erase verification, buffered/full/partial pages, epoch/key wrap, live-reference/capacity/read-only guards; uncertain program/erase poisons mount");
 }

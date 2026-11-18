@@ -77,6 +77,7 @@ int ns_sftl_replay(struct ns_sftl *m,uint32_t vba,const uint32_t r[4]) {
        r[2]>=m->sectors||!valid_run(m,vba,1))return fail(m,NS_FORMAT);
     if(!later(r[1],key,m->checkpoint_generation,m->checkpoint_key))return NS_OK;
     if(m->nupdates==m->update_capacity)return fail(m,NS_SPACE);
+    m->order_n=0;
     m->updates[m->nupdates++]=(struct ns_update){r[2],vba,r[1],key};
     return NS_OK;
 }
@@ -104,14 +105,21 @@ int ns_sftl_finish(struct ns_sftl *m) {
     if(!m)return NS_ARGUMENT;
     if(m->error)return m->error;
     m->ready=0;
-    sort_runs(m->runs,m->nruns);uint32_t next=0;
+    /* Appends and replay keep both lists in order almost always: only sort when not. */
+    uint32_t sorted=1;
+    for(uint32_t i=1;i<m->nruns&&sorted;++i)if(run_less(m->runs[i],m->runs[i-1]))sorted=0;
+    if(!sorted)sort_runs(m->runs,m->nruns);
+    uint32_t next=0;
     for(uint32_t i=0;i<m->nruns;++i) {
         struct ns_run r=m->runs[i];
         if(r.lba!=next)return fail(m,NS_FORMAT);
         next+=r.count;
     }
     if(next<m->sectors)return fail(m,NS_FORMAT);
-    sort_updates(m->updates,m->nupdates);
+    m->order_n=0;
+    sorted=1;
+    for(uint32_t i=1;i<m->nupdates&&sorted;++i)if(update_less(m->updates[i],m->updates[i-1]))sorted=0;
+    if(!sorted)sort_updates(m->updates,m->nupdates);
     for(uint32_t i=1;i<m->nupdates;++i) {
         struct ns_update a=m->updates[i-1],b=m->updates[i];
         if(a.generation==b.generation&&a.key==b.key&&
@@ -119,14 +127,55 @@ int ns_sftl_finish(struct ns_sftl *m) {
     }
     m->ready=1;return NS_OK;
 }
+const struct ns_update *ns_sftl_newest(const struct ns_sftl *m,uint32_t lba) {
+    if(!m)return 0;
+    if(m->order&&m->order_n&&m->order_n==m->nupdates) {
+        /* last position whose update has this lba: positions are weave order, so newest */
+        uint32_t lo=0,hi=m->order_n;
+        while(lo<hi){uint32_t mid=lo+(hi-lo)/2;if(m->updates[m->order[mid]].lba<=lba)lo=mid+1;else hi=mid;}
+        if(lo&&m->updates[m->order[lo-1]].lba==lba)return m->updates+m->order[lo-1];
+        return 0;
+    }
+    /* Replay remains weave-ordered; scan newest first. */
+    for(uint32_t i=m->nupdates;i;--i)if(m->updates[i-1].lba==lba)return m->updates+i-1;
+    return 0;
+}
+static int order_less(const struct ns_update *u,uint16_t a,uint16_t b){
+    return u[a].lba<u[b].lba||(u[a].lba==u[b].lba&&a<b);
+}
+int ns_sftl_index(struct ns_sftl *m,uint16_t *o,uint32_t cap) {
+    if(!m)return NS_ARGUMENT;
+    m->order_n=0;
+    if(!o||m->nupdates>cap||m->nupdates>65536u)return NS_SPACE;
+    uint32_t n=m->nupdates;const struct ns_update *u=m->updates;
+    for(uint32_t i=0;i<n;++i)o[i]=(uint16_t)i;
+    /* heapsort, same shape as SORT() above */
+    for(uint32_t i=1;i<n;++i){
+        uint32_t c=i;
+        while(c){
+            uint32_t p=(c-1)/2;
+            if(!order_less(u,o[p],o[c]))break;
+            uint16_t t=o[p];o[p]=o[c];o[c]=t;c=p;
+        }
+    }
+    for(uint32_t end=n;end>1;){
+        uint16_t t=o[0];o[0]=o[--end];o[end]=t;
+        uint32_t p=0;
+        while(p<end/2){
+            uint32_t c=p*2+1;
+            if(c+1<end&&order_less(u,o[c],o[c+1]))++c;
+            if(!order_less(u,o[p],o[c]))break;
+            t=o[p];o[p]=o[c];o[c]=t;p=c;
+        }
+    }
+    m->order=o;m->order_n=n;
+    return NS_OK;
+}
 int ns_sftl_lookup(const struct ns_sftl *m,uint32_t lba,uint32_t *vba) {
     if(!m||!vba||lba>=m->sectors)return NS_ARGUMENT;
     if(!m->ready)return NS_NOT_READY;
-    /* Replay remains weave-ordered; scan newest first. A mount can compact
-     * this bounded overlay into a hash index without changing its semantics. */
-    for(uint32_t i=m->nupdates;i;--i)if(m->updates[i-1].lba==lba) {
-        *vba=m->updates[i-1].vba;return NS_OK;
-    }
+    const struct ns_update *nu=ns_sftl_newest(m,lba);
+    if(nu){*vba=nu->vba;return NS_OK;}
     uint32_t lo=0,hi=m->nruns;
     while(lo<hi){uint32_t mid=lo+(hi-lo)/2;
         if(m->runs[mid].lba<=lba)lo=mid+1;else hi=mid;}
@@ -139,7 +188,7 @@ int ns_sftl_lookup(const struct ns_sftl *m,uint32_t lba,uint32_t *vba) {
 int ns_sftl_compact(struct ns_sftl *m){
  if(!m)return NS_ARGUMENT;
  if(!m->ready||m->error)return NS_NOT_READY;
- m->ready=0;sort_updates_lba(m->updates,m->nupdates);uint32_t kept=0;
+ m->ready=0;m->order_n=0;sort_updates_lba(m->updates,m->nupdates);uint32_t kept=0;
  for(uint32_t i=0;i<m->nupdates;){uint32_t end=i+1;
   while(end<m->nupdates&&m->updates[end].lba==m->updates[i].lba)++end;
   m->updates[kept++]=m->updates[end-1];i=end;

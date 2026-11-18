@@ -17,6 +17,10 @@ struct ns_sftl {
     struct ns_run *runs;
     struct ns_update *updates;
     uint32_t read_only; /* recovery quarantine: reads valid, all mutation planning refused */
+    /* Optional lookup index (ns_sftl_index): update positions sorted by (lba, position).
+     * Valid only while order_n == nupdates; every update-list change resets order_n. */
+    const uint16_t *order;
+    uint32_t order_n;
 };
 int ns_sftl_init(struct ns_sftl *, uint32_t blocks, uint32_t sectors,
                 const uint8_t *bank_mask, struct ns_run *, uint32_t run_capacity,
@@ -37,6 +41,11 @@ int ns_sftl_compact(struct ns_sftl *);
 int ns_sftl_snapshot(const struct ns_sftl *,struct ns_run *,uint32_t capacity,
  struct ns_update *work,uint32_t work_capacity,uint32_t *count);
 int ns_sftl_lookup(const struct ns_sftl *, uint32_t lba, uint32_t *vba);
+/* Newest replay update for lba (what lookup resolves through), or NULL. */
+const struct ns_update *ns_sftl_newest(const struct ns_sftl *, uint32_t lba);
+/* Build the lookup index in caller storage (cap entries, nupdates <= 65536): lookups become
+ * O(log n) instead of a scan of every replay update. Same results either way. */
+int ns_sftl_index(struct ns_sftl *, uint16_t *order, uint32_t capacity);
 /* Conservative write-planning guard: READY state, usable banks, no checkpoint
  * or replay references. This only permits consideration; it never erases. */
 int ns_sftl_ready_block(const struct ns_sftl *, uint32_t block, uint32_t state);

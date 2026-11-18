@@ -5,12 +5,12 @@ OBJCOPY := $(CROSS_COMPILE)objcopy
 # Strongly-ordered, where an unaligned load faults (GCC merges byte loads
 # into ldrh/ldr); with it on, the uncached DMA sections still are.
 CFLAGS := -mcpu=cortex-a5 -marm -O2 -mno-unaligned-access -Wall -Wextra -Werror -ffreestanding -fno-builtin -fno-pic -fno-common -fno-unwind-tables -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Iruntime/gl2 -Iruntime/storage -MMD -MP
-OBJECTS := $(addprefix build/,startup.o fiq.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o btui.o libc_shim.o gl2rt.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o)
+OBJECTS := $(addprefix build/,startup.o fiq.o main.o lcd.o font.o input.o reset.o devmode.o mem.o timer.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o btui.o libc_shim.o gl2rt.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o ns_handoff.o)
 # Size: the chainloader package must fit the Blocks.hbapp slot it replaces
 # in the emulator test (20708 bytes, emulator/tools/disk_patch.py). Code
 # off the pixel/bus hot paths is Thumb-2 (-O2: -Os calls libgcc for divisions by constants); lcd, input, timer, font
 # stay ARM -O2 (tuned on the device).
-THUMB_OBJS := $(addprefix build/,main.o devmode.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o)
+THUMB_OBJS := $(addprefix build/,main.o devmode.o fmt.o spi.o touch.o buttons.o audio.o nand.o usb.o bt.o mbx.o mbx_test.o drivers.o clk.o mmu.o game.o asset.o gl2vsc.o gl2api.o gl2tex.o sftl.o disk.o mount.o partition.o hfs.o ns_handoff.o)
 $(THUMB_OBJS): CFLAGS += -mthumb
 # MBX: register pokes and a test page, no divisions: -Os
 build/mbx.o build/mbx_test.o build/mmu.o build/game.o build/asset.o: CFLAGS += -Os
@@ -37,6 +37,8 @@ build/mount.o: runtime/storage/mount.c | build
 build/partition.o: runtime/storage/partition.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 build/hfs.o: runtime/storage/hfs.c | build
+	$(CC) $(CFLAGS) -c $< -o $@
+build/ns_handoff.o: runtime/storage/handoff.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 build/%.o: src/%.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
