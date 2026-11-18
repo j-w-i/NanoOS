@@ -29,6 +29,13 @@ static int wait_lcd(void){
 #define EQ_STRIDE 0x80000u
 #define EQ_BYTES (240u*432u*4u)
 static uint32_t qi;static int queued;
+/* GL2_EGL_FBO_SYNC: render FBO frames synchronously with the GPU idle (the pre-v28 behaviour). */
+#ifdef GL2_EGL_FBO_SYNC
+#define FBO_QUEUED 0
+#else
+#define FBO_QUEUED (queued&&window_surface)
+#endif
+static uint32_t *held;   /* window frame retired by a queued FBO end, not presented yet */
 static uint32_t *qbuf(unsigned i){uintptr_t base=(0x08a00000u+GL2_TEXTURE_ARENA_BYTES+EQ_STRIDE-1u)&~(uintptr_t)(EQ_STRIDE-1u);return (uint32_t*)(base+(uintptr_t)i*EQ_STRIDE);}
 static int queue_supported(void){
 #ifdef GL2_EGL_NO_QUEUE
@@ -80,7 +87,7 @@ static int recover(void){
  if(!b.fault)return 0;
  uint32_t now=g_api->usec();if(now-recover_last<100000u)return -1;recover_last=now;
  if(gl2_nano_recover(&b))return -1;
- fault=0;qi=0;last_presented=0;return 0;
+ fault=0;qi=0;last_presented=0;held=0;return 0;
 }
 uint32_t gl2_egl_recoveries(void){return b.recoveries;}
 static void ensure_frame(void){
@@ -93,8 +100,10 @@ static void ensure_frame(void){
    * eglSwapBuffers failed begin_fbo, faulted, and stalled in the 100 ms recovery path. */
   rc=0;
   if(!gl2_fbo_target(&c,&ft,&fw,&fh)){
-   if(b.pending_valid){uint32_t *done=0;rc=gl2_nano_finish(&b,&done);if(!rc&&done&&queued&&window_surface)rc=present_q(done);}
-   if(!rc)rc=gl2_nano_begin_fbo(&b,target,fw,0);
+   /* The FBO scene is built while a queued window frame still renders (end_frame queues it
+    * too). Without the queue the GPU must be idle first. */
+   if(b.pending_valid&&!(FBO_QUEUED)){uint32_t *done=0;rc=gl2_nano_finish(&b,&done);if(!rc&&done&&queued&&window_surface)rc=present_q(done);}
+   if(!rc){uint32_t t0=g_api->usec();rc=gl2_nano_begin_fbo(&b,target,fw,0);gl2_nano_prof[10]+=g_api->usec()-t0;++gl2_nano_prof[11];}
   }}
  else if(window_surface&&queued){
   uint32_t *buf=qbuf(qi);uint32_t start=g_api->usec();
@@ -105,14 +114,26 @@ static void ensure_frame(void){
  else rc=gl2_nano_begin_target(&b,target,width,height,width,0);
  if(rc){fault=1;b.fault=1;}
 }
+/* End the open frame at a target change. An FBO frame is queued like a window frame when
+ * the queue exists: its render overlaps the next frame's submission and its texture is
+ * filled when the render is collected (gl2_nano_end_fbo_queued). */
+static int end_frame(void){
+ if(!c.fbo_active)return gl2_nano_end(&b);
+ if(FBO_QUEUED){
+  uint32_t *ret=0;int rc=gl2_nano_end_fbo_queued(&b,&ret);
+  /* The retired window frame is presented at the next swap, as without an FBO pass: the
+   * display is still pushing the frame before it, and presenting here waited ~10 ms for it. */
+  if(rc!=GL2_NANO_UNSUPPORTED){if(!rc&&ret){if(held)rc=present_q(held);held=ret;}return rc;}
+ }
+ return gl2_nano_end_fbo(&b);
+}
 static void changed_target(void){
  if(!b.frame_open)return;
- int rc=c.fbo_active?gl2_nano_end_fbo(&b):gl2_nano_end(&b);
- if(rc){fault=1;b.fault=1;}
+ if(end_frame()){fault=1;b.fault=1;}
 }
 static int finish(void){
  if(!b.frame_open)return 0;
- return c.fbo_active?gl2_nano_end_fbo(&b):gl2_nano_end(&b);
+ return end_frame();
 }
 void gl2_egl_set_platform(const struct nanoos_api *api){g_api=api;}
 /* Landscape (see gl2_egl.h): applies to window surfaces created afterwards. */
@@ -192,6 +213,8 @@ EGLBoolean eglSwapBuffers(EGLDisplay d,EGLSurface s){
    if(!rc)rc=present_q(b.target);
    qi=(qi+1u)%EQ_N;
   }
+  if(!rc&&held){uint32_t t0=g_api->usec();rc=present_q(held);gl2_nano_prof[8]+=g_api->usec()-t0;++gl2_nano_prof[9];}
+  held=0;
   if(!rc&&ret)rc=present_q(ret);
   if(rc){fault=1;egl_error=EGL_BAD_ACCESS;return EGL_FALSE;}
   return EGL_TRUE;

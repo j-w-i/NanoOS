@@ -34,6 +34,8 @@ void mmu_init(void) {
         if(i==0x3b8u)d=SEC_DEVICE|SEC_XN;
 #endif
         ttb[i] = i << 20 | d;
+        if (i >= (MM_GAME_GPU + MM_GAME_GPU_ALIAS) >> 20 && i < (MM_GAME_GPU_END + MM_GAME_GPU_ALIAS) >> 20)
+            ttb[i] = ((i << 20) - MM_GAME_GPU_ALIAS) | SEC_WB | SEC_XN;
     }
     dcache_clean_all();   /* no line may be valid when C goes on */
     uint32_t r;

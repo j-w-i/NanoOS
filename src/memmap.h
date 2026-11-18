@@ -26,6 +26,10 @@
  * 0x00a00000..0x02000000 = MBX_VA). Uncached for now. */
 #define MM_GAME_GPU      0x08a00000u
 #define MM_GAME_GPU_END  0x0a000000u
+/* Cached (Normal write-back) alias of the game GPU arena at VA + this offset
+ * (API v28). For bulk CPU copies only: invalidate lines before reading what the
+ * GPU wrote, clean and invalidate after writing; never leave lines valid. */
+#define MM_GAME_GPU_ALIAS 0x40000000u
 /* game heap / streaming arena (CPU only). Holds the report mailbox and
  * mirrors (report.h): those are only live from a report write to the
  * next reset, and the game owns the RAM while it runs. */

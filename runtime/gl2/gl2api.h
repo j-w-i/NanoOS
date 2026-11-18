@@ -303,6 +303,10 @@ typedef struct gl2_ctx {
     float fbo_depth[GL2_MAX_FBO_SIZE * GL2_MAX_FBO_SIZE];
     uint8_t copy_pixels[GL2_MAX_FBO_SIZE * GL2_MAX_FBO_SIZE * 4];
     gl2_soft_saved fbo_saved; uint32_t fbo_active;
+    uint32_t fbo_soft_mark, fbo_soft_cleared; /* software draws at bind / software clear since bind: fb_unbind stores only a scratch that was drawn */
+    uint32_t texture_write_force;            /* backend-only: a deferred FBO store bypasses the write guard */
+    uintptr_t texture_store_alias;           /* backend-only: add to texture storage addresses in gl2_texture_store_argb (cached alias), 0 = none */
+    void (*texture_store_flush)(void *va, uint32_t bytes); /* required with texture_store_alias: write back and drop the lines */
     uint32_t landscape; /* window surface shown rotated: 0 portrait, 1 home right, 2 home left (gl2_set_landscape) */
     float clear_color[4]; float clear_depth; uint32_t clear_stencil;
     uint32_t color_mask, scissor_enabled; int32_t scissor_box[4];

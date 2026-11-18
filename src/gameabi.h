@@ -136,7 +136,7 @@
  * their order; a v13 game checks NGAME_API_TABLE(api)>=13. */
 /* v15 adds nand_read_words variant 8 (stock 3072-byte boot reader).
  * No table fields move; existing variants keep their numeric values. */
-#define NGAME_API_VERSION 27u
+#define NGAME_API_VERSION 28u   /* v28: MM_GAME_GPU_ALIAS cached alias of the game GPU arena (memmap.h); no new table fields */
 #define NGAME_API_TABLE(api) (((api)->flags >> 16) & 0xffu)
 /* The first 32 bytes of game.bin (game/mkgame.py fills size and crc). */
 struct ngame_hdr {

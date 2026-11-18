@@ -1,6 +1,10 @@
 #include "gl2nano.h"
 #include "memmap.h"
 static gl2_nano *owner;
+uint32_t gl2_nano_prof[12];
+#ifdef GL2_NANO_FBO_DEBUG
+uint32_t gl2_nano_fdbg[8],gl2_nano_fgrid[129];
+#endif
 static float software_depth[240*432];
 static int owned(gl2_nano *b) { return b && owner==b && b->opened; }
 static int deny(void *u) { (void)u; return -1; }
@@ -16,6 +20,7 @@ static int display_busy(gl2_nano *b,const uint32_t *target,uint32_t bytes){
 }
 static int nano_read(struct gl2_ctx *c,int x,int y,int w,int h,uint32_t format,uint32_t type,uint32_t pack,void *pixels,void *user){
  gl2_nano *b=user;(void)type;
+ if(owned(b)&&b->pending_fbo_texture&&!b->frame_open)(void)gl2_nano_finish(b,0);
  if(!owned(b)||b->fault||b->cpu_active||b->frame_open||b->pending_valid||!b->completed||!b->target)return -1;
  if(c->landscape&&!c->fbo_active){
   /* Rotated window surface: logical (x, y), bottom-left origin, on a panel target. */
@@ -69,6 +74,61 @@ static int texture_sync(void *user,void *cpu,uint32_t va,uint32_t bytes) {
 #endif
     ++b->uploads; return 0;
 }
+/* Cached-alias cache maintenance (kernel API v28, MM_GAME_GPU_ALIAS). 32-byte lines. */
+static void alias_invalidate(const void *va,uint32_t bytes){
+#if defined(__arm__)
+ for(uintptr_t l=(uintptr_t)va&~31u;l<(uintptr_t)va+bytes;l+=32u)__asm__ volatile("mcr p15, 0, %0, c7, c6, 1"::"r"(l):"memory");
+ __asm__ volatile("dsb sy":::"memory");
+#else
+ (void)va;(void)bytes;
+#endif
+}
+static void alias_flush(void *va,uint32_t bytes){
+#if defined(__arm__)
+ for(uintptr_t l=(uintptr_t)va&~31u;l<(uintptr_t)va+bytes;l+=32u)__asm__ volatile("mcr p15, 0, %0, c7, c14, 1"::"r"(l):"memory");
+ __asm__ volatile("dsb sy":::"memory");
+#else
+ (void)va;(void)bytes;
+#endif
+}
+/* Tile a rendered FBO surface into its texture. Reads and writes go through the cached
+ * alias when the kernel maps one: the uncached copy of 128x128 took 5.2 ms. The write
+ * guard is bypassed: every draw that samples the texture in an open frame was issued
+ * after the FBO pass, and the GPU is idle. */
+/* Prove the alias before trusting it (a kernel that reports v28 without the mapping would
+ * read and write nothing): one word each way against the uncached mapping. */
+uint32_t gl2_nano_alias_state;   /* 0 untested, 1 good, else 2|read bad<<4|write bad<<5 (disabled) */
+static void alias_check(gl2_nano *b,uint32_t *surface){
+ volatile uint32_t *so=surface,*al=(volatile uint32_t *)((uintptr_t)surface+b->gpu_alias);
+ uint32_t save=so[0],bad=0;
+ so[0]=0x5aa51234u;alias_invalidate((const void *)al,4u);if(al[0]!=0x5aa51234u)bad|=0x10u;
+ al[0]=0xc33c4321u;alias_flush((void *)al,4u);if(so[0]!=0xc33c4321u)bad|=0x20u;
+ so[0]=save;alias_invalidate((const void *)al,4u);
+ gl2_nano_alias_state=bad?2u|bad:1u;
+ if(bad){b->gpu_alias=0;b->ctx->texture_store_alias=0;b->ctx->texture_store_flush=0;}
+}
+static int fbo_store(gl2_nano *b,uint32_t texture,uint32_t *surface,uint32_t w,uint32_t h,uint32_t stride){
+ const uint32_t *src=surface;
+ if(b->gpu_alias&&!gl2_nano_alias_state)alias_check(b,surface);
+ if(b->gpu_alias){src=(const uint32_t *)((uintptr_t)surface+b->gpu_alias);alias_invalidate(src,stride*h*4u);}
+#ifdef GL2_NANO_FBO_DEBUG
+ /* 0 stores, 1 texture != surface, 2 last caster pixels, 3 max, 4 min, 5 corner pixel, 6 centre pixel */
+ uint32_t sum=0,n=0;{const volatile uint32_t *q=surface;uint32_t bg=q[0];for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x){uint32_t v=q[y*stride+x];sum+=v&0xffffffu;n+=v!=bg;}
+  gl2_nano_fdbg[5]=bg;gl2_nano_fdbg[6]=q[(h/2u)*stride+w/2u];
+  {uint32_t *g=gl2_nano_fgrid+(gl2_nano_fdbg[0]==20u?0u:64u);for(uint32_t i=0;i<64u;++i)g[i]=0;
+   for(uint32_t gy=0;gy<16u;++gy)for(uint32_t gx=0;gx<16u;++gx){uint32_t v=q[(gy*h/16u+h/32u)*stride+gx*w/16u+w/32u]&255u;g[gy*4u+gx/4u]|=v<<(24u-8u*(gx&3u));}
+   }}
+#endif
+ b->ctx->texture_write_force=1;
+ int r=gl2_texture_store_name(b->ctx,texture,0,0,(int)w,(int)h,src,w,h,stride);
+ b->ctx->texture_write_force=0;
+#ifdef GL2_NANO_FBO_DEBUG
+ if(gl2_nano_fdbg[0]++==0)gl2_nano_fdbg[4]=n;
+ if(gl2_nano_fdbg[7]!=sum)++gl2_nano_fdbg[1];
+ gl2_nano_fdbg[2]=n;if(n>gl2_nano_fdbg[3])gl2_nano_fdbg[3]=n;if(n<gl2_nano_fdbg[4])gl2_nano_fdbg[4]=n;
+#endif
+ return r;
+}
 static int submit(const uint32_t *p,uint32_t n,void *user) {
     gl2_nano *b=user;
     if (!owned(b) || !b->frame_open || b->cpu_active || b->fault || !p || !n) {
@@ -117,6 +177,11 @@ int gl2_nano_open(gl2_nano *b,const struct nanoos_api *api,gl2_ctx *c,
 #endif
     if(GL2_NANO_ASYNC_FIFO&&NGAME_API_TABLE(api)>=24&&api->mbx_submit_parts_async&&api->mbx_fifo_sync&&api->mbx_fifo_pump){c->submit_parts_async=submit_parts_async;c->submit_sync=submit_sync;c->submit_pump=submit_pump;}
     c->texture_write_guard=write_guard;c->texture_write_guard_user=b;
+    b->pending_fbo_texture=0;b->gpu_alias=0;c->texture_write_force=0;c->texture_store_alias=0;c->texture_store_flush=0;
+#if defined(__arm__)
+    gl2_nano_alias_state=0;
+    if(NGAME_API_TABLE(api)>=28&&(api->flags&NGAME_API_MMU)){b->gpu_alias=MM_GAME_GPU_ALIAS;c->texture_store_alias=MM_GAME_GPU_ALIAS;c->texture_store_flush=alias_flush;}
+#endif
     c->clear=nano_clear;c->clear_user=b;
     c->read_pixels=nano_read;c->read_pixels_user=b;
     return GL2_NANO_OK;
@@ -156,6 +221,9 @@ static int nano_clear(struct gl2_ctx *c,uint32_t mask,uint32_t argb,float depth,
  /* A scissor rectangle that covers the whole target is equivalent to no scissor. */
  if(scissor_enabled&&gl2_scissor_blocks(c))return -1;
  if(!(mask&(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)))return -1;
+#ifdef GL2_NANO_FBO_DEBUG
+ if(c->fbo_active){gl2_nano_fgrid[128]=argb;gl2_nano_fdbg[6]=(gl2_nano_fdbg[6]&0xffffu)|(b->frame_draws<<16)|(mask<<24);}
+#endif
  if(b->frame_draws==0){submit_clear(b,argb);return 0;}
  return 0;
 }
@@ -202,7 +270,10 @@ static int begin_target(gl2_nano *b,uint32_t *target,uint32_t w,uint32_t h,uint3
 }
 int gl2_nano_begin_target(gl2_nano *b,uint32_t *target,uint32_t w,uint32_t h,uint32_t stride,uint32_t colour){return begin_target(b,target,w,h,stride,colour,0);}
 int gl2_nano_begin_fbo(gl2_nano *b,uint32_t *surface,uint32_t stride,uint32_t clear_argb){
- if(!owned(b)||b->fault||b->cpu_active||b->frame_open||b->pending_valid)return GL2_NANO_STATE;
+ if(!owned(b)||b->fault||b->cpu_active||b->frame_open)return GL2_NANO_STATE;
+ /* A queued window frame may still be rendering: only the render start needs the GPU idle.
+  * A queued FBO owns the surface until it is stored. Without the queue, stay synchronous. */
+ if(b->pending_valid&&(b->pending_fbo_texture||overlaps((uintptr_t)surface,stride*GL2_MAX_FBO_SIZE*4u,(uintptr_t)b->pending_target,b->pending_bytes))){int f=gl2_nano_finish(b,0);if(f)return f;}
  uint32_t texture=0,w=0,h=0;int r=gl2_fbo_target(b->ctx,&texture,&w,&h);if(r)return GL2_NANO_TARGET;
  if(!surface||!w||!h||stride<w)return GL2_NANO_TARGET;
  if(!gpu_range((uintptr_t)surface,stride*h*4u))return GL2_NANO_TARGET;
@@ -215,14 +286,27 @@ int gl2_nano_end_fbo(gl2_nano *b){
  uint32_t texture=b->fbo_texture,w=b->fbo_width,h=b->fbo_height,stride=b->fbo_stride;uint32_t *surface=(uint32_t *)(uintptr_t)b->fbo_surface;
  int r=gl2_nano_end(b);if(r)return r;
  b->fbo_texture=b->fbo_width=b->fbo_height=b->fbo_stride=b->fbo_surface=0;
- if(gl2_texture_store_name(b->ctx,texture,0,0,(int)w,(int)h,surface,w,h,stride))return GL2_NANO_DRIVER;
+ if(fbo_store(b,texture,surface,w,h,stride))return GL2_NANO_DRIVER;
+ return GL2_NANO_OK;
+}
+int gl2_nano_end_fbo_queued(gl2_nano *b,uint32_t **retired){
+ if(retired)*retired=0;
+ if(!owned(b)||b->fault||b->cpu_active||!b->frame_open||!b->fbo_texture)return GL2_NANO_STATE;
+ if(b->software_frame)return GL2_NANO_UNSUPPORTED;
+ uint32_t texture=b->fbo_texture,t0=b->api->usec();
+ int r=gl2_nano_end_queued(b,retired);
+ gl2_nano_prof[6]+=b->api->usec()-t0;++gl2_nano_prof[7];
+ if(r==GL2_NANO_UNSUPPORTED||r==GL2_NANO_TARGET)return GL2_NANO_UNSUPPORTED; /* frame still open: end_fbo */
+ b->fbo_texture=b->fbo_width=b->fbo_height=b->fbo_stride=b->fbo_surface=0;
+ if(r)return r;
+ b->pending_fbo_texture=texture;
  return GL2_NANO_OK;
 }
 int gl2_nano_recover(gl2_nano *b){
  if(!owned(b)||b->cpu_active)return GL2_NANO_STATE;
  if(!b->fault)return GL2_NANO_OK;
  b->api->mbx_halt();
- b->pending_valid=b->frame_open=b->completed=0;b->pending_target=b->retired_target=0;b->software_frame=0;
+ b->pending_valid=b->frame_open=b->completed=0;b->pending_target=b->retired_target=0;b->pending_fbo_texture=0;b->software_frame=0;
  b->fbo_texture=b->fbo_width=b->fbo_height=b->fbo_stride=b->fbo_surface=0;
  b->ctx->soft_target=0;b->ctx->soft_depth=0;
  gl2_set_state_cache(b->ctx,0);gl2_invalidate_state_cache(b->ctx);
@@ -233,7 +317,7 @@ int gl2_nano_begin(gl2_nano *b,uint32_t *target,uint32_t colour){
     return begin_target(b,target,240,432,240,colour,1);
 }
 static int queue_fault(gl2_nano *b){
- b->pending_valid=b->frame_open=b->completed=0;b->pending_target=b->retired_target=0;
+ b->pending_valid=b->frame_open=b->completed=0;b->pending_target=b->retired_target=0;b->pending_fbo_texture=0;
  b->fault=1;++b->errors;gl2_set_state_cache(b->ctx,0);b->api->mbx_halt();return GL2_NANO_DRIVER;
 }
 int gl2_nano_finish(gl2_nano *b,uint32_t **completed){
@@ -241,8 +325,19 @@ int gl2_nano_finish(gl2_nano *b,uint32_t **completed){
  if(!owned(b)||b->cpu_active)return GL2_NANO_STATE;
  if(b->fault)return GL2_NANO_FAULT;
  if(!b->pending_valid)return GL2_NANO_OK;
- if(b->api->mbx_wait_done(50000u*GL2_WAIT_SCALE))return queue_fault(b);
- uint32_t *target=b->pending_target;b->retired_target=target;b->pending_target=0;b->pending_valid=0;++b->frames;
+ {uint32_t t0=b->api->usec();int w=b->api->mbx_wait_done(50000u*GL2_WAIT_SCALE);unsigned k=b->pending_fbo_texture?2u:0u;gl2_nano_prof[k]+=b->api->usec()-t0;++gl2_nano_prof[k+1u];if(w)return queue_fault(b);}
+ uint32_t *target=b->pending_target;b->pending_target=0;b->pending_valid=0;++b->frames;
+ if(b->pending_fbo_texture){
+  /* A queued FBO: tile it into its texture now. It is not a presentable target. A failed
+   * store (texture deleted meanwhile) only leaves a GL error. */
+  uint32_t texture=b->pending_fbo_texture;b->pending_fbo_texture=0;
+  uint32_t t0=b->api->usec();
+  (void)fbo_store(b,texture,target,b->pending_width,b->pending_height,b->pending_stride);
+  gl2_nano_prof[4]+=b->api->usec()-t0;++gl2_nano_prof[5];
+  if(!b->frame_open&&target==b->target)b->completed=1;
+  return GL2_NANO_OK;
+ }
+ b->retired_target=target;
  b->retired_width=b->pending_width;b->retired_height=b->pending_height;b->retired_stride=b->pending_stride;
  if(!b->frame_open&&target==b->target)b->completed=1;
  if(completed)*completed=target;
@@ -338,5 +433,6 @@ void gl2_nano_close(gl2_nano *b) {
     b->ctx->submit_parts=0;b->ctx->submit_parts_async=0;b->ctx->submit_sync=0;b->ctx->submit_pump=0;b->ctx->submit=deny_submit;b->ctx->submit_user=0;
     b->ctx->texture_write_guard=deny;b->ctx->texture_write_guard_user=0;
     b->ctx->texture_sync=0;b->ctx->texture_sync_user=0;
-    b->frame_open=b->completed=b->opened=b->pending_valid=0;b->pending_target=b->retired_target=0;owner=0;
+    b->frame_open=b->completed=b->opened=b->pending_valid=0;b->pending_target=b->retired_target=0;b->pending_fbo_texture=0;owner=0;
+    b->ctx->texture_store_alias=0;b->ctx->texture_store_flush=0;
 }

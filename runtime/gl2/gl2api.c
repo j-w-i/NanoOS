@@ -1520,7 +1520,7 @@ static void fb_unbind(gl2_ctx *c) {
     /* Only copy the software scratch if it was actually the active raster
      * target. A native adapter begins its own GPU target and leaves
      * soft_target clear; that path updates the texture itself. */
-    int software_target = c->soft_target == c->fbo_color;
+    int software_target = c->soft_target == c->fbo_color && (c->soft_draws != c->fbo_soft_mark || c->fbo_soft_cleared);
     if (software_target && t && t->defined && c->texture_cpu && t->size >= 16 && t->size <= GL2_MAX_FBO_SIZE)
         (void)gl2_texture_store_argb(c, t, 0, 0, (int)t->size, (int)t->size, c->fbo_color, t->size, t->size, t->size);
     c->soft_target = c->fbo_saved.target; c->soft_depth = c->fbo_saved.depth;
@@ -1566,6 +1566,7 @@ void glBindFramebuffer(gl2_ctx *c, uint32_t target, uint32_t name) {
     c->soft_target = c->fbo_color; c->soft_depth = c->fbo_depth;
     c->soft_width = (uint32_t)w; c->soft_height = (uint32_t)h; c->soft_stride = (uint32_t)w;
     c->soft_depth_initialized = 0;
+    c->fbo_soft_mark = c->soft_draws; c->fbo_soft_cleared = 0;
     sync_rotate(c);
     if (w > 0) {
         for (int i = 0; i < w * h; ++i) c->fbo_color[i] = 0;
@@ -1699,6 +1700,7 @@ void glClear(gl2_ctx *c,uint32_t mask){
     if(c->soft_target){
         uint32_t w=c->soft_width,h=c->soft_height,stride=c->soft_stride;
         int x0=0,y0=0,x1=(int)w,y1=(int)h;
+        c->fbo_soft_cleared=1;
         if(c->scissor_enabled){
             int gx0=c->scissor_box[0],gy0=c->scissor_box[1],gx1=gx0+c->scissor_box[2],gy1=gy0+c->scissor_box[3];
             if(gx0<0)gx0=0;

@@ -30,6 +30,8 @@ typedef struct {
     uint32_t retired_width,retired_height,retired_stride;
     uint32_t presented;
     uint32_t fbo_texture,fbo_width,fbo_height,fbo_stride,fbo_surface;
+    uint32_t pending_fbo_texture; /* the queued target is an FBO surface: finish stores it into this texture */
+    uintptr_t gpu_alias;          /* cached alias offset of the game GPU arena (kernel API v28), else 0 */
     uint32_t recoveries; /* faults cleared by gl2_nano_recover */
 } gl2_nano;
 /* Clear a fault (GPU completion timeout, display wait timeout, failed begin): halt and
@@ -59,6 +61,17 @@ int gl2_nano_begin_target(gl2_nano *,uint32_t *target,uint32_t width,uint32_t he
  * attachments are not supported yet. */
 int gl2_nano_begin_fbo(gl2_nano *,uint32_t *surface,uint32_t stride,uint32_t clear_argb);
 int gl2_nano_end_fbo(gl2_nano *);
+/* Queued FBO end (needs the v22 queue, else GL2_NANO_UNSUPPORTED and nothing is done):
+ * collects the previous target into retired, starts the FBO render and returns. The
+ * surface is tiled into the texture when the render is collected: at the next finish,
+ * end, queued end, begin_fbo or read. Draws issued after this call may sample the
+ * texture; do not write or delete it before the store. */
+int gl2_nano_end_fbo_queued(gl2_nano *,uint32_t **retired);
+/* Profile (us totals, counts): 0,1 wait for a queued window frame; 2,3 wait for a queued FBO;
+ * 4,5 FBO store; 6,7 FBO end (wait + scene end + render start); 8,9 present at FBO end;
+ * 10,11 FBO begin. */
+extern uint32_t gl2_nano_prof[12];
+extern uint32_t gl2_nano_alias_state;
 /* Optional caller-owned cached colour workspace. Float frames render here and
  * copy completed rows to the uncached target at end. Capacity is checked per
  * target; keep it alive while configured. Zero pointer disables staging. */

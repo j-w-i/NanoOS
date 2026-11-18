@@ -138,7 +138,7 @@ static uint32_t slot_offset(gl2_ctx *c, const gl2_texture_obj *t) { (void)c; ret
  * texture unless the arena is recycled, which tex_reserve skips while refs are live.
  * So a game can load a level's textures in the middle of a frame (SHMUP does). */
 static int tex_write_blocked(gl2_ctx *c, const gl2_texture_obj *t) {
-    if (!c->texture_write_guard) return 0;
+    if (!c->texture_write_guard || c->texture_write_force) return 0;
     int g = c->texture_write_guard(c->texture_write_guard_user);
     if (!g) {
         if (c->texture_gpu_refs) { for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) c->textures[i].gpu_ref = 0; c->texture_gpu_refs = 0; }
@@ -613,7 +613,8 @@ int gl2_texture_store_argb(gl2_ctx *c, gl2_texture_obj *t, int dx, int dy, int w
     if (src > UINTPTR_MAX - bytes || (src < dst + output && dst < src + bytes)) { terr(c, GL_INVALID_OPERATION); return -1; }
     if (tex_write_blocked(c,t)) { terr(c, GL_INVALID_OPERATION); return -1; }
     gl2_invalidate_state_cache(c);
-    texture_word *out = (texture_word *)dst; uint32_t alpha = t->format == GL_RGB ? 0xff000000u : 0;
+    const uintptr_t alias = c->texture_store_flush ? c->texture_store_alias : 0;
+    texture_word *out = (texture_word *)(dst + alias); uint32_t alpha = t->format == GL_RGB ? 0xff000000u : 0;
     if (!((dx | dy | w | h) & 1)) {
         uint32_t first = spread((uint32_t)dx) << 1;
         for (uint32_t y = 0; y < (uint32_t)h; y += 2) {
@@ -631,5 +632,9 @@ int gl2_texture_store_argb(gl2_ctx *c, gl2_texture_obj *t, int dx, int dy, int w
         uint32_t mx = spread((uint32_t)dx) << 1, my = spread((uint32_t)dy + y);
         for (uint32_t x = 0; x < (uint32_t)w; ++x) { out[mx | my] = row[x] | alpha; mx = (mx - 0xaaaau) & 0xaaaau; }
     }
+    if (alias) c->texture_store_flush(out, output);
+#ifdef GL2_NANO_FBO_DEBUG
+    { extern uint32_t gl2_nano_fdbg[8]; uint32_t s = 0; const volatile uint32_t *q = (const volatile uint32_t *)dst; for (uint32_t i = 0; i < output / 4; ++i) s += q[i] & 0xffffffu; gl2_nano_fdbg[7] = s; }
+#endif
     return sync_image(c, t);
 }
