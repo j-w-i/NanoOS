@@ -65,7 +65,7 @@
  * "ib" = input.c's boot I2C1 log (input_i2c_recover). */
 #define POLL_US 8000u
 #define BYTE_US 500u
-#define FETCH_MAX 64u
+#define FETCH_MAX 112u          /* 5 contacts: 2 + 0x12 + 5 * 16 payload bytes + header */
 #define TRIES 5u               /* RetailOS: 5, 1 ms apart */
 #define BLIND_L 0x36u          /* L of the report in snap6's RX buffer */
 #define BLIND_MAX 3u            /* per touch_start() (round 12) */
@@ -80,6 +80,8 @@
 #define ATN (1u << 30)                              /* its IRQ group 1 bit */
 #define RPT_TOUCH_ID 84u
 struct touch_state touch;
+struct touch_contact touch_contacts[TOUCH_MAX];
+unsigned touch_max_seen;
 uint32_t touch_extra[TOUCH_EXTRA];
 static uint32_t last, ctrl0;
 static unsigned idle, force, blind_left;
@@ -141,6 +143,28 @@ static int read_once(unsigned blind) {
         rx[7] + 8u > l - 2)
         goto err;
     const uint8_t *rec = rx + 5 + rx[7];   /* payload[2] = record offset */
+    {   /* every record of the report: payload[0x10] = count, [0x11] = stride (touch_contacts) */
+        unsigned n = rx[5 + 0x10], stride = rx[5 + 0x11];
+        if (n == 0 || n > TOUCH_MAX || stride < 8 || rx[7] + n * stride > l - 2) { n = 1; stride = 8; }
+        if (n > touch_max_seen) touch_max_seen = n;
+        for (unsigned i = 0; i < n; ++i) {
+            const uint8_t *r = rec + i * stride;
+            int id = r[0], st = r[1], cx, cy, k = -1, f = -1;
+            cx = clamp(((int16_t)(r[4] | r[5] << 8) + 75) * 239 / 2845, LCD_PANEL_WIDTH - 1);
+            cy = clamp(431 - ((int16_t)(r[6] | r[7] << 8) + 75) * 431 / 5250, LCD_PANEL_HEIGHT - 1);
+            for (unsigned j = 0; j < TOUCH_MAX; ++j) {
+                if (touch_contacts[j].state && touch_contacts[j].id == id) k = (int)j;
+                else if (!touch_contacts[j].state && f < 0) f = (int)j;
+            }
+            if (st >= TOUCH_UP) { if (k >= 0) touch_contacts[k].state = 0; continue; }
+            if (k < 0) k = f;
+            if (k < 0) continue;
+            touch_contacts[k].id = id;
+            touch_contacts[k].x = cy;
+            touch_contacts[k].y = LCD_PANEL_WIDTH - 1 - cx;
+            touch_contacts[k].state = st;
+        }
+    }
     int px = clamp(((int16_t)(rec[4] | rec[5] << 8) + 75) * 239 / 2845, LCD_PANEL_WIDTH - 1);
     int py = clamp(431 - ((int16_t)(rec[6] | rec[7] << 8) + 75) * 431 / 5250,
                    LCD_PANEL_HEIGHT - 1);
@@ -265,6 +289,7 @@ void touch_start(void) {
     touch.errors = r < 0;   /* a failed first query shows as ERR */
     touch.reports = 0;
     touch.state = 0;
+    for (unsigned j = 0; j < TOUCH_MAX; ++j) touch_contacts[j].state = 0;
     last = USEC;
 }
 void touch_init(void) {
@@ -320,4 +345,11 @@ int touch_lines(int x, int y, int dy) {
     fmt_str("/"); sat(cnt[C_FBAD], 999);
     fmt_line(x, y + dy, WHITE);
     return y + 2 * dy;
+}
+
+int touch_get_contacts(struct touch_contact *out, unsigned max) {
+    unsigned n = 0;
+    for (unsigned j = 0; j < TOUCH_MAX && n < max; ++j)
+        if (touch_contacts[j].state) out[n++] = touch_contacts[j];
+    return (int)n;
 }

@@ -89,6 +89,79 @@ void nano_app_poll_input(nano_input_t *out) {
     }
 }
 
+/* kernel logical landscape (x = panel y, y = 239 - panel x) -> display coordinates of the
+ * current orientation; the same mapping nano_app_poll_input applies */
+static void to_display(int kx, int ky, int *ox, int *oy) {
+    int dx = 239 - ky;
+    int dy = kx;
+    if (dx < 0) dx = 0;
+    if (dx >= (int)NANO_SCREEN_W) dx = (int)NANO_SCREEN_W - 1;
+    if (dy < 0) dy = 0;
+    if (dy >= (int)NANO_SCREEN_H) dy = (int)NANO_SCREEN_H - 1;
+    if (g_orient == NANO_ORIENT_LANDSCAPE) {
+        int lx = dy, ly = (int)NANO_SCREEN_W - 1 - dx; dx = lx; dy = ly;
+    } else if (g_orient == NANO_ORIENT_LANDSCAPE_LEFT) {
+        int lx = (int)NANO_SCREEN_H - 1 - dy, ly = dx; dx = lx; dy = ly;
+    }
+    *ox = dx;
+    *oy = dy;
+}
+
+static struct { int active, id, x, y; } g_slot[NANO_TOUCH_MAX];
+
+int nano_app_poll_touches(nano_touch_t out[NANO_TOUCH_MAX]) {
+    struct ngame_touch_contact c[NANO_TOUCH_MAX];
+    int n = 0, i, j, downs = 0;
+    for (i = 0; i < NANO_TOUCH_MAX; i++) {
+        out[i].down = out[i].pressed = out[i].released = out[i].moved = 0;
+        out[i].x = out[i].prev_x = g_slot[i].x;
+        out[i].y = out[i].prev_y = g_slot[i].y;
+        out[i].id = g_slot[i].id;
+    }
+    if (!g_api || !g_api->touch_poll || !g_api->touch) return 0;
+    for (i = 0; i < 4; i++) if (!g_api->touch_poll()) break;   /* drain queued reports */
+    if (NGAME_API_TABLE(g_api) >= 27 && g_api->touch_contacts) {
+        n = g_api->touch_contacts(c, NANO_TOUCH_MAX);
+    } else if (g_api->touch->state == 3u || g_api->touch->state == 4u) {
+        c[0].id = 0; c[0].x = g_api->touch->x; c[0].y = g_api->touch->y; c[0].state = g_api->touch->state;
+        n = 1;
+    }
+    int seen[NANO_TOUCH_MAX] = {0, 0, 0, 0, 0};
+    int ccur[NANO_TOUCH_MAX][2];
+    for (j = 0; j < n; j++) to_display(c[j].x, c[j].y, &ccur[j][0], &ccur[j][1]);
+    for (i = 0; i < NANO_TOUCH_MAX; i++) {        /* fingers that stayed */
+        if (!g_slot[i].active) continue;
+        for (j = 0; j < n; j++) if (!seen[j] && c[j].id == g_slot[i].id) break;
+        if (j == n) {                              /* gone: released this call */
+            out[i].released = 1;
+            g_slot[i].active = 0;
+            continue;
+        }
+        seen[j] = 1;
+        out[i].down = 1;
+        out[i].x = ccur[j][0]; out[i].y = ccur[j][1];
+        out[i].moved = out[i].x != g_slot[i].x || out[i].y != g_slot[i].y;
+        g_slot[i].x = out[i].x; g_slot[i].y = out[i].y;
+    }
+    for (j = 0; j < n; j++) {                      /* new fingers */
+        if (seen[j]) continue;
+        for (i = 0; i < NANO_TOUCH_MAX; i++) if (!g_slot[i].active && !out[i].released) break;
+        if (i == NANO_TOUCH_MAX) continue;
+        g_slot[i].active = 1; g_slot[i].id = c[j].id;
+        g_slot[i].x = out[i].x = out[i].prev_x = ccur[j][0];
+        g_slot[i].y = out[i].y = out[i].prev_y = ccur[j][1];
+        out[i].id = c[j].id;
+        out[i].down = out[i].pressed = 1;
+    }
+    for (i = 0; i < NANO_TOUCH_MAX; i++) downs += out[i].down;
+    return downs;
+}
+
+int nano_app_touch_max_seen(void) {
+    if (g_api && NGAME_API_TABLE(g_api) >= 27 && g_api->touch_max_seen) return (int)g_api->touch_max_seen();
+    return 0;
+}
+
 int nano_app_home_pressed(void) {
     if (!g_api) return 0;
     if (g_api->input_poll && (g_api->input_poll() & NGAME_HOME)) return 1;

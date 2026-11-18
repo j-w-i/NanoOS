@@ -7,6 +7,16 @@
 /* last contact, in logical landscape coordinates (lcd.h), and counts */
 struct touch_state { int x, y; unsigned state, reports, errors, diag, bad; };  /* diag/bad: touch.c */
 extern struct touch_state touch;
+/* Every contact the panel reports (multitouch controller: payload[0x10] = count, [0x11] =
+ * stride, one record per finger). Slot order is arrival order; state TOUCH_DOWN / TOUCH_MOVE
+ * for a finger that is down, 0 = free. Coordinates as touch.x / touch.y (logical landscape).
+ * `touch` above stays the first record of the last report, as before. */
+#define TOUCH_MAX 5
+struct touch_contact { int id, x, y; unsigned state; };   /* game ABI: struct ngame_touch_contact */
+extern struct touch_contact touch_contacts[TOUCH_MAX];
+extern unsigned touch_max_seen;   /* most contacts one report has carried */
+/* copy the fingers that are down into out[0..max-1]; returns how many */
+int touch_get_contacts(struct touch_contact *out, unsigned max);
 void touch_init(void);   /* touch_start(), then (TOUCH_DIAG) the capture window and R84 */
 void touch_start(void);  /* gate on, drop reports queued before the handoff (launcher) */
 int touch_poll(void);    /* rate-limited; 1 when a new report was read */

@@ -52,6 +52,24 @@ int nano_app_screen_h(void);
  * 432x240 landscape) and physical buttons. */
 void nano_app_poll_input(nano_input_t *out);
 
+/* Multitouch. The panel can report several fingers at once (kernel API v27); on an older
+ * kernel only slot 0 is ever used. nano_app_poll_touches() fills out[0..NANO_TOUCH_MAX-1]:
+ * a finger keeps its slot from press to release, so slot index is a stable finger handle.
+ * Per slot: down (finger on the screen now), pressed / released (edge this call; a released
+ * slot keeps its last x/y for that one call), moved, display coordinates for the current
+ * orientation (same frame as nano_app_poll_input), prev_x/prev_y from the previous call.
+ * Returns the number of fingers down. Call once per frame; it reads the panel itself
+ * (do not rely on nano_app_poll_input having done so). */
+#define NANO_TOUCH_MAX 5
+typedef struct {
+    int down, pressed, released, moved;
+    int x, y, prev_x, prev_y;
+    int id;            /* panel contact id (diagnostic) */
+} nano_touch_t;
+int nano_app_poll_touches(nano_touch_t out[NANO_TOUCH_MAX]);
+/* Most fingers any single panel report has carried since boot (0 if the kernel cannot say). */
+int nano_app_touch_max_seen(void);
+
 /* Return 1 if NGAME_HOME button is pressed. */
 int nano_app_home_pressed(void);
 

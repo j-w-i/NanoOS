@@ -261,6 +261,8 @@ static int g_nand_read_ppn_direct(unsigned ce, uint32_t row, unsigned count, voi
 static const void *volume_handoff;
 static const void *g_nand_volume_handoff(void) { return volume_handoff; }
 
+static unsigned game_touch_max_seen(void) { return touch_max_seen; }
+
 static const struct nanoos_api api = {
     NGAME_ABI, NGAME_API_VERSION << 16 | (NANOOS_MMU ? NGAME_API_MMU : 0),
     lcd_back, lcd_present, lcd_service, lcd_ready, lcd_flush, lcd_clear,
@@ -294,6 +296,7 @@ static const struct nanoos_api api = {
     mbx_submit_parts_async, mbx_fifo_sync, mbx_fifo_async_info, mbx_fifo_pump,
     g_nand_read_ppn_direct, g_nand_volume_handoff,
     mbx_set_scene_reg,
+    (int (*)(struct ngame_touch_contact *, unsigned))touch_get_contacts, game_touch_max_seen,
 };
 
 static int outside(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi) {

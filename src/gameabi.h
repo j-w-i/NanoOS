@@ -136,7 +136,7 @@
  * their order; a v13 game checks NGAME_API_TABLE(api)>=13. */
 /* v15 adds nand_read_words variant 8 (stock 3072-byte boot reader).
  * No table fields move; existing variants keep their numeric values. */
-#define NGAME_API_VERSION 26u
+#define NGAME_API_VERSION 27u
 #define NGAME_API_TABLE(api) (((api)->flags >> 16) & 0xffu)
 /* The first 32 bytes of game.bin (game/mkgame.py fills size and crc). */
 struct ngame_hdr {
@@ -181,6 +181,8 @@ struct nboot_game {
 #define NGAME_API_MMU 1u   /* flags: MMU, D-cache on (memmap.h attributes) */
 /* flags bits 16..23: the table version (see NGAME_API_TABLE) */
 struct ngame_touch { int x, y; unsigned state; };   /* touch.h prefix */
+/* v27 multitouch: one finger that is down (touch.h struct touch_contact); state 3 down, 4 moving */
+struct ngame_touch_contact { int id, x, y; unsigned state; };
 /* v4: NAND geometry as probed (nand.h struct nand_info prefix, same order) */
 /* ...plus the probe's recovery trace, so a failed probe is diagnosable.
  * rcv: 0 = controller latched at once (no recovery needed), 1 = after
@@ -510,5 +512,12 @@ struct nanoos_api {
     /* v26: write an extra 3D-setup register (unused gaps of 0x600..0x6fc only) with every
      * scene's ISP list, e.g. the vertex-fog colour. slot 0..3; off 0 clears. 0 ok, -1 refused. */
     int (*mbx_set_scene_reg)(unsigned slot, uint32_t off, uint32_t val);
+    /* v27: every finger that is down after touch_poll(), as logical landscape coordinates like
+     * *touch (ids are the panel's, stable while a finger stays down): copies up to max into
+     * out and returns the count (0 = none down). *touch keeps reporting the first record of the
+     * last report. A v27 game checks NGAME_API_TABLE(api)>=27. */
+    int (*touch_contacts)(struct ngame_touch_contact *out, unsigned max);
+    /* v27: the most contacts any one panel report has carried since boot (diagnostic) */
+    unsigned (*touch_max_seen)(void);
 };
 #endif
