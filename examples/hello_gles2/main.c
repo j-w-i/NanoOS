@@ -2,6 +2,9 @@
 #include "nano_app.h"
 #include "EGL/egl.h"
 #include "GLES2/gl2.h"
+#ifdef HELLO_VIEWPORT_CLIP
+#define HELLO_BENCH 1
+#endif
 #ifdef HELLO_BENCH
 #include "report.h"
 static char report[1024];
@@ -44,6 +47,62 @@ int nano_example_main(const struct nanoos_api *api) {
     if (sfc == EGL_NO_SURFACE || ctx == EGL_NO_CONTEXT) return 4;
     if (!eglMakeCurrent(dpy, sfc, sfc, ctx)) return 5;
 
+
+#ifdef HELLO_VIEWPORT_CLIP
+    {
+        /* Viewport / scissor clipping check (GL clips draws to the viewport and scissor; the SDK
+         * uses the VGP clip planes 5.y / 5.z). A quad larger than the viewport is drawn; three
+         * pixels per case are read back: R = drawn, B = clear colour. */
+        static const char *pvs = "attribute vec4 aPos;\nattribute vec4 aCol;\nvarying vec4 vColor;\nvoid main(){ vColor = aCol; gl_Position = aPos; }\n";
+        static const char *pfs = "precision mediump float;\nvarying vec4 vColor;\nvoid main(){ gl_FragColor = vColor; }\n";
+        GLuint pv = compile_shader(GL_VERTEX_SHADER, pvs), pf = compile_shader(GL_FRAGMENT_SHADER, pfs);
+        GLuint pp = glCreateProgram(); glAttachShader(pp, pv); glAttachShader(pp, pf); glLinkProgram(pp);
+        GLint plinked = 0; glGetProgramiv(pp, GL_LINK_STATUS, &plinked);
+        static const float q[24] = { -1.6f,-1.6f,0,1, 1.6f,-1.6f,0,1, -1.6f,1.6f,0,1,  1.6f,-1.6f,0,1, 1.6f,1.6f,0,1, -1.6f,1.6f,0,1 };
+        static const float qc[24] = { 1,0,0,1, 1,0,0,1, 1,0,0,1, 1,0,0,1, 1,0,0,1, 1,0,0,1 };
+        glUseProgram(pp); GLint lp = glGetAttribLocation(pp, "aPos"), lc = glGetAttribLocation(pp, "aCol");
+        for (unsigned a = 0; a < 5; ++a) glDisableVertexAttribArray(a);
+        glVertexAttribPointer((GLuint)lc, 4, GL_FLOAT, GL_FALSE, 0, qc); glEnableVertexAttribArray((GLuint)lc);
+        glVertexAttribPointer((GLuint)lp, 4, GL_FLOAT, GL_FALSE, 0, q); glEnableVertexAttribArray((GLuint)lp);
+        /* case: viewport x, y, w, h; scissor (w = 0: off); three sample points; expected */
+        static const struct { int vp[4], sc[4], pt[3][2]; const char *want; } cs[] = {
+            { {0,150,240,132}, {0,0,0,0},     {{120,300},{120,216},{120,130}}, "BRB" },
+            { {60,0,120,432},  {0,0,0,0},     {{30,216},{120,216},{210,216}},  "BRB" },
+            { {0,0,240,432},   {0,0,0,0},     {{120,420},{120,216},{120,10}},  "RRR" },
+            { {0,0,240,432},   {0,150,240,132}, {{120,300},{120,216},{120,130}}, "BRB" },
+            { {0,150,240,132}, {0,0,0,0},     {{120,283},{120,281},{120,150}}, "BRR" },
+        };
+        rtext("NANOOS GL2 GAME build " __DATE__ " " __TIME__ "\nVCLIP linked "); rword((uint32_t)plinked); rtext("\n");
+        unsigned ok = 0, n = sizeof cs / sizeof cs[0];
+        for (unsigned i = 0; i < n; ++i) {
+            char got[4] = {0,0,0,0}; uint32_t e = 0;
+            for (unsigned f = 0; f < 3; ++f) {
+                glDisable(GL_SCISSOR_TEST); glViewport(0, 0, 240, 432); glClearColor(0.0f, 0.0f, 1.0f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+                glViewport(cs[i].vp[0], cs[i].vp[1], cs[i].vp[2], cs[i].vp[3]);
+                if (cs[i].sc[2]) { glScissor(cs[i].sc[0], cs[i].sc[1], cs[i].sc[2], cs[i].sc[3]); glEnable(GL_SCISSOR_TEST); }
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                if (f == 2u) {
+                    for (unsigned k = 0; k < 3; ++k) { uint8_t b[4] = {0,0,0,0}; glReadPixels(cs[i].pt[k][0], cs[i].pt[k][1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, b);
+                        uint32_t px = (uint32_t)b[0] << 16 | (uint32_t)b[1] << 8 | b[2]; got[k] = px == 0xff0000u ? 'R' : px == 0x0000ffu ? 'B' : '?'; }
+                    e = (uint32_t)glGetError();
+                }
+                eglSwapBuffers(dpy, sfc);
+            }
+            glDisable(GL_SCISSOR_TEST);
+            int pass = got[0] == cs[i].want[0] && got[1] == cs[i].want[1] && got[2] == cs[i].want[2] && !e;
+            ok += (unsigned)pass;
+            rtext("V "); rtext(got); rtext(" want "); rtext(cs[i].want); rtext(pass ? " ok\n" : " BAD\n");
+        }
+        uint32_t fr = 0, sw = 0, fault = 0; nano_app_gfx_stats(&fr, &sw, &fault);
+        rtext("VCLIP frames/sw/fault "); rword(fr); rword(sw); rword(fault); rtext("\n");
+        rtext(ok == n && fault == 0u ? "HELLO PASS\n" : "HELLO FAIL\n");
+        report[rused] = 0;
+        rpt_mirror_write(report, rused, rpt_sum(report, rused));
+        nano_app_dcache_clean();
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        return 0;
+    }
+#endif
     static const char *vs_src =
         "attribute vec4 aPos;\n"
         "attribute vec4 aCol;\n"

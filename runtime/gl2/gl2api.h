@@ -244,6 +244,7 @@ typedef struct {
     uint32_t min_filter, mag_filter, wrap_s, wrap_t;
     uint32_t level_mask, mip_complete;
     uint32_t arena_off, arena_bytes; /* storage in the texture arena: level 0 plus its whole mip chain */
+    uint32_t gpu_ref; /* sampled by a GPU draw since the GPU was last seen idle (gl2tex.c tex_write_blocked) */
 } gl2_texture_obj;
 typedef struct { uint32_t name,reserved,used,width,height,format,defined; } gl2_renderbuffer;
 typedef struct { uint32_t name,reserved,used,color_texture,depth_renderbuffer,stencil_renderbuffer; } gl2_framebuffer;
@@ -263,12 +264,13 @@ typedef struct gl2_ctx {
 #endif
     uint32_t array_buffer, element_buffer, next_buffer;
     uint32_t cull_enabled, cull_face, front_face;
-    gl2_state st; gl2_tex tex[2], raw_unit_tex[2]; uint32_t vp_w, vp_h;
+    gl2_state st; gl2_tex tex[2], raw_unit_tex[2]; uint32_t vp_w, vp_h; int32_t vp_x, vp_y;
     gl2_texture_obj textures[GL2_MAX_TEXTURES];
     uint32_t texture_binding[2], texture_managed[2], active_texture, next_texture, unpack_alignment;
     uint8_t *texture_cpu; uint32_t texture_va, texture_arena_used;
     gl2_texture_sync_fn texture_sync; void *texture_sync_user;
-    int (*texture_write_guard)(void *user); void *texture_write_guard_user; /* optional BEFORE-write veto */
+    int (*texture_write_guard)(void *user); void *texture_write_guard_user; /* optional BEFORE-write veto: 0 idle, >0 GPU busy (only textures it may read are refused), <0 refuse all */
+    uint32_t texture_gpu_refs; /* some texture has gpu_ref set: the arena must not be recycled */
     uint32_t soft_draws,diagnostic_gpu,soft_depth_initialized;
     uint32_t *soft_target;float *soft_depth;uint32_t soft_width,soft_height,soft_stride;
     gl2_submit_fn submit; void *submit_user;
@@ -297,7 +299,9 @@ void gl2_invalidate_state_cache(gl2_ctx *c);
 /* A scissor rectangle that covers the whole render target is a no-op. */
 #ifdef GL2_SCISSOR_IGNORE_DRAWS
 /* Opt-in: the application's scissor is an optimisation hint (it only trims
- * work); draws are not clipped to it. glClear still honours the rectangle. */
+ * work); draws are not clipped to it. glClear still honours the rectangle.
+ * Without it, draws are clipped to viewport and scissor by the VGP clip planes
+ * (gl2api.c sync_prog_target, up to two edges); more edges take the CPU path. */
 #define GL2_DRAW_SCISSOR_BLOCKS(c) 0
 #else
 #define GL2_DRAW_SCISSOR_BLOCKS(c) gl2_scissor_blocks(c)

@@ -59,7 +59,7 @@ static V mkv(int f, int i, int w) { V v; v.f = f; v.i = i; v.w = w; v.hascv = 0;
 static V cnst(const float *vals, int w) {
     float key[4] = { 0, 0, 0, 0 }; for (int k = 0; k < w; ++k) key[k] = vals[k];
     int idx = -1;
-    for (uint32_t j = 0; j < R->nlit; ++j) { int same = 1; for (int k = 0; k < 4; ++k) if (R->lit_val[j][k] != key[k]) same = 0; if (same) { idx = R->lit_idx[j]; break; } }
+    for (uint32_t j = 0; j < R->nlit; ++j) { if (R->clip_lit >= 0 && (int32_t)j - R->clip_lit >= 0 && (int32_t)j - R->clip_lit < 2) continue; int same = 1; for (int k = 0; k < 4; ++k) if (R->lit_val[j][k] != key[k]) same = 0; if (same) { idx = R->lit_idx[j]; break; } }
     if (idx < 0) {
         if (R->nlit >= VSC_MAX_LIT || nc >= 112) { fail("out of constants"); idx = 0; }
         else { idx = nc++; R->lit_idx[R->nlit] = (uint16_t)idx; for (int k = 0; k < 4; ++k) R->lit_val[R->nlit][k] = key[k]; ++R->nlit; }
@@ -440,6 +440,23 @@ static int parse_block(Block *b){
     }
     eat("}");return 1;
 }
+/* Clip distances (output 5). 5.x = w + z: near plane. 5.y and 5.z = position . two plane rows
+ * the runtime rewrites per draw (gl2api.c clip_sync): 5.y is the far plane w - z by default; 5.z
+ * is the user plane, active when the draw's control word has bit 20. Hardware probe (run
+ * clipprobe-1..3): the TA clips on 5.y always and on 5.z with bit 20; 5.w is never used. So a
+ * viewport / scissor edge inside the target costs no CPU work: one edge on 5.z, a second on 5.y. */
+static void emit_clip(void){
+    V d[2]={position_value,position_value};
+    for(int k=0;k<4;++k){d[0].sw[k]=position_value.sw[3];d[1].sw[k]=position_value.sw[2];}
+    emit(ADD,5,1,d,2,0,0);
+    if(R->clip_lit<0){
+        if(R->nlit+2>VSC_MAX_LIT||nc+2>112){fail("out of constants");return;}
+        static const float rows[2][4]={{0,0,-1,1},{0,0,0,1}};
+        R->clip_lit=(int32_t)R->nlit;
+        for(int r=0;r<2;++r){R->lit_idx[R->nlit]=(uint16_t)nc++;for(int k=0;k<4;++k)R->lit_val[R->nlit][k]=rows[r][k];++R->nlit;}
+    }
+    for(int r=0;r<2;++r){V s[2]={position_value,mkv(1,R->lit_idx[R->clip_lit+r],4)};emit(DP4,5,r?4:2,s,2,0,0);}
+}
 static int emit_position_mask(const int *mask,int nm,V v){
     if(nm<=0){fail("empty position mask");return 0;}
     if(v.w==1&&nm>1)v=bc(v,nm);
@@ -454,9 +471,7 @@ static int emit_position_mask(const int *mask,int nm,V v){
         position_value=mkv(2,t,4);
     }else position_value=s;
     emit(MOV,0,15,&position_value,1,0,0);
-    V d[2]={position_value,position_value};
-    for(int k=0;k<4;++k){d[0].sw[k]=position_value.sw[3];d[1].sw[k]=position_value.sw[2];}
-    emit(ADD,5,1,d,2,0,0);emit(ADD,5,2,d,2,0,1);written_pos=1;return 1;
+    emit_clip();written_pos=1;return 1;
 }
 static int emit_varying(const char*n,const int*mask,int nm,V v){
     int oi=out_find(n);if(oi<0){fail("bad varying");return 0;}int slot=outs[oi].slot;
@@ -713,13 +728,7 @@ static void stmt(void) {
             position_value = mkv(2, t, 4);
         } else position_value = s;
         emit(MOV, 0, 15, &position_value, 1, 0, 0);
-        V distances[2] = {position_value, position_value};
-        for (int k = 0; k < 4; ++k) {
-            distances[0].sw[k] = position_value.sw[3];
-            distances[1].sw[k] = position_value.sw[2];
-        }
-        emit(ADD, 5, 1, distances, 2, 0, 0); /* w + z */
-        emit(ADD, 5, 2, distances, 2, 0, 1); /* w - z */
+        emit_clip();
         written_pos = 1;
     } else {
         int t = newtmp();
@@ -1165,7 +1174,7 @@ int gl2_preprocess(const char *src, char *out, uint32_t cap) {
 
 int gl2vsc_compile(const char *src, vsc_result *out) {
     static char pp_buf[16384];
-    R = out; R->ncode=R->nconst=R->ntemps=0; R->err[0] = 0; R->nlit = R->nuni = R->nattr = R->nvary = 0; err_flag = 0; nc = 0; nreg = 0; ncode = 0; nvars = 0; nouts = 0; tp = 0; written_pos = 0; nufn = 0;
+    R = out; R->ncode=R->nconst=R->ntemps=0; R->err[0] = 0; R->nlit = R->nuni = R->nattr = R->nvary = 0; err_flag = 0; nc = 0; nreg = 0; ncode = 0; nvars = 0; nouts = 0; tp = 0; written_pos = 0; nufn = 0; R->clip_lit = -1;
     gl2_preprocess(src, pp_buf, sizeof(pp_buf));
     tokenize(pp_buf); if (err_flag) return -1;
     while (tp < ntk && !err_flag) {

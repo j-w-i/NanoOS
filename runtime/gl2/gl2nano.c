@@ -46,11 +46,15 @@ static int nano_read(struct gl2_ctx *c,int x,int y,int w,int h,uint32_t format,u
 }
 static int write_guard(void *user) {
     gl2_nano *b=user;
-    return !owned(b) || b->fault || b->cpu_active || b->pending_valid || (b->frame_open && b->frame_draws);
+    /* <0: no texture write is safe; >0: queued GPU work may sample textures (gl2tex.c
+     * still lets textures no queued draw uses be written); 0: idle. */
+    if (!owned(b) || b->fault || b->cpu_active) return -1;
+    return b->pending_valid || (b->frame_open && b->frame_draws);
 }
 static int texture_sync(void *user,void *cpu,uint32_t va,uint32_t bytes) {
     gl2_nano *b=user;
-    if (!owned(b) || b->fault || b->cpu_active || b->pending_valid || !gpu_range((uintptr_t)cpu,bytes) ||
+    /* Called after the write; tex_write_blocked decided it was safe while work is queued. */
+    if (!owned(b) || b->fault || b->cpu_active || !gpu_range((uintptr_t)cpu,bytes) ||
         va!=(uint32_t)((uintptr_t)cpu-MM_DRAM)) return -1;
     /* Native game-GPU sections10..31 are Strongly-ordered in NanoOS mmu.c.
      * CPU writes here cannot leave dirty cache lines. Complete writes before

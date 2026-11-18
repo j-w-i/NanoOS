@@ -193,6 +193,9 @@ static int cache_valid(const gl2_fs_entry *e) {
     }
     return 1;
 }
+#ifndef GL2_SOFTWARE_FS
+#define GL2_SOFTWARE_FS 0   /* 1: accept fragment shaders with no GPU plan on GPU contexts too */
+#endif
 void glCompileShader(gl2_ctx *c, uint32_t sh) {
     gl2_shader *s = shp(c, sh); if (!s) return; s->ok = 0; s->log[0] = 0; s->vs = 0; s->fs = 0;
     if (!s->src) { scpy(s->log, "shader has no source", 64); return; }
@@ -210,7 +213,15 @@ void glCompileShader(gl2_ctx *c, uint32_t sh) {
             if (!cache_valid(&c->cache[i])) { scpy(s->log, "invalid cached fragment metadata", 64); return; }
             s->fs = &c->cache[i]; s->ok = 1; return;
         }
-        if(!compile_fragment(src,&c->sh_fs[sh],s->log)){s->fs=&c->sh_fs[sh].e;s->ok=1;}
+        if(!compile_fragment(src,&c->sh_fs[sh],s->log)){
+            /* No TSP combiner plan: the MBX can't run it, and GPU frames would drop every
+             * draw (GL_INVALID_OPERATION) after a successful link. Report it at compile
+             * time, as a driver does for a shader its hardware can't run, so the app takes
+             * its own fallback (e.g. a simpler shader). Contexts drawing to a software
+             * target (host tools, software frames) still accept it; GL2_SOFTWARE_FS=1
+             * always does. */
+            if(!GL2_SOFTWARE_FS&&!c->soft_target&&!c->sh_fs[sh].e.nplan){scpy(s->log,"fragment shader needs per-pixel maths the GPU can't run",64);return;}
+            s->fs=&c->sh_fs[sh].e;s->ok=1;}
     }
 }
 static uint32_t text_length(const char *s){uint32_t n=0;while(s[n])++n;return n;}
@@ -323,15 +334,69 @@ static uint32_t prune_native(gl2_prog_obj *P,uint32_t ncode){
     }
     return n;
 }
+/* Target size in GL window coordinates: an FBO's colour image, else the window surface
+ * (432x240 when shown landscape). */
+static void target_size(const gl2_ctx *c,uint32_t *w,uint32_t *h){
+    if(c->fbo_active){*w=c->soft_width;*h=c->soft_height;return;}
+    *w=c->landscape?432u:240u;*h=c->landscape?240u:432u;
+}
+#ifdef GL2_SCISSOR_IGNORE_DRAWS
+#define GL2_SCISSOR_IGNORES_DRAWS 1
+#else
+#define GL2_SCISSOR_IGNORES_DRAWS 0
+#endif
+/* Pixels a draw may touch: the viewport, cut by the scissor box when enabled (GL window coords). */
+static void draw_rect(const gl2_ctx *c,int32_t r[4]){
+    r[0]=c->vp_x;r[1]=c->vp_y;r[2]=c->vp_x+(int32_t)c->vp_w;r[3]=c->vp_y+(int32_t)c->vp_h;
+    /* GL2_SCISSOR_IGNORE_DRAWS: the scissor only trims work for this app; draws are not clipped to it */
+    if(c->scissor_enabled&&!GL2_SCISSOR_IGNORES_DRAWS){int32_t s0=c->scissor_box[0],s1=c->scissor_box[1],s2=s0+c->scissor_box[2],s3=s1+c->scissor_box[3];
+        if(s0>r[0]){r[0]=s0;}
+        if(s1>r[1]){r[1]=s1;}
+        if(s2<r[2]){r[2]=s2;}
+        if(s3<r[3]){r[3]=s3;}}
+}
+/* Edges of draw_rect strictly inside the target, as clip-space planes (dot(position, plane) >= 0
+ * keeps a vertex), largest cut-off band first. Returns the count (0..4). */
+static uint32_t clip_edges(const gl2_ctx *c,float planes[4][4]){
+    uint32_t tw,th;target_size(c,&tw,&th);
+    int32_t r[4];draw_rect(c,r);
+    float band[4];uint32_t n=0;
+    if(!c->vp_w||!c->vp_h)return 0;
+    const float vx=(float)c->vp_x,vy=(float)c->vp_y,vw=(float)c->vp_w,vh=(float)c->vp_h;
+    /* left / right: x_ndc = 2 (X - vx) / vw - 1; bottom / top likewise in y */
+    if(r[0]>0){float a=2*((float)r[0]-vx)/vw-1;planes[n][0]=1;planes[n][1]=0;planes[n][2]=0;planes[n][3]=-a;band[n++]=(float)r[0];}
+    if(r[2]<(int32_t)tw){float b=2*((float)r[2]-vx)/vw-1;planes[n][0]=-1;planes[n][1]=0;planes[n][2]=0;planes[n][3]=b;band[n++]=(float)((int32_t)tw-r[2]);}
+    if(r[1]>0){float a=2*((float)r[1]-vy)/vh-1;planes[n][0]=0;planes[n][1]=1;planes[n][2]=0;planes[n][3]=-a;band[n++]=(float)r[1];}
+    if(r[3]<(int32_t)th){float b=2*((float)r[3]-vy)/vh-1;planes[n][0]=0;planes[n][1]=-1;planes[n][2]=0;planes[n][3]=b;band[n++]=(float)((int32_t)th-r[3]);}
+    for(uint32_t i=1;i<n;++i)for(uint32_t j=i;j>0&&band[j]>band[j-1];--j){float t=band[j];band[j]=band[j-1];band[j-1]=t;for(int k=0;k<4;++k){float q=planes[j][k];planes[j][k]=planes[j-1][k];planes[j-1][k]=q;}}
+    return n;
+}
+static uint32_t clip_edge_count(const gl2_ctx *c){float pl[4][4];return clip_edges(c,pl);}
+/* GL clips every draw to its viewport (and scissor). The TA only clips to the target, so up
+ * to two edges inside it go to the VGP clip planes (gl2vsc.c emit_clip): the first on 5.z
+ * (control bit 20), a second on 5.y in place of the far plane (the depth test still rejects
+ * most of what lies beyond it). A third / fourth edge stays unclipped on the GPU. */
+static void sync_prog_target(const gl2_ctx *c,gl2_prog_obj *P){
+    gl2_program *g=&P->prog;
+    uint32_t tw,th;target_size(c,&tw,&th);
+    g->rotate=(uint8_t)(c->fbo_active?0u:c->landscape);
+    g->vp_x=(int16_t)c->vp_x;g->vp_y=(int16_t)c->vp_y;g->tgt_w=(uint16_t)tw;g->tgt_h=(uint16_t)th;
+    g->clip_ctl=0;
+    if(!g->clip_has)return;
+    float planes[4][4];uint32_t n=clip_edges(c,planes);
+    float *far=P->gpu_lit_val[g->clip_slot],*user=P->gpu_lit_val[g->clip_slot+1u];
+    static const float far_plane[4]={0,0,-1,1},keep[4]={0,0,0,1};
+    for(int k=0;k<4;++k){far[k]=n>1?planes[1][k]:far_plane[k];user[k]=n?planes[0][k]:keep[k];}
+    if(n)g->clip_ctl=1u<<20;
+}
 static void sync_rotate(gl2_ctx *c){
-    uint8_t r=(uint8_t)(c->fbo_active?0u:c->landscape);
-    for(uint32_t i=1;i<GL2_MAX_PROGRAMS;++i)c->pr[i].prog.rotate=r;
+    for(uint32_t i=1;i<GL2_MAX_PROGRAMS;++i)if(c->pr[i].used)sync_prog_target(c,&c->pr[i]);
 }
 void gl2_set_landscape(gl2_ctx *c,uint32_t mode){
     if(mode>2u){err(c,GL_INVALID_VALUE);return;}
     c->landscape=mode;
     uint32_t w=mode?432u:240u,h=mode?240u:432u;
-    c->vp_w=w;c->vp_h=h;c->scissor_box[0]=c->scissor_box[1]=0;c->scissor_box[2]=(int32_t)w;c->scissor_box[3]=(int32_t)h;
+    c->vp_x=c->vp_y=0;c->vp_w=w;c->vp_h=h;c->scissor_box[0]=c->scissor_box[1]=0;c->scissor_box[2]=(int32_t)w;c->scissor_box[3]=(int32_t)h;
     sync_rotate(c);gl2_invalidate_state_cache(c);
 }
 /* ---- zero-uniform specialisation ----
@@ -461,7 +526,8 @@ static void link_build(gl2_ctx *c,gl2_prog_obj *P) {
     P->gpu_nlit = gv->nlit; for (uint32_t i = 0; i < gv->nlit; ++i) { P->gpu_lit_idx[i] = gv->lit_idx[i]; for (unsigned k = 0; k < 4; ++k) P->gpu_lit_val[i][k] = gv->lit_val[i][k]; }
     g->nstage = GL2_VS_PRUNE ? prune_native(P, gv->ncode) : gv->ncode;
     g->nplan = P->fs->nplan; g->code = &P->gpu_code[0][0];
-    g->rotate = (uint8_t)(c->fbo_active ? 0u : c->landscape);
+    g->clip_has = (uint8_t)(gv->clip_lit >= 0); g->clip_slot = (uint8_t)(gv->clip_lit >= 0 ? gv->clip_lit : 0);
+    sync_prog_target(c, P);
     g->nlit = P->gpu_nlit; g->lit_idx = P->gpu_lit_idx; g->lit_val = &P->gpu_lit_val[0][0]; g->nuni = P->vs.nuni;
     /* All vertex tables belong to this linked program snapshot, not a global program-ID slot. */
     g->dot3_mask=(P->fs->has_alpha>>1)&1u;
@@ -514,7 +580,7 @@ void glLinkProgram(gl2_ctx *c,uint32_t p){
  static gl2_prog_obj candidate;candidate=*P;link_build(c,&candidate);
  if(!candidate.ok){P->ok=0;scpy(P->log,candidate.log,64);return;}
  *P=candidate;fs_rebase(P);gl2_program *g=&P->prog;
- g->code=&P->gpu_code[0][0];g->lit_idx=P->gpu_lit_idx;g->lit_val=&P->gpu_lit_val[0][0];g->uni_idx=P->vs.uni_idx;g->uni_cnt=P->vs.uni_cnt;
+ g->code=&P->gpu_code[0][0];g->lit_idx=P->gpu_lit_idx;g->lit_val=&P->gpu_lit_val[0][0];g->uni_idx=P->vs.uni_idx;g->uni_cnt=P->vs.uni_cnt;g->clay_valid=0;sync_prog_target(c,P);
  gl2_invalidate_state_cache(c);
 }
 int glIsProgram(gl2_ctx *c,uint32_t p){return p>0&&p<GL2_MAX_PROGRAMS&&c->pr[p].used;}
@@ -640,8 +706,8 @@ void glVertexAttribPointer(gl2_ctx *c,uint32_t loc,int size,uint32_t type,int no
 void glBlendFunc(gl2_ctx *c,uint32_t s,uint32_t d){if(!((s<=1)||(s>=0x300&&s<=0x308))||!((d<=1)||(d>=0x300&&d<=0x307))){err(c,GL_INVALID_ENUM);return;}c->st.src=s;c->st.dst=d;gl2_invalidate_state_cache(c);}
 void glDepthFunc(gl2_ctx *c, uint32_t f) { if (f < 0x200 || f > 0x207) { err(c, GL_INVALID_ENUM); return; } c->st.depth_func = f; gl2_invalidate_state_cache(c); }
 void glDepthMask(gl2_ctx *c, int flag) { c->st.depth_write = flag != 0; gl2_invalidate_state_cache(c); }
-void glEnable(gl2_ctx *c, uint32_t cap) { if (cap == 0xBE2) c->st.blend = 1; else if (cap == 0xB71) c->st.depth_test = 1; else if (cap == GL_CULL_FACE) c->cull_enabled = 1; else if (cap == GL_SCISSOR_TEST) c->scissor_enabled = 1; else { err(c, GL_INVALID_ENUM); return; } gl2_invalidate_state_cache(c); }
-void glDisable(gl2_ctx *c, uint32_t cap) { if (cap == 0xBE2) c->st.blend = 0; else if (cap == 0xB71) c->st.depth_test = 0; else if (cap == GL_CULL_FACE) c->cull_enabled = 0; else if (cap == GL_SCISSOR_TEST) c->scissor_enabled = 0; else { err(c, GL_INVALID_ENUM); return; } gl2_invalidate_state_cache(c); }
+void glEnable(gl2_ctx *c, uint32_t cap) { if (cap == 0xBE2) c->st.blend = 1; else if (cap == 0xB71) c->st.depth_test = 1; else if (cap == GL_CULL_FACE) c->cull_enabled = 1; else if (cap == GL_SCISSOR_TEST) c->scissor_enabled = 1; else { err(c, GL_INVALID_ENUM); return; } gl2_invalidate_state_cache(c);  if (cap == GL_SCISSOR_TEST) sync_rotate(c); }
+void glDisable(gl2_ctx *c, uint32_t cap) { if (cap == 0xBE2) c->st.blend = 0; else if (cap == 0xB71) c->st.depth_test = 0; else if (cap == GL_CULL_FACE) c->cull_enabled = 0; else if (cap == GL_SCISSOR_TEST) c->scissor_enabled = 0; else { err(c, GL_INVALID_ENUM); return; } gl2_invalidate_state_cache(c);  if (cap == GL_SCISSOR_TEST) sync_rotate(c); }
 void glCullFace(gl2_ctx *c, uint32_t mode) {
     if (mode != GL_FRONT && mode != GL_BACK && mode != GL_FRONT_AND_BACK) { err(c, GL_INVALID_ENUM); return; }
     c->cull_face = mode;
@@ -656,7 +722,7 @@ int glIsEnabled(gl2_ctx *c, uint32_t cap) {
     if (cap == 0xB71) return c->st.depth_test != 0;
     err(c, GL_INVALID_ENUM); return 0;
 }
-void glViewport(gl2_ctx *c, int x, int y, int w, int h) { (void)x; (void)y; if (w < 0 || h < 0) { err(c, GL_INVALID_VALUE); return; } c->vp_w = (uint32_t)w; c->vp_h = (uint32_t)h; gl2_invalidate_state_cache(c); }
+void glViewport(gl2_ctx *c, int x, int y, int w, int h) { if (w < 0 || h < 0) { err(c, GL_INVALID_VALUE); return; } if (x < -32768) x = -32768; if (x > 32767) x = 32767; if (y < -32768) y = -32768; if (y > 32767) y = 32767; c->vp_x = x; c->vp_y = y; c->vp_w = (uint32_t)w; c->vp_h = (uint32_t)h; sync_rotate(c); gl2_invalidate_state_cache(c); }
 void gl2_bind_texture_native(gl2_ctx *c,uint32_t unit,uint32_t va,uint32_t l2,uint32_t storage) {
     if (unit>=2) { err(c,GL_INVALID_VALUE);return; }
     uint32_t format=storage&~GL2_TEX_LINEAR;
@@ -1300,7 +1366,7 @@ static unsigned query_int(gl2_ctx *c, uint32_t pname, int *v) {
     case GL_DEPTH_BITS: v[0] = 16; return 1;
     case GL_STENCIL_BITS: v[0] = 0; return 1;
     case GL_MAX_VIEWPORT_DIMS: v[0] = 240; v[1] = 432; return 2;
-    case GL_VIEWPORT: v[0] = 0; v[1] = 0; v[2] = (int)c->vp_w; v[3] = (int)c->vp_h; return 4;
+    case GL_VIEWPORT: v[0] = c->vp_x; v[1] = c->vp_y; v[2] = (int)c->vp_w; v[3] = (int)c->vp_h; return 4;
     case GL_ACTIVE_TEXTURE: v[0] = GL_TEXTURE0 + (int)c->active_texture; return 1;
     case GL_CURRENT_PROGRAM: v[0] = (int)c->cur; return 1;
     case GL_ARRAY_BUFFER_BINDING: v[0] = (int)c->array_buffer; return 1;
@@ -1464,6 +1530,7 @@ void glBindFramebuffer(gl2_ctx *c, uint32_t target, uint32_t name) {
     c->soft_target = c->fbo_color; c->soft_depth = c->fbo_depth;
     c->soft_width = (uint32_t)w; c->soft_height = (uint32_t)h; c->soft_stride = (uint32_t)w;
     c->soft_depth_initialized = 0;
+    sync_rotate(c);
     if (w > 0) {
         for (int i = 0; i < w * h; ++i) c->fbo_color[i] = 0;
         for (int i = 0; i < w * h; ++i) c->fbo_depth[i] = 1.f;
@@ -1585,7 +1652,7 @@ void glClearColor(gl2_ctx *c,float r,float g,float b,float a){c->clear_color[0]=
 void glClearDepthf(gl2_ctx *c,float depth){c->clear_depth=depth<0?0:depth>1?1:depth;}
 void glClearStencil(gl2_ctx *c,int stencil){c->clear_stencil=(uint32_t)stencil;}
 void glColorMask(gl2_ctx *c,int r,int g,int b,int a){c->color_mask=(r?1u:0u)|(g?2u:0u)|(b?4u:0u)|(a?8u:0u);gl2_invalidate_state_cache(c);}
-void glScissor(gl2_ctx *c,int x,int y,int width,int height){if(width<0||height<0){err(c,GL_INVALID_VALUE);return;}c->scissor_box[0]=x;c->scissor_box[1]=y;c->scissor_box[2]=width;c->scissor_box[3]=height;gl2_invalidate_state_cache(c);}
+void glScissor(gl2_ctx *c,int x,int y,int width,int height){if(width<0||height<0){err(c,GL_INVALID_VALUE);return;}c->scissor_box[0]=x;c->scissor_box[1]=y;c->scissor_box[2]=width;c->scissor_box[3]=height;gl2_invalidate_state_cache(c);sync_rotate(c);}
 void glClear(gl2_ctx *c,uint32_t mask){
     if(mask&~(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT|GL_STENCIL_BUFFER_BIT)){err(c,GL_INVALID_VALUE);return;}
     mask&=~(uint32_t)GL_STENCIL_BUFFER_BIT;               /* no stencil buffer */

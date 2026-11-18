@@ -130,6 +130,29 @@ static uint32_t rect_morton(uint32_t lw, uint32_t lh, uint32_t x, uint32_t y) {
  * let a 1024x1024 RGBA16 atlas's mips (2.67 MB) spill into the next texture: OpenLara's
  * distant room surfaces sampled another atlas. */
 static uint32_t slot_offset(gl2_ctx *c, const gl2_texture_obj *t) { (void)c; return t->arena_off; }
+/* Texture memory the GPU may still read must not change: a frame's draws are rendered
+ * (and their textures sampled) when the frame ends, and the previous frame may still be
+ * rendering. The backend's guard says whether such work exists (>0) or writes are unsafe
+ * altogether (<0). While work exists, a texture no queued draw has sampled can still be
+ * written: arena storage is handed out by a bump allocator, never shared with another
+ * texture unless the arena is recycled, which tex_reserve skips while refs are live.
+ * So a game can load a level's textures in the middle of a frame (SHMUP does). */
+static int tex_write_blocked(gl2_ctx *c, const gl2_texture_obj *t) {
+    if (!c->texture_write_guard) return 0;
+    int g = c->texture_write_guard(c->texture_write_guard_user);
+    if (!g) {
+        if (c->texture_gpu_refs) { for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) c->textures[i].gpu_ref = 0; c->texture_gpu_refs = 0; }
+        return 0;
+    }
+    return g < 0 || t->gpu_ref;
+}
+/* A deleted texture's object can be reused (new name, same object) while the GPU may
+ * still sample its old storage. Defining level 0 of such a not-yet-defined object then
+ * takes fresh arena storage instead of writing over the old region. */
+static void tex_fresh_storage(gl2_ctx *c, gl2_texture_obj *t) {
+    if (t->defined || !t->gpu_ref || !c->texture_write_guard) return;
+    if (c->texture_write_guard(c->texture_write_guard_user) > 0) { t->arena_bytes = 0; t->gpu_ref = 0; }
+}
 static uint32_t storage_bytes(uint32_t storage);
 static uint32_t chain_bytes(uint32_t w, uint32_t h, uint32_t storage) {
     uint32_t total = 0;
@@ -148,7 +171,7 @@ static int tex_reserve(gl2_ctx *c, gl2_texture_obj *t, uint32_t bytes) {
     if (t->arena_bytes >= bytes) return 0;
     int others = 0;
     for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) if (&c->textures[i] != t && c->textures[i].defined) others = 1;
-    if (!others) { c->texture_arena_used = 0; for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) c->textures[i].arena_bytes = 0; }
+    if (!others && !c->texture_gpu_refs) { c->texture_arena_used = 0; for (uint32_t i = 0; i < GL2_MAX_TEXTURES; ++i) c->textures[i].arena_bytes = 0; }
     if (bytes > GL2_TEXTURE_ARENA_BYTES - c->texture_arena_used) return -1;
     t->arena_off = c->texture_arena_used; t->arena_bytes = bytes; c->texture_arena_used += bytes;
     return 0;
@@ -377,7 +400,8 @@ void glTexImage2D(gl2_ctx *c, uint32_t target, int level, int internalformat, in
     if (border || !c->texture_cpu) { terr(c, border ? GL_INVALID_VALUE : GL_INVALID_OPERATION); return; }
     uint32_t bytes;
     if (source_range(c,(uint32_t)w,(uint32_t)h,bpp,pixels,&bytes)) return;
-    if (c->texture_write_guard && c->texture_write_guard(c->texture_write_guard_user)) { terr(c, GL_INVALID_OPERATION); return; }
+    if (level == 0) tex_fresh_storage(c,t);
+    if (tex_write_blocked(c,t)) { terr(c, GL_INVALID_OPERATION); return; }
     if (level == 0) {
         uint8_t up[8 * 8 * 4];
         if ((w == 1 || w == 2 || w == 4) && w == h) {
@@ -427,7 +451,8 @@ void glCompressedTexImage2D(gl2_ctx *c, uint32_t target, int level, uint32_t int
     gl2_texture_obj *t=bound(c,target); if (!t) return;
     if (internalformat!=GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG && internalformat!=GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG) { terr(c, GL_INVALID_ENUM); return; }
     if (level<0 || w<1 || h<1 || border || imageSize<0 || !data) { terr(c, (!data||imageSize<0)?GL_INVALID_OPERATION:GL_INVALID_VALUE); return; }
-    if (!c->texture_cpu || (c->texture_write_guard && c->texture_write_guard(c->texture_write_guard_user))) { terr(c, GL_INVALID_OPERATION); return; }
+    if (level == 0) tex_fresh_storage(c,t);
+    if (!c->texture_cpu || (tex_write_blocked(c,t))) { terr(c, GL_INVALID_OPERATION); return; }
     uint32_t storage = (internalformat==GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG) ? GL2_TEX_PVRTC4_RGB : GL2_TEX_PVRTC4_RGBA;
     uint32_t bw=(uint32_t)w<8u?8u:(uint32_t)w, bh=(uint32_t)h<8u?8u:(uint32_t)h;
     uint32_t expected_bytes=(bw*bh)>>1;
@@ -471,7 +496,7 @@ void glTexSubImage2D(gl2_ctx *c, uint32_t target, int level, int x, int y, int w
     if (!w || !h) return;
     uint32_t bytes;
     if (source_range(c,(uint32_t)w,(uint32_t)h,bpp,pixels,&bytes)) return;
-    if (c->texture_write_guard && c->texture_write_guard(c->texture_write_guard_user)) { terr(c, GL_INVALID_OPERATION); return; }
+    if (tex_write_blocked(c,t)) { terr(c, GL_INVALID_OPERATION); return; }
     gl2_invalidate_state_cache(c);
     uint32_t base=slot_offset(c,t)+level_offset(t,(uint32_t)level);
     pixels=stage_alias(c,t,base,pixels,bytes,level_bytes(t,(uint32_t)level));
@@ -481,7 +506,7 @@ void glTexSubImage2D(gl2_ctx *c, uint32_t target, int level, int x, int y, int w
 void glGenerateMipmap(gl2_ctx *c, uint32_t target) {
     gl2_texture_obj *t=bound(c,target); if (!t) return;
     if (!t->defined || (t->storage&(GL2_TEX_PVRTC4_RGB|GL2_TEX_PVRTC4_RGBA))) { terr(c, GL_INVALID_OPERATION); return; }
-    if (c->texture_write_guard && c->texture_write_guard(c->texture_write_guard_user)) { terr(c, GL_INVALID_OPERATION); return; }
+    if (tex_write_blocked(c,t)) { terr(c, GL_INVALID_OPERATION); return; }
     gl2_invalidate_state_cache(c); gl2_soft_cache_flush();
     uint32_t slot=slot_offset(c,t);
     for (uint32_t level=1; level<=t->log2size; ++level) {
@@ -521,6 +546,7 @@ int gl2_resolve_texture_units(gl2_ctx *c, uint32_t layers, uint32_t samplers, co
         if (!c->texture_managed[unit]) { resolved[layer] = c->raw_unit_tex[unit]; continue; }
         gl2_texture_obj *t = named(c, c->texture_binding[unit]);
         if (!t || !t->used || !t->defined) { terr(c, GL_INVALID_OPERATION); return -1; }
+        if (!c->soft_target) { t->gpu_ref = 1; c->texture_gpu_refs = 1; }
         uint32_t mf=t->min_filter,gf=t->mag_filter;
         int mip = mf>=GL_NEAREST_MIPMAP_NEAREST && mf<=GL_LINEAR_MIPMAP_LINEAR;
         uint32_t linear=0,mipflag=0;
@@ -557,7 +583,7 @@ int gl2_texture_copy_argb(gl2_ctx *c,int dx,int dy,int sx,int sy,int w,int h,con
  if(!surface||((uintptr_t)surface&3u)||!sh||stride>UINT32_MAX/4/sh){terr(c,GL_INVALID_VALUE);return -1;}
  uintptr_t src=(uintptr_t)surface,dst=(uintptr_t)(c->texture_cpu+slot_offset(c,t));uint32_t bytes=stride*sh*4,output=t->size*t->size*4;
  if(src>UINTPTR_MAX-bytes||(src<dst+output&&dst<src+bytes)){terr(c,GL_INVALID_OPERATION);return -1;}
- if(c->texture_write_guard&&c->texture_write_guard(c->texture_write_guard_user)){terr(c,GL_INVALID_OPERATION);return -1;}
+ if(tex_write_blocked(c,t)){terr(c,GL_INVALID_OPERATION);return -1;}
  gl2_invalidate_state_cache(c);
  texture_word *out=(texture_word *)dst;uint32_t alpha=t->format==GL_RGB?0xff000000u:0;
  if(!((dx|dy|w|h)&1)){
@@ -585,7 +611,7 @@ int gl2_texture_store_argb(gl2_ctx *c, gl2_texture_obj *t, int dx, int dy, int w
     uintptr_t src = (uintptr_t)surface, dst = (uintptr_t)(c->texture_cpu + slot_offset(c, t));
     uint32_t bytes = stride * sh * 4, output = t->size * t->size * 4;
     if (src > UINTPTR_MAX - bytes || (src < dst + output && dst < src + bytes)) { terr(c, GL_INVALID_OPERATION); return -1; }
-    if (c->texture_write_guard && c->texture_write_guard(c->texture_write_guard_user)) { terr(c, GL_INVALID_OPERATION); return -1; }
+    if (tex_write_blocked(c,t)) { terr(c, GL_INVALID_OPERATION); return -1; }
     gl2_invalidate_state_cache(c);
     texture_word *out = (texture_word *)dst; uint32_t alpha = t->format == GL_RGB ? 0xff000000u : 0;
     if (!((dx | dy | w | h) & 1)) {

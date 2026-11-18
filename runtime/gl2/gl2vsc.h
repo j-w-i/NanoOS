@@ -15,6 +15,7 @@ typedef struct {
     uint32_t nattr; char attr_name[8][32]; uint8_t attr_slot[8], attr_w[8];     /* attribute name -> VGP input slot (0 pos, 1 normal, 2 colour, 3 uv0, 4 uv1) */
     uint32_t nvary; char vary_name[8][32]; uint8_t vary_slot[8], vary_w[8];     /* varying name -> output slot (1 colour, 2 fog, 3 uv0, 4 uv1) */
     uint32_t nconst, ntemps;
+    int32_t clip_lit;   /* literal slot of the two per-draw clip plane rows (5.y, 5.z), -1 none; gl2api.c clip_sync */
     char err[64];
 } vsc_result;
 int gl2_preprocess(const char *src, char *out, uint32_t cap);

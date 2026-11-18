@@ -27,6 +27,10 @@ typedef struct {
     uint32_t uv0_input;    /* floats per vertex in UV0 / VGP input 3: 0 = legacy 2; 3 or 4 when the code reads .z/.w */
     uint8_t pack_pos, pack_uv1; /* per draw: position as raw short4 (2 words), input 4 as packed ubyte4 (1 word) */
     uint8_t rotate;             /* landscape window target: 0 none, 1 = 90 deg (home right), 2 = 270 deg (home left); see build_header */
+    int16_t vp_x, vp_y;         /* glViewport origin (GL window coordinates, bottom-left) */
+    uint16_t tgt_w, tgt_h;      /* target size in GL window coordinates; 0 = viewport covers the target */
+    uint8_t clip_has, clip_slot; /* literal slot of the clip plane rows (5.y far / 5.z user), see gl2vsc.c emit_clip */
+    uint32_t clip_ctl;          /* control-word bits for this draw: 1 << 20 enables the 5.z plane */
     uint32_t cused_valid; uint8_t cused[16]; /* constant rows the compiled vertex code reads (bit per index); unread uniform rows are not sent */
     /* constant record layout cache (build_header): sorted rows and where their values live; rebuilt when
      * the set of set uniforms, the read rows or the literals change (clay_valid = 0) */

@@ -213,8 +213,19 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
         out[k++] = (lw << 24) | (lh << 20) | (fmt<<12) | 0x600u | cm | ((p->dot3_mask&(1u<<u))?1u<<13:0); out[k++] = (filt<<24) | (tex[u].va >> 7); out[k++] = (w2_of(p->plan + 12 * u)&~0x7fffu)|(p->custom_alpha?p->alpha[u]:0x4610u);
     }
     out[k++] = 0x2003801au; out[k++] = (p->pack_pos ? 8u : 4u) | p->normal_input << 4 | (p->omit_colour ? 0 : 5u << 8) | GL2_UV0W(p) << 12 | ((p->pack_uv1 ? 5u : p->uv1_input) << 16); out[k++] = 0;
-    out[k++] = f2u((float)vp_w / 2); out[k++] = f2u(rot == 2u ? -(float)vp_w / 2 : (float)vp_w / 2); out[k++] = f2u((float)vp_h / 2); out[k++] = f2u(rot == 1u ? (float)vp_h / 2 : -(float)vp_h / 2); out[k++] = f2u(0.5f); out[k++] = f2u(0.5f);
-    out[k++] = mode == 4 ? 0x70000000u : mode == 5 ? 0x40020000u : 0x50020000u; out[k++] = 0xf0020004u | (two ? 1u << 13 : 0);
+    {   /* viewport: panel x = ox + sx * ndc, panel y (rows from the top) = oy + sy * ndc. vp_w / vp_h
+         * are already swapped for landscape; vp_x / vp_y and the target size are GL window
+         * coordinates (origin bottom-left). Portrait: x = vx + w/2 (1 + ndc_x), row = H - vy - h/2 (1 + ndc_y).
+         * Landscape home right (1): panel x = window y, panel y = window x; home left (2): both mirrored. */
+        float hw = (float)vp_w / 2, hh = (float)vp_h / 2, vx = (float)p->vp_x, vy = (float)p->vp_y;
+        float tw = p->tgt_w ? (float)p->tgt_w : (rot ? 2 * hh : 2 * hw), th = p->tgt_h ? (float)p->tgt_h : (rot ? 2 * hw : 2 * hh);
+        float ox, sx, oy, sy;
+        if (rot == 1u) { ox = vy + hw; sx = hw; oy = vx + hh; sy = hh; }
+        else if (rot == 2u) { ox = th - vy - hw; sx = -hw; oy = tw - vx - hh; sy = -hh; }
+        else { ox = vx + hw; sx = hw; oy = th - vy - hh; sy = -hh; }
+        out[k++] = f2u(ox); out[k++] = f2u(sx); out[k++] = f2u(oy); out[k++] = f2u(sy); out[k++] = f2u(0.5f); out[k++] = f2u(0.5f);
+    }
+    out[k++] = mode == 4 ? 0x70000000u : mode == 5 ? 0x40020000u : 0x50020000u; out[k++] = 0xf0020004u | (two ? 1u << 13 : 0) | p->clip_ctl;
     return (int)k;
 }
 int gl2_build_draw_views_mask(const gl2_program *p,const gl2_state *st,int mode,uint32_t n,

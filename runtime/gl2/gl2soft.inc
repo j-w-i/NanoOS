@@ -24,7 +24,8 @@ int gl2_soft_is_texture_cube(const gl2_soft_program *p){
  for(unsigned k=0;k<4;++k){const gl2_soft_insn *i=&p->code[p->output[k]];if(i->op!=GL2_SMUL||!((s_input_channel(p,i->a,k)&&s_square_channel(p,i->b,k))||(s_input_channel(p,i->b,k)&&s_square_channel(p,i->a,k))))return 0;}return 1;
 }
 int gl2_program_needs_software(const gl2_ctx *c,const gl2_prog_obj *p){
- if(GL2_DRAW_SCISSOR_BLOCKS(c)||c->color_mask!=0xfu)return 1;
+ /* a partial scissor needing at most two clip edges runs natively on the VGP clip planes (sync_prog_target) */
+ if((GL2_DRAW_SCISSOR_BLOCKS(c)&&clip_edge_count(c)>2u)||c->color_mask!=0xfu)return 1;
  const gl2_soft_program *s=p&&p->fs?p->fs->software:0;if(!s)return 0;
  if(p->fs->nplan&&p->sampler_unit[0]<2)return 0; /* a lowered combiner plan on texture unit 0/1 runs natively (OpenLara checked against the ANGLE reference) */
  /* A compiled combiner plan is an exact fixed-function lowering of the
@@ -160,11 +161,13 @@ __attribute__((optimize("O2")))
 #endif
 static void s_triangle(gl2_ctx *restrict c,const gl2_prog_obj *p,const s_vertex_out *vertices[3],int constant_primary){
  const s_vertex_out *v[3]={vertices[0],vertices[1],vertices[2]};int32_t x[3],y[3];float iw[3],z[3];
- for(unsigned i=0;i<3;++i){if(!(v[i]->v[0][3]>0))return;iw[i]=1/v[i]->v[0][3];if(!s_finite(iw[i]))return;x[i]=(int32_t)((v[i]->v[0][0]*iw[i]+1)*(float)c->vp_w*8+.5f);y[i]=(int32_t)((1-v[i]->v[0][1]*iw[i])*(float)c->vp_h*8+.5f);z[i]=(v[i]->v[0][2]*iw[i]+1)*.5f;}
+ /* viewport origin (GL window coords, bottom-left) in 1/16-pixel units; rows count from the top */
+ const int32_t vl=c->vp_x,vt=(int32_t)c->soft_height-c->vp_y-(int32_t)c->vp_h,vx16=vl*16,vy16=vt*16;
+ for(unsigned i=0;i<3;++i){if(!(v[i]->v[0][3]>0))return;iw[i]=1/v[i]->v[0][3];if(!s_finite(iw[i]))return;x[i]=(int32_t)((v[i]->v[0][0]*iw[i]+1)*(float)c->vp_w*8+.5f)+vx16;y[i]=(int32_t)((1-v[i]->v[0][1]*iw[i])*(float)c->vp_h*8+.5f)+vy16;z[i]=(v[i]->v[0][2]*iw[i]+1)*.5f;}
  int32_t area=s_edge(x[0],y[0],x[1],y[1],x[2],y[2]);if(!area)return;
  if(c->cull_enabled){int front=(area<0)==(c->front_face==GL_CCW);if(c->cull_face==GL_FRONT_AND_BACK||(c->cull_face==GL_FRONT?front:!front))return;}
  if(area<0){const s_vertex_out *tmp=v[1];v[1]=v[2];v[2]=tmp;int32_t tx=x[1],ty=y[1];x[1]=x[2];y[1]=y[2];x[2]=tx;y[2]=ty;float f=iw[1];iw[1]=iw[2];iw[2]=f;f=z[1];z[1]=z[2];z[2]=f;area=-area;}
- int minx=x[0],maxx=x[0],miny=y[0],maxy=y[0];for(unsigned k=1;k<3;++k){if(x[k]<minx)minx=x[k];if(x[k]>maxx)maxx=x[k];if(y[k]<miny)miny=y[k];if(y[k]>maxy)maxy=y[k];}minx/=16;miny/=16;maxx=(maxx+15)/16;maxy=(maxy+15)/16;if(maxx>(int)c->vp_w)maxx=(int)c->vp_w;if(maxy>(int)c->vp_h)maxy=(int)c->vp_h;
+ int minx=x[0],maxx=x[0],miny=y[0],maxy=y[0];for(unsigned k=1;k<3;++k){if(x[k]<minx)minx=x[k];if(x[k]>maxx)maxx=x[k];if(y[k]<miny)miny=y[k];if(y[k]>maxy)maxy=y[k];}minx/=16;miny/=16;maxx=(maxx+15)/16;maxy=(maxy+15)/16;/* GL clips to the viewport: no pixel outside it */if(minx<vl)minx=vl;if(miny<vt)miny=vt;if(maxx>vl+(int)c->vp_w)maxx=vl+(int)c->vp_w;if(maxy>vt+(int)c->vp_h)maxy=vt+(int)c->vp_h;if(minx<0)minx=0;if(miny<0)miny=0;if(maxx>(int)c->soft_width)maxx=(int)c->soft_width;if(maxy>(int)c->soft_height)maxy=(int)c->soft_height;
  if(c->scissor_enabled){
   int gx0=c->scissor_box[0],gy0=c->scissor_box[1],gx1=gx0+c->scissor_box[2],gy1=gy0+c->scissor_box[3];
   if(gx0<0)gx0=0;
