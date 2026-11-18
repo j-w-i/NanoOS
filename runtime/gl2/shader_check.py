@@ -32,10 +32,12 @@ int main(int argc, char **argv) {
       else printf("%-28s ok   vs: %u VGP instructions, %u literals\n", base, r.ncode, r.nlit);
     } else {
       static gl2_fs_owned o; char log[64] = {0}; int rc = compile_fragment(pp, &o, log);
-      if (rc) { printf("%-28s FAIL fs: %s\n", base, log); bad = 1; continue; }
+      if (rc) { static gl2_fs_owned m; if (mp_adopt(pp, &m, 1)) { printf("%-28s ok   fs: only with gl2_fragment_passes: %u GPU passes (single pass: %s)\n", base, m.e.mp, log); continue; }
+        printf("%-28s FAIL fs: %s\n", base, log); bad = 1; continue; }
       printf("%-28s ok   fs: %s%s%s\n", base, o.e.nplan ? (o.e.nplan > 1 ? "native, 2 stages" : "native, 1 stage") : "CPU only (GPU frames reject its draws)",
              o.e.uv_approx ? ", approximated texture lookups" : "",
              (o.e.fold_mask || o.e.fold_const[0] || o.e.fold_const[1] || o.e.fold_const[2] || o.e.uv_divide) ? ", per-vertex folds" : "");
+      { static gl2_fs_owned m; if (mp_adopt(pp, &m, 1)) printf("%-28s      exact in %u GPU pass(es) with gl2_fragment_passes (now: %s)\n", "", m.e.mp, o.e.nplan ? (o.e.approx ? "approximated" : "exact") : "no GPU plan"); }
     }
   }
   return bad;

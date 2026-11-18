@@ -3,6 +3,7 @@ static int scmp(const char *a, const char *b) { while (*a && *a == *b) { ++a; ++
 static void scpy(char *d, const char *s, int n) { int i = 0; for (; i < n - 1 && s[i]; ++i) d[i] = s[i]; d[i] = 0; }
 uint32_t gl2_hash(const char *s) { uint32_t h = 2166136261u; while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; } return h; }
 #include "gl2fsc.inc"
+#include "gl2fmp.inc"
 static void fs_copy(gl2_fs_owned *dst,const gl2_fs_entry *src){
  dst->e=*src;if(src->fold_name){scpy(dst->fold_vary,src->fold_name,32);dst->e.fold_name=dst->fold_vary;}if(src->fog_name){scpy(dst->fog_vary,src->fog_name,32);dst->e.fog_name=dst->fog_vary;}if(src->software){dst->software=*src->software;dst->e.software=&dst->software;}for(unsigned i=0;i<src->nsampler;++i){scpy(dst->samplers[i],src->sampler_names[i],32);dst->e.sampler_names[i]=dst->samplers[i];}
  for(unsigned i=0;i<src->nuniform;++i){scpy(dst->uniforms[i],src->uniform_names[i],32);dst->e.uniform_names[i]=dst->uniforms[i];}
@@ -24,7 +25,7 @@ void gl2_init(gl2_ctx *c, gl2_prog_obj *progs, uint32_t *segbuf, uint32_t seg_ca
     c->seg = segbuf; c->seg_cap = seg_cap; c->submit = fn; c->submit_user = user;
     c->st.depth_func = 0x201; c->st.depth_write = 1; c->st.src = 1; c->st.dst = 0; c->vp_w = 240; c->vp_h = 432;
     c->cull_face = GL_BACK; c->front_face = GL_CCW; c->clear_depth = 1.f; c->color_mask = 0xfu; c->scissor_box[0]=0;c->scissor_box[1]=0;c->scissor_box[2]=240;c->scissor_box[3]=432;
-    c->next_buffer = 1; c->next_texture = 1; c->unpack_alignment = 4; c->pack_alignment = 4;
+    c->next_buffer = 1; c->next_texture = 1; c->unpack_alignment = 4; c->pack_alignment = 4; c->mp_mode = GL2_MP_MODE;
     for (uint32_t i = 0; i < 5; ++i) { c->attr[i].size = 4; c->attr[i].stride = 16; c->attr[i].type = GL_FLOAT; c->attr[i].current[3] = 1; }
 }
 extern const uint32_t *gl2_hdr_memo_out;
@@ -177,7 +178,7 @@ void glDeleteShader(gl2_ctx *c,uint32_t sh){if(!sh)return;gl2_shader *s=shp(c,sh
 static int cache_valid(const gl2_fs_entry *e) {
     if(e->software&&gl2_soft_validate(e->software))return 0;
     if(e->has_alpha>3||((e->has_alpha&1u)&&((e->alpha[0]|e->alpha[1])&0x8000u)))return 0;
-    if((e->has_alpha&2u)&&(!(e->has_alpha&1u)||e->nplan!=1))return 0;
+    if((e->has_alpha&2u)&&(!(e->has_alpha&1u)||e->nplan!=2))return 0;   /* DOT3 takes two stages */
     if (!e->source || e->nplan < 1 || e->nplan > 2 || e->nsampler > 2 || e->nvary > 3 || e->nuniform>16) return 0;
     for(unsigned i=0;i<e->nuniform;++i){if(!e->uniform_names[i]||!e->uniform_names[i][0]||e->uniform_widths[i]<1||e->uniform_widths[i]>4)return 0;for(unsigned j=0;j<i;++j)if(!scmp(e->uniform_names[i],e->uniform_names[j]))return 0;for(unsigned j=0;j<e->nsampler;++j)if(e->sampler_names[j]&&!scmp(e->uniform_names[i],e->sampler_names[j]))return 0;}
     for (uint32_t i = 0; i < e->nsampler; ++i) {
@@ -213,14 +214,18 @@ void glCompileShader(gl2_ctx *c, uint32_t sh) {
             if (!cache_valid(&c->cache[i])) { scpy(s->log, "invalid cached fragment metadata", 64); return; }
             s->fs = &c->cache[i]; s->ok = 1; return;
         }
-        if(!compile_fragment(src,&c->sh_fs[sh],s->log)){
+        int rc=compile_fragment(src,&c->sh_fs[sh],s->log);
+        {gl2_fs_owned *o=&c->sh_fs[sh];
+         int want=c->mp_mode>=2?(rc||!o->e.nplan||o->e.approx):c->mp_mode==1?(!c->soft_target&&(rc||!o->e.nplan)):0;
+         if(want&&mp_adopt(src,o,rc)){rc=0;s->log[0]=0;}}
+        if(!rc){
             /* No TSP combiner plan: the MBX can't run it, and GPU frames would drop every
              * draw (GL_INVALID_OPERATION) after a successful link. Report it at compile
              * time, as a driver does for a shader its hardware can't run, so the app takes
              * its own fallback (e.g. a simpler shader). Contexts drawing to a software
              * target (host tools, software frames) still accept it; GL2_SOFTWARE_FS=1
              * always does. */
-            if(!GL2_SOFTWARE_FS&&!c->soft_target&&!c->sh_fs[sh].e.nplan){scpy(s->log,"fragment shader needs per-pixel maths the GPU can't run",64);return;}
+            if(!GL2_SOFTWARE_FS&&!c->soft_target&&!c->sh_fs[sh].e.nplan&&!c->sh_fs[sh].e.mp){scpy(s->log,"fragment shader needs per-pixel maths the GPU can't run",64);return;}
             s->fs=&c->sh_fs[sh].e;s->ok=1;}
     }
 }
@@ -248,6 +253,9 @@ void glAttachShader(gl2_ctx *c, uint32_t p, uint32_t sh) {
 #ifndef GL2_FOLD_COLOUR
 #define GL2_FOLD_COLOUR 1
 #endif
+#ifndef GL2_COLOUR_COMP
+#define GL2_COLOUR_COMP 1   /* correct the vertex colour's float -> byte conversion on the GPU path (gpu_variant) */
+#endif
 #ifndef GL2_UV_DIVIDE
 #define GL2_UV_DIVIDE 1
 #endif
@@ -270,7 +278,7 @@ static uint32_t sappend(char *d,uint32_t k,uint32_t cap,const char *s){while(*s&
 /* The GPU compile of P's vertex shader (see link_build). Falls back to P->vs when
  * nothing is appended or the recompile would change the uniform/literal layout. */
 static const vsc_result *gpu_variant(gl2_ctx *c,gl2_prog_obj *P){
-    static char src[GL2_SHADER_SOURCE_BYTES+512],add[384];static vsc_result r;
+    static char src[GL2_SHADER_SOURCE_BYTES+768],add[640];static vsc_result r;
     uint32_t k=0;add[0]=0;
     for(uint32_t s=0;s<2;++s){
         if(!GL2_UV_DIVIDE||!(P->fs->uv_divide>>s&1u))continue;
@@ -295,18 +303,39 @@ static const vsc_result *gpu_variant(gl2_ctx *c,gl2_prog_obj *P){
                 num[n++]=(char)('0'+ip%10u);num[n++]='.';for(uint32_t dv=100000u;dv;dv/=10u)num[n++]=(char)('0'+fp/dv%10u);num[n]=0;
                 char lm[2]={lane[l],0};
                 k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,".");k=sappend(add,k,sizeof add,lm);k=sappend(add,k,sizeof add,"*=");k=sappend(add,k,sizeof add,num);k=sappend(add,k,sizeof add,";");}}}
-    if(!k||!P->vsh||!c->sh[P->vsh].src)return &P->vs;
-    if(gl2_preprocess(c->sh[P->vsh].src,src,GL2_SHADER_SOURCE_BYTES)!=0)return &P->vs;
-    uint32_t len=0;while(src[len])++len;
-    uint32_t close=len;while(close&&src[close-1]!='}')--close;   /* main() is the last body */
-    if(!close||len+k+2>=sizeof src)return &P->vs;
-    for(uint32_t i=len+1;i-->close-1;)src[i+k]=src[i];
-    for(uint32_t i=0;i<k;++i)src[close-1+i]=add[i];
-    if(gl2vsc_compile(src,&r)!=0)return &P->vs;
-    if(r.nuni!=P->vs.nuni||r.nlit<P->vs.nlit)return &P->vs;
-    for(uint32_t u=0;u<r.nuni;++u)if(r.uni_idx[u]!=P->vs.uni_idx[u]||r.uni_cnt[u]!=P->vs.uni_cnt[u])return &P->vs;
-    for(uint32_t i=0;i<P->vs.nlit;++i){if(r.lit_idx[i]!=P->vs.lit_idx[i])return &P->vs;for(unsigned q=0;q<4;++q)if(r.lit_val[i][q]!=P->vs.lit_val[i][q])return &P->vs;}
-    return &r;
+    /* Vertex colour precision (MBX_GPU.md "DOT3 and vertex colour precision"): the colour output's
+     * float -> byte conversion rounds up to 0.5 but loses up to 1.75 steps above. Shift colours
+     * above 0.5 so they land on round(255 c): 3 VGP instructions per vertex, device only. */
+    uint32_t kf=k;
+    if(GL2_COLOUR_COMP&&!c->soft_target){
+        const char *d=vs_out_name(P,1u);uint32_t w=0;
+        for(uint32_t i=0;i<P->vs.nvary;++i)if(P->vs.vary_slot[i]==1u)w=P->vs.vary_w[i];
+        if(d&&w==4u){
+            /* one literal row (the VGP reads one constant register per instruction): step, MAD, MAD */
+            k=sappend(add,k,sizeof add,"vec4 gl2k=vec4(-0.002191,0.004148,0.501,0.0);");
+            k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,"=");k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,"+step(gl2k.zzzz,");
+            k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,")*(");k=sappend(add,k,sizeof add,d);k=sappend(add,k,sizeof add,"*gl2k.xxxx+gl2k.yyyy);");
+        }
+    }
+    if(!P->vsh||!c->sh[P->vsh].src)return &P->vs;
+    /* with the colour correction first; without it if that changes the uniform / literal layout */
+    for(unsigned attempt=0;attempt<2;++attempt){
+        if(attempt){if(k==kf)break;k=kf;add[k]=0;}
+        if(!k)return &P->vs;
+        if(gl2_preprocess(c->sh[P->vsh].src,src,GL2_SHADER_SOURCE_BYTES)!=0)return &P->vs;
+        uint32_t len=0;while(src[len])++len;
+        uint32_t close=len;while(close&&src[close-1]!='}')--close;   /* main() is the last body */
+        if(!close||len+k+2>=sizeof src)continue;
+        for(uint32_t i=len+1;i-->close-1;)src[i+k]=src[i];
+        for(uint32_t i=0;i<k;++i)src[close-1+i]=add[i];
+        if(gl2vsc_compile(src,&r)!=0)continue;
+        if(r.nuni!=P->vs.nuni||r.nlit<P->vs.nlit)continue;
+        int same=1;
+        for(uint32_t u=0;u<r.nuni&&same;++u)if(r.uni_idx[u]!=P->vs.uni_idx[u]||r.uni_cnt[u]!=P->vs.uni_cnt[u])same=0;
+        for(uint32_t i=0;i<P->vs.nlit&&same;++i){if(r.lit_idx[i]!=P->vs.lit_idx[i])same=0;for(unsigned q=0;q<4;++q)if(r.lit_val[i][q]!=P->vs.lit_val[i][q])same=0;}
+        if(same)return &r;
+    }
+    return &P->vs;
 }
 /* VGP outputs the native TSP reads for this fragment plan: position (0),
  * clip distances (5), the plan's varyings, colour when the combiner takes the
@@ -495,10 +524,14 @@ static void spec_select_i(gl2_prog_obj *P){
     P->spec_n[s]=n;P->spec_key[s]=key;
     P->prog.code=&P->spec_code[s][0][0];P->prog.nstage=n;
 }
+static const vsc_result *mp_link_vs;static const gl2_fs_entry *mp_link_fs;   /* set while linking a pass program from generated shaders */
 static void link_build(gl2_ctx *c,gl2_prog_obj *P) {
     P->ok = 0;
+    if (mp_link_vs) { P->vs = *mp_link_vs; fs_copy(&P->fs_owned, mp_link_fs); P->fs = &P->fs_owned.e; }
+    else {
     if (!P->vsh || !P->fsh || !c->sh[P->vsh].ok || !c->sh[P->fsh].ok) { scpy(P->log, "missing or uncompiled shader", 64); return; }
     P->vs = *c->sh[P->vsh].vs; fs_copy(&P->fs_owned,c->sh[P->fsh].fs);P->fs=&P->fs_owned.e;
+    }
     uint32_t has_col = 0, has_uv = 0; for (uint32_t i = 0; i < P->vs.nvary; ++i) { if (P->vs.vary_slot[i] == 1) has_col = 1; if (P->vs.vary_slot[i] == 3) has_uv = 1; }
     if (P->fs->needs_colour && !has_col) { scpy(P->log, "fragment shader reads a colour varying the vertex shader does not write", 64); return; }
     if (P->fs->nsampler && !has_uv) { scpy(P->log, "fragment shader samples a texture but the vertex shader writes no texcoord", 64); return; }
@@ -544,7 +577,7 @@ static void link_build(gl2_ctx *c,gl2_prog_obj *P) {
      *                              lighting; without it scenes were unlit, doors black)
      * Then the copy is pruned to what the TSP reads. The software fragment path keeps
      * the original P->vs. */
-    const vsc_result *gv = gpu_variant(c, P);
+    const vsc_result *gv = mp_link_vs ? &P->vs : gpu_variant(c, P);
     for (uint32_t i = 0; i < gv->ncode; ++i) { P->gpu_code[i][0] = gv->code[i][0]; P->gpu_code[i][1] = gv->code[i][1]; }
     P->gpu_nlit = gv->nlit; for (uint32_t i = 0; i < gv->nlit; ++i) { P->gpu_lit_idx[i] = gv->lit_idx[i]; for (unsigned k = 0; k < 4; ++k) P->gpu_lit_val[i][k] = gv->lit_val[i][k]; }
     g->nstage = GL2_VS_PRUNE ? prune_native(P, gv->ncode) : gv->ncode;
@@ -600,14 +633,223 @@ static void link_build(gl2_ctx *c,gl2_prog_obj *P) {
     P->sampler_unit[0] = P->sampler_unit[1] = 0; /* GLES sampler-uniform defaults */
     P->ok = 1; P->executable = 1; P->validate_status = 0; scpy(P->log, P->fs->nplan?"linked:native combiner; state-dependent route":"linked:software-only fragment (slow)", 64);
 }
+static void mp_release(gl2_ctx *c,gl2_prog_obj *P){
+ for(unsigned i=0;i<P->mp_n;++i){gl2_prog_obj *Q=&c->pr[P->mp_q[i]];Q->used=Q->ok=Q->executable=0;Q->mp_hidden=0;}
+ for(unsigned i=0;i<P->mp_acc_n;++i){gl2_prog_obj *Q=&c->pr[P->mp_acc_q[i]];Q->used=Q->ok=Q->executable=0;Q->mp_hidden=0;}
+ P->mp_n=P->mp_acc_n=0;
+}
+static int mp_vs_has(void *user,const char *name){const gl2_prog_obj *P=user;for(uint32_t i=0;i<P->vs.nuni;++i)if(!scmp(P->vs.uni_name[i],name))return 1;return 0;}
+/* Build the pass programs of a linked multi-pass program: per pass, the vertex shader with that
+ * pass's colour / texture coordinate appended, and a one-pass fragment shader. 0 on success. */
+/* One hidden pass program: the application's vertex shader with decl in front and add at the end
+ * of main(), and fragment source fs. Returns its program slot, 0 when it cannot be built. */
+static uint32_t mp_build_pass(gl2_ctx *c,gl2_prog_obj *P,const char *vbase,uint32_t close,const char *decl,const char *add,const char *fs){
+ static char vsrc[GL2_SHADER_SOURCE_BYTES+2048];static vsc_result vr;static gl2_fs_owned fo;static char log[64];
+ uint32_t k=0;k=sappend(vsrc,k,sizeof vsrc,decl);
+ for(uint32_t j=0;j+1<close&&k+1<sizeof vsrc;++j)vsrc[k++]=vbase[j];
+ vsrc[k]=0;k=sappend(vsrc,k,sizeof vsrc,add);k=sappend(vsrc,k,sizeof vsrc,vbase+close-1);
+ if(k+2>=sizeof vsrc||gl2vsc_compile(vsrc,&vr)!=0||compile_fragment(fs,&fo,log)||!fo.e.nplan||fo.e.approx)return 0;
+ uint32_t q=GL2_MAX_PROGRAMS-1;while(q&&c->pr[q].used)--q;
+ if(!q)return 0;
+ gl2_prog_obj *Q=&c->pr[q];{uint8_t *z=(uint8_t *)Q;for(uint32_t b=0;b<sizeof *Q;++b)z[b]=0;}
+ Q->used=1;Q->mp_hidden=1;Q->nbind=P->nbind;for(unsigned b=0;b<8;++b){scpy(Q->bind_name[b],P->bind_name[b],32);Q->bind_loc[b]=P->bind_loc[b];}
+ mp_link_vs=&vr;mp_link_fs=&fo.e;link_build(c,Q);mp_link_vs=0;mp_link_fs=0;
+ if(!Q->ok){Q->used=Q->ok=Q->executable=0;Q->mp_hidden=0;return 0;}
+ fs_rebase(Q);sync_prog_target(c,Q);
+ for(uint32_t u=0;u<Q->vs.nuni&&u<GL2_MAX_UNI;++u){
+  const char *nm=Q->vs.uni_name[u];Q->mp_usrc[u]=0;
+  if(!scmp(nm,"gl2_mpk")){Q->mp_usrc[u]=0xff;continue;}
+  for(uint32_t j=0;j<P->vs.nuni;++j)if(!scmp(P->vs.uni_name[j],nm)){Q->mp_usrc[u]=(uint8_t)(j+1);break;}
+  if(!Q->mp_usrc[u])for(unsigned j=0;j<P->fs->nuniform;++j)if(!scmp(P->fs->uniform_names[j],nm)){Q->mp_usrc[u]=(uint8_t)(0x80u|j);break;}
+ }
+ return q;
+}
+/* Build the pass programs of a linked multi-pass program: per pass, the vertex shader with that
+ * pass's colour / texture coordinate appended, and a one-pass fragment shader. 0 on success.
+ * The additive list (destination alpha) is optional: it is dropped when it cannot be built. */
+static int mp_link(gl2_ctx *c,gl2_prog_obj *P){
+ static char fsrc[GL2_SHADER_SOURCE_BYTES],vbase[GL2_SHADER_SOURCE_BYTES],fst[MP_MAX_PASS+MP_ACC_MAX][512],decl[MP_MAX_PASS+MP_ACC_MAX][384],add[MP_MAX_PASS+MP_ACC_MAX][1280];
+ if(!P->vsh||!P->fsh||!c->sh[P->fsh].src||!c->sh[P->vsh].src)return -1;
+ if(gl2_preprocess(c->sh[P->fsh].src,fsrc,sizeof fsrc)||gl2_preprocess(c->sh[P->vsh].src,vbase,sizeof vbase))return -1;
+ if(mp_analyse(fsrc,MP_MAX_PASS))return -1;
+ mp_dot_hw=!c->soft_target;   /* light-vector encoding for the MBX (see gl2fmp.inc) */
+ static gl2_mp_lut lut;lut=mp.lut;   /* resolved now: compiling the passes below reuses the parser state */
+ for(unsigned u=0;u<16;++u){
+  lut.usrc[u]=0;if(!(mp.lut_uniused>>u&1u))continue;
+  for(uint32_t j=0;j<P->vs.nuni;++j)if(!scmp(P->vs.uni_name[j],f_mp_uname[u])){lut.usrc[u]=(uint8_t)(j+1);break;}
+  if(!lut.usrc[u])for(unsigned j=0;j<P->fs->nuniform;++j)if(!scmp(P->fs->uniform_names[j],f_mp_uname[u])){lut.usrc[u]=(uint8_t)(0x80u|j);break;}
+ }
+ /* the pass colour goes out in VGP slot 1, its texture coordinate in slot 3 */
+ const char *col=0,*uv=0;unsigned uvw=2;int decl_col=0,decl_uv=0;
+ for(uint32_t i=0;i<P->vs.nvary;++i){
+  if(P->vs.vary_slot[i]==1){if(P->vs.vary_w[i]!=4||(scmp(P->vs.vary_name[i],"vColor")&&scmp(P->vs.vary_name[i],"vDiffuse")))return -1;col=P->vs.vary_name[i];}
+  if(P->vs.vary_slot[i]==3){uvw=P->vs.vary_w[i];if(uvw!=2&&(uvw!=4||scmp(P->vs.vary_name[i],"vTexCoord")))return -1;uv=P->vs.vary_name[i];}
+ }
+ if(!col){if(vs_has_out(P,"vColor"))return -1;col="vColor";decl_col=1;}
+ if(!uv){if(vs_has_out(P,"vTexCoord"))return -1;uv="vTexCoord";decl_uv=1;uvw=2;}
+ const unsigned n=mp.npass,na=mp.nacc;uint8_t op[MP_MAX_PASS+MP_ACC_MAX],samp[MP_MAX_PASS+MP_ACC_MAX],blend_ok=mp.blend_ok;int acc_ok=na>0;
+ uint8_t slot[MP_MAX_PASS+MP_ACC_MAX];
+ for(unsigned i=0;i<n+na;++i){
+  op[i]=mp.pass[i].op;samp[i]=0xff;
+  int bad=0;
+  if(mp.pass[i].site!=0xff&&f_mp_site_sampler[mp.pass[i].site]==0xfeu)samp[i]=0xfe;
+  else if(mp.pass[i].site!=0xff){unsigned s=f_mp_site_sampler[mp.pass[i].site];for(unsigned j=0;j<mp.nsampler;++j)if(mp.sampler[j]==s)for(unsigned q=0;q<P->fs->nsampler;++q)if(!scmp(P->fs->sampler_names[q],mp.sampler_name[j]))samp[i]=(uint8_t)q;if(samp[i]==0xff)bad=1;}
+  if(!bad&&(mp_fs_text(i,col,uv,uvw,fst[i],sizeof fst[i])||mp_vs_text(i,col,decl_col,uv,uvw,decl_uv,mp_vs_has,P,decl[i],sizeof decl[i],add[i],sizeof add[i],0)))bad=1;
+  if(bad){if(i<n)return -1;acc_ok=0;}
+ }
+ uint32_t len=0;while(vbase[len])++len;
+ uint32_t close=len;while(close&&vbase[close-1]!='}')--close;   /* main() is the last body */
+ if(!close)return -1;
+ P->mp_n=P->mp_acc_n=0;
+ /* passes with the same shaders share one program (a pow chain repeats its pass) */
+ for(unsigned i=0;i<n+na;++i){
+  slot[i]=0;
+  for(unsigned j=0;j<i;++j)if(slot[j]&&!scmp(fst[j],fst[i])&&!scmp(decl[j],decl[i])&&!scmp(add[j],add[i])){slot[i]=slot[j];break;}
+ }
+ for(unsigned i=0;i<n;++i){
+  uint32_t q=slot[i]?slot[i]:mp_build_pass(c,P,vbase,close,decl[i],add[i],fst[i]);
+  if(!q){mp_release(c,P);return -1;}
+  slot[i]=(uint8_t)q;
+  P->mp_q[P->mp_n]=(uint8_t)q;P->mp_op[P->mp_n]=op[i];P->mp_sampler[P->mp_n]=samp[i];++P->mp_n;
+ }
+ for(unsigned i=n;i<n+na&&acc_ok;++i){
+  for(unsigned j=0;j<i;++j)if(slot[j]&&!scmp(fst[j],fst[i])&&!scmp(decl[j],decl[i])&&!scmp(add[j],add[i])){slot[i]=slot[j];break;}
+  uint32_t q=slot[i]?slot[i]:mp_build_pass(c,P,vbase,close,decl[i],add[i],fst[i]);
+  if(!q){acc_ok=0;break;}
+  slot[i]=(uint8_t)q;
+  P->mp_acc_q[P->mp_acc_n]=(uint8_t)q;P->mp_acc_op[P->mp_acc_n]=op[i];P->mp_acc_sampler[P->mp_acc_n]=samp[i];++P->mp_acc_n;
+ }
+ if(!acc_ok){
+  for(unsigned i=0;i<P->mp_acc_n;++i){int shared=0;for(unsigned j=0;j<P->mp_n;++j)if(P->mp_q[j]==P->mp_acc_q[i])shared=1;
+   if(!shared){gl2_prog_obj *Q=&c->pr[P->mp_acc_q[i]];Q->used=Q->ok=Q->executable=0;Q->mp_hidden=0;}}
+  P->mp_acc_n=0;
+  if(!n){mp_release(c,P);return -1;}
+ }
+ P->mp_blend_ok=blend_ok;P->mp_lut=lut;P->mp_lut.serial=++c->mp_lut_serial;   /* a relinked or reused program slot must not find the old program's table */
+ return 0;
+}
+/* ---- lookup-table generation (see gl2fmp.inc) ---- */
+/* No libm here, and a divide-based Newton square root made one table take 7 ms on the device
+ * (run-lut2): reciprocal square root from the exponent bits plus three multiply-only Newton steps. */
+static float mp_rsqf(float x){union{float f;uint32_t u;}v;v.f=x;v.u=0x5f3759dfu-(v.u>>1);float y=v.f,h=0.5f*x;y*=1.5f-h*y*y;y*=1.5f-h*y*y;y*=1.5f-h*y*y;return y;}
+static float mp_sqrtf(float x){return x>1e-30f?x*mp_rsqf(x):0;}
+static float mp_log2f(float x){union{float f;uint32_t u;}v;v.f=x;int e=(int)(v.u>>23&255u)-127;v.u=(v.u&0x7fffffu)|0x3f800000u;float m=v.f;
+ return (float)e+1.442695f*(-1.7417939f+(2.8212026f+(-1.4699568f+(0.44717955f-0.056570851f*m)*m)*m)*m);}   /* the quartic is ln(mantissa) */
+static float mp_exp2f(float x){if(x<-120)return 0;if(x>120)x=120;int i=(int)x;if((float)i>x)--i;float f=x-(float)i;
+ union{float f;uint32_t u;}v;v.u=(uint32_t)(i+127)<<23;return v.f*(1+f*(0.6931472f+f*(0.2402265f+f*(0.0555041f+f*0.0096181f))));}
+/* Runs instructions list[0..n) of L into r (all of them when list is null). */
+static void mp_lut_run(const gl2_mp_lut *L,float uni[16][4],const float d[3],float *r,const uint8_t *list,unsigned n){
+ for(unsigned q=0;q<n;++q){
+  const unsigned i=list?list[q]:q;
+  const gl2_mp_lut_insn *s=&L->code[i];float a=0,b=0,v=0;
+  if(s->op!=F_CONST&&s->op!=F_INPUT){a=r[s->a];b=r[s->b];}
+  switch(s->op){
+  case F_CONST:v=s->value;break;
+  case F_INPUT:v=s->a<3?d[s->a]:uni[(s->a-16u)>>2&15u][(s->a-16u)&3u];break;
+  case F_ADD:v=a+b;break;case F_SUB:v=a-b;break;case F_MUL:v=a*b;break;
+  case F_CLAMP:v=a<0?0:a>1?1:a;break;
+  default:switch(s->fn){
+   case FN_DIV:v=a/(b>0.0000305f?b:0.0000305f);break;   /* as the vertex form */
+   case FN_MIN:v=a<b?a:b;break;case FN_MAX:v=a>b?a:b;break;case FN_ABS:v=a<0?-a:a;break;
+   case FN_EXP:v=mp_exp2f(a*1.442695f);break;case FN_SQRT:v=mp_sqrtf(a);break;
+   case FN_RSQ:v=mp_rsqf(a>1e-12f?a:1e-12f);break;
+   case FN_FLOOR:{int k=(int)a;if((float)k>a)--k;v=(float)k;break;}
+   case FN_FRACT:{int k=(int)a;if((float)k>a)--k;v=a-(float)k;break;}
+   case FN_SIGN:v=a>0?1.f:a<0?-1.f:0;break;
+   case FN_STEP:v=b>=a?1.f:0;break;
+   case FN_POW:v=a>0?mp_exp2f(b*mp_log2f(a)):0;break;
+   default:v=0;}
+  }
+  r[i]=v;
+ }
+}
+/* The texture holding P's lookup table for the current uniform values. A table a queued frame may
+ * still sample cannot be rewritten (gl2tex.c tex_write_blocked), so tables live in a small ring
+ * keyed by program and uniform values; an unchanged table is reused. 0: none could be written. */
+static uint32_t mp_lut_texture(gl2_ctx *c,gl2_prog_obj *P){
+ static uint8_t px[GL2_MP_LUT_SIZE*GL2_MP_LUT_SIZE*4];
+ float uni[16][4];uint32_t key=2166136261u^P->mp_lut.serial*0x9e3779b9u;
+ for(unsigned u=0;u<16;++u){
+  unsigned s=P->mp_lut.usrc[u];const float *v=0;
+  if(s&0x80u)v=P->fragment_values[s&0x7fu];else if(s)v=P->prog.uval[s-1][0];
+  for(unsigned k=0;k<4;++k){uni[u][k]=v?v[k]:0;union{float f;uint32_t w;}q;q.f=uni[u][k];key=(key^q.w)*16777619u;}
+ }
+ key|=1u;
+ for(unsigned s=0;s<GL2_MP_LUT_RING;++s)if(c->mp_lut_tex[s]&&c->mp_lut_key[s]==key){c->mp_lut_used[s]=c->scene_serial;++c->mp_lut_stat[0];return c->mp_lut_tex[s];}
+ /* a slot no scene still being rendered can sample: never used, or last used two scenes ago
+  * (always, where no GPU backend guards texture memory) */
+ const unsigned ring=GL2_MP_LUT_RING-c->mp_lut_short;
+ unsigned slot=GL2_MP_LUT_RING;
+ for(unsigned q=0;q<ring&&slot==GL2_MP_LUT_RING;++q){
+  unsigned s=(c->mp_lut_next+q)%ring;
+  if(!c->mp_lut_tex[s]||!c->mp_lut_key[s]||!c->texture_write_guard||c->scene_serial-c->mp_lut_used[s]>=2u)slot=s;
+ }
+ if(slot==GL2_MP_LUT_RING){++c->mp_lut_stat[2];return 0;}
+ c->mp_lut_next=(uint8_t)((slot+1u)%ring);
+ const unsigned N=GL2_MP_LUT_SIZE;
+ static float dirs[GL2_MP_LUT_SIZE*GL2_MP_LUT_SIZE][3];static int dirs_ready;
+ if(!dirs_ready){   /* the direction of every texel, once. Sphere map: (uv - 0.5) * 2 = n.xy / sqrt(2 (1 + n.z)) */
+  for(unsigned y=0;y<N;++y)for(unsigned x=0;x<N;++x){
+   float qx=((float)x+0.5f)*(2.f/(float)N)-1,qy=((float)y+0.5f)*(2.f/(float)N)-1,r2=qx*qx+qy*qy;
+   if(r2>1){float k=mp_rsqf(r2);qx*=k;qy*=k;r2=1;}
+   float w=2*mp_sqrtf(1-r2),*d=dirs[y*N+x];d[0]=qx*w;d[1]=qy*w;d[2]=1-2*r2;
+  }
+  dirs_ready=1;
+ }
+ /* instructions that do not read the direction are the same for every texel: run them once */
+ const gl2_mp_lut *L=&P->mp_lut;float r[GL2_MP_LUT_INS];uint8_t dep[GL2_MP_LUT_INS],isdep[GL2_MP_LUT_INS];unsigned ndep=0;
+ for(unsigned i=0;i<L->n;++i){const gl2_mp_lut_insn *q=&L->code[i];
+  isdep[i]=q->op==F_INPUT?q->a<3u:q->op==F_CONST?0:(uint8_t)(isdep[q->a]|((q->op==F_CLAMP||(q->op==F_FN&&!q->b))?0:isdep[q->b]));
+  if(isdep[i])dep[ndep++]=(uint8_t)i;}
+ {static const float zero[3]={0,0,0};mp_lut_run(L,uni,zero,r,0,L->n);}
+ for(unsigned y=0;y<N;++y)for(unsigned x=0;x<N;++x){
+  mp_lut_run(L,uni,dirs[y*N+x],r,dep,ndep);
+  uint8_t *p=px+4u*(y*N+x);
+  for(unsigned k=0;k<3;++k){float v=r[L->out[k]]*255.f+0.5f;p[k]=(uint8_t)(v<0?0:v>255?255:v);}
+  p[3]=255;
+ }
+ const uint32_t active=c->active_texture,bind0=c->texture_binding[0],man0=c->texture_managed[0],err0=c->err,site0=c->err_site,aux0=c->err_aux,force0=c->texture_write_force;
+ uint32_t name=0;
+ c->err=0;   /* so a failure below can be told from an earlier application error (restored on every path out) */
+ const int fresh=!c->mp_lut_tex[slot];
+ glActiveTexture(c,GL_TEXTURE0);
+ if(!c->mp_lut_tex[slot]){
+  glGenTextures(c,1,&c->mp_lut_tex[slot]);glBindTexture(c,GL_TEXTURE_2D,c->mp_lut_tex[slot]);
+  glTexParameteri(c,GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);glTexParameteri(c,GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+  glTexParameteri(c,GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(c,GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+  if(c->err&&slot){   /* no texture object left: the ring ends here (run-lut4: a slot without a texture kept a stale table on screen) */
+   c->mp_lut_stat[3]=c->err<<16|(c->err_site&0xffffu);c->mp_lut_tex[slot]=0;c->mp_lut_short=(uint8_t)(GL2_MP_LUT_RING-slot);c->mp_lut_next=0;
+   c->err=err0;c->err_site=site0;c->err_aux=aux0;c->active_texture=active;c->texture_binding[0]=bind0;c->texture_managed[0]=man0;
+   return mp_lut_texture(c,P);
+  }
+ }else glBindTexture(c,GL_TEXTURE_2D,c->mp_lut_tex[slot]);
+ c->err=0;c->texture_write_force=1;   /* the slot test above is the guard: the generic one only clears when the GPU goes idle */
+ /* later repaints write in place: redefining the image took new arena storage every time */
+ if(fresh)glTexImage2D(c,GL_TEXTURE_2D,0,GL_RGBA,(int)N,(int)N,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
+ else glTexSubImage2D(c,GL_TEXTURE_2D,0,0,0,(int)N,(int)N,GL_RGBA,GL_UNSIGNED_BYTE,px);
+ c->texture_write_force=force0;
+ if(!c->err){c->mp_lut_key[slot]=key;c->mp_lut_used[slot]=c->scene_serial;name=c->mp_lut_tex[slot];++c->mp_lut_stat[1];}
+ else{c->mp_lut_key[slot]=0;c->mp_lut_stat[3]=c->err<<16|(c->err_site&0xffffu);}
+ c->err=err0;c->err_site=site0;c->err_aux=aux0;
+ c->active_texture=active;c->texture_binding[0]=bind0;c->texture_managed[0]=man0;
+ gl2_invalidate_state_cache(c);
+ return name;
+}
 void glLinkProgram(gl2_ctx *c,uint32_t p){
  gl2_prog_obj *P=prp(c,p);if(!P)return;
- static gl2_prog_obj candidate;candidate=*P;link_build(c,&candidate);
+ static gl2_prog_obj candidate;candidate=*P;candidate.mp_n=candidate.mp_acc_n=0;link_build(c,&candidate);
  if(!candidate.ok){P->ok=0;scpy(P->log,candidate.log,64);return;}
+ mp_release(c,P);
  *P=candidate;fs_rebase(P);gl2_program *g=&P->prog;
  g->code=&P->gpu_code[0][0];g->lit_idx=P->gpu_lit_idx;g->lit_val=&P->gpu_lit_val[0][0];g->uni_idx=P->vs.uni_idx;g->uni_cnt=P->vs.uni_cnt;g->clay_valid=0;sync_prog_target(c,P);
+ if(P->fs->mp&&mp_link(c,P)&&!P->fs->nplan){P->ok=P->executable=0;scpy(P->log,"multi-pass fragment shader does not link with this vertex shader",64);}
+ else if(P->mp_n)scpy(P->log,"linked:multi-pass combiner",64);
  gl2_invalidate_state_cache(c);
 }
+int gl2_program_passes_additive(gl2_ctx *c,uint32_t p){return c&&p&&p<GL2_MAX_PROGRAMS&&c->pr[p].used&&c->pr[p].ok?c->pr[p].mp_acc_n:0;}
+int gl2_program_passes(gl2_ctx *c,uint32_t p){return c&&p&&p<GL2_MAX_PROGRAMS&&c->pr[p].used&&c->pr[p].ok?(c->pr[p].mp_n?c->pr[p].mp_n:1):0;}
+const uint32_t *gl2_lut_stats(gl2_ctx *c){return c->mp_lut_stat;}
+void gl2_fragment_passes(gl2_ctx *c,int mode){if(c)c->mp_mode=(uint8_t)(mode<0?0:mode>2?2:mode);}
 int glIsProgram(gl2_ctx *c,uint32_t p){return p>0&&p<GL2_MAX_PROGRAMS&&c->pr[p].used;}
 void glDetachShader(gl2_ctx *c,uint32_t p,uint32_t sh){
  gl2_prog_obj *P=prp(c,p);gl2_shader *S=shp(c,sh);if(!P||!S)return;
@@ -616,6 +858,7 @@ void glDetachShader(gl2_ctx *c,uint32_t p,uint32_t sh){
 }
 static void program_release(gl2_ctx *c,uint32_t p){
  gl2_prog_obj *P=&c->pr[p];if(P->vsh)glDetachShader(c,p,P->vsh);if(P->fsh)glDetachShader(c,p,P->fsh);
+ mp_release(c,P);
  P->used=P->ok=P->executable=0;
 }
 void glDeleteProgram(gl2_ctx *c,uint32_t p){if(!p)return;gl2_prog_obj *P=prp(c,p);if(!P)return;P->delete_pending=1;gl2_invalidate_state_cache(c);if(c->cur!=p)program_release(c,p);}
@@ -1318,7 +1561,7 @@ static void draw_stream_i(gl2_ctx *c,gl2_prog_obj *p,uint32_t mode,uint32_t coun
         offset+=mode==GL_TRIANGLES?n:n-2u;
     }
 }
-void glDrawArrays(gl2_ctx *c, uint32_t mode, int first, int count) {
+static void draw_arrays_1(gl2_ctx *c, uint32_t mode, int first, int count) {
     if (first < 0) { err(c, GL_INVALID_VALUE); return; }
     gl2_prog_obj *p = draw_check(c, mode, count); if (!p) return;
     draw_stream(c,p,mode,(uint32_t)count,0,0,(uint32_t)first);
@@ -1357,7 +1600,13 @@ static int draw_prims(gl2_ctx *c,gl2_prog_obj *p,const uint16_t *lens,uint32_t n
     return 0;
 }
 #endif
-void glDrawElements(gl2_ctx *c, uint32_t mode, int count, uint32_t type, const void *indices) {
+/* Blending whose result is the same in any triangle order: dst + f(src) or dst * f(src). */
+static int blend_commutes(const gl2_state *st){
+    const uint32_t s=st->src,d=st->dst;
+    if(d==1u)return s==0u||s==1u||s==0x302u;                 /* additive: src factor does not read dst */
+    return (s==0x306u&&(d==0u||d==0x300u))||(s==0u&&(d==0x300u||d==0x301u));   /* multiply: dst*src, 2*dst*src, dst*(1-src) */
+}
+static void draw_elements_1(gl2_ctx *c, uint32_t mode, int count, uint32_t type, const void *indices) {
     if (type != GL_UNSIGNED_BYTE && type != GL_UNSIGNED_SHORT) { err(c, GL_INVALID_ENUM); return; }
     gl2_prog_obj *p = draw_check(c, mode, count); if (!p) return;
     uint32_t bytes = (uint32_t)count * (type == GL_UNSIGNED_BYTE ? 1u : 2u);
@@ -1367,8 +1616,13 @@ void glDrawElements(gl2_ctx *c, uint32_t mode, int count, uint32_t type, const v
         if (!b || !b->used || off > b->size || bytes > b->size - off) { err(c, GL_INVALID_OPERATION); return; }
         src = buf_data(c, b) + off;
 #if GL2_STRIP_POOL_WORDS
-        /* Opaque, depth-written lists from static buffers draw as cached strips. */
-        if (mode == GL_TRIANGLES && !c->soft_target && c->st.depth_test && c->st.depth_write && !c->st.blend && count >= 6) {
+        /* Lists from static buffers draw as cached strips with cached converted vertices when the
+         * result cannot depend on the order of the triangles within the draw (strips reorder them):
+         * opaque with depth writes, or blended without depth writes where the blend commutes
+         * (additive or multiply: a darkening or light pass over geometry already drawn), or a later
+         * pass of a multi-pass program. */
+        if (mode == GL_TRIANGLES && !c->soft_target && c->st.depth_test && count >= 6 &&
+            (c->st.blend ? (c->mp_later || (!c->st.depth_write && blend_commutes(&c->st))) : c->st.depth_write)) {
             uint32_t len = 0;
             uint32_t nidx = 0;
             gl2_strip_entry *se = 0;
@@ -1384,6 +1638,70 @@ void glDrawElements(gl2_ctx *c, uint32_t mode, int count, uint32_t type, const v
         src = indices;
     }
     draw_stream(c,p,mode,(uint32_t)count,src,type,0);
+}
+/* A multi-pass program: the same draw once per pass program. Pass 1 keeps the application's
+ * state; later passes blend into what it left (add, multiply or invert), without depth writes and
+ * with a depth test that accepts the depth pass 1 wrote. */
+static void mp_draw(gl2_ctx *c,gl2_prog_obj *P,uint32_t mode,int first,int count,uint32_t type,const void *indices,int elements){
+    const gl2_state st=c->st;const uint32_t cur_prog=c->cur;float kv=0;
+    uint32_t lut=0;
+    if(P->mp_lut.on){
+        lut=mp_lut_texture(c,P);
+        if(!lut){uint32_t best=0;for(unsigned s=0;s<GL2_MP_LUT_RING;++s)if(c->mp_lut_tex[s]&&c->mp_lut_key[s]&&(!lut||c->mp_lut_used[s]>=best)){lut=c->mp_lut_tex[s];best=c->mp_lut_used[s];}}   /* every table busy: the newest one, not a failed draw */
+        if(!lut){err(c,GL_OUT_OF_MEMORY);return;}
+    }
+    /* an additive (ONE/ONE) draw of a product with a dot product: the destination-alpha list */
+    const int acc=st.blend&&st.src==1&&st.dst==1&&P->mp_acc_n>0;
+    const unsigned np=acc?P->mp_acc_n:P->mp_n;const uint8_t *qs=acc?P->mp_acc_q:P->mp_q,*ops=acc?P->mp_acc_op:P->mp_op,*sms=acc?P->mp_acc_sampler:P->mp_sampler;
+    if(!acc&&!P->mp_n){err(c,GL_INVALID_OPERATION);return;}   /* only an additive (ONE/ONE) draw can run this shader */
+    if(st.blend&&!acc){
+        int ok=P->mp_blend_ok&&((st.src==0x302&&(st.dst==0x303||st.dst==1))||(st.src==1&&(st.dst==1||st.dst==0x303)));
+        if(P->mp_n>1&&!ok){err(c,GL_INVALID_OPERATION);return;}
+        kv=st.src==0x302?1.f:0.f;
+    }
+    for(unsigned i=0;i<np;++i){
+        gl2_prog_obj *Q=&c->pr[qs[i]];
+        for(uint32_t u=0;u<Q->prog.nuni;++u){
+            unsigned s=Q->mp_usrc[u];
+            if(s==0xffu)gl2_uniform4f(&Q->prog,(int)u,kv,0,0,0);
+            else if(s&0x80u){const float *v=P->fragment_values[s&0x7fu];gl2_uniform4f(&Q->prog,(int)u,v[0],v[1],v[2],v[3]);}
+            else if(s&&P->prog.uset[s-1]){for(unsigned r=0;r<4;++r)for(unsigned k=0;k<4;++k)Q->prog.uval[u][r][k]=P->prog.uval[s-1][r][k];if(!Q->prog.uset[u]){Q->prog.uset[u]=1;Q->prog.clay_valid=0;}}
+        }
+        const uint32_t bind1=c->texture_binding[1],man1=c->texture_managed[1];
+        if(sms[i]==0xfe){Q->sampler_unit[0]=1;c->texture_binding[1]=lut;c->texture_managed[1]=1;}   /* this pass reads the lookup table: lend it unit 1 */
+        else if(sms[i]!=0xff)Q->sampler_unit[0]=P->sampler_unit[sms[i]];
+        c->st=st;
+        if(acc){
+            unsigned op=ops[i];
+            if(i){c->st.depth_write=0;if(st.depth_test&&st.depth_write){if(st.depth_func==0x201)c->st.depth_func=0x203;else if(st.depth_func==0x204)c->st.depth_func=0x206;}}
+            if(op==MP_SETA||op==MP_ADD){c->st.src=1;c->st.dst=1;}
+            else if(op==MP_MULA){c->st.src=0;c->st.dst=0x300;}
+            else{c->st.src=0x304;c->st.dst=1;}
+        }
+        else if(i){
+            unsigned op=ops[i];
+            c->st.blend=1;c->st.depth_write=0;
+            if(st.depth_test&&st.depth_write){if(st.depth_func==0x201)c->st.depth_func=0x203;else if(st.depth_func==0x204)c->st.depth_func=0x206;}
+            if(op==MP_MUL){c->st.src=0x306;c->st.dst=0;}
+            else if(op==MP_INV){c->st.src=0x307;c->st.dst=0;}
+            else if(op==MP_SQ){c->st.src=0;c->st.dst=0x304;}     /* framebuffer times its own alpha */
+            else if(op==MP_SETA){c->st.src=1;c->st.dst=1;}
+            else if(st.blend){c->st.src=st.src;c->st.dst=1;}
+            else{c->st.src=1;c->st.dst=1;}
+        }
+        c->cur=qs[i];c->mp_later=i>0||acc;gl2_invalidate_state_cache(c);
+        if(elements)draw_elements_1(c,mode,count,type,indices);else draw_arrays_1(c,mode,first,count);
+        c->texture_binding[1]=bind1;c->texture_managed[1]=man1;
+    }
+    c->st=st;c->cur=cur_prog;c->mp_later=0;gl2_invalidate_state_cache(c);
+}
+void glDrawArrays(gl2_ctx *c, uint32_t mode, int first, int count) {
+    if(c->cur&&c->cur<GL2_MAX_PROGRAMS&&c->pr[c->cur].used&&c->pr[c->cur].executable&&(c->pr[c->cur].mp_n||c->pr[c->cur].mp_acc_n)){mp_draw(c,&c->pr[c->cur],mode,first,count,0,0,0);return;}
+    draw_arrays_1(c,mode,first,count);
+}
+void glDrawElements(gl2_ctx *c, uint32_t mode, int count, uint32_t type, const void *indices) {
+    if(c->cur&&c->cur<GL2_MAX_PROGRAMS&&c->pr[c->cur].used&&c->pr[c->cur].executable&&(c->pr[c->cur].mp_n||c->pr[c->cur].mp_acc_n)){mp_draw(c,&c->pr[c->cur],mode,0,count,type,indices,1);return;}
+    draw_elements_1(c,mode,count,type,indices);
 }
 /* ---------------------------------------------------------------- queries */
 static unsigned query_int(gl2_ctx *c, uint32_t pname, int *v) {

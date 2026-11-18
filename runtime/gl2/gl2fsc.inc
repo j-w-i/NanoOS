@@ -5,7 +5,7 @@
 #define F_NODES 768
 #define F_TABLE 2048
 #define F_SYMBOLS 48
-enum { F_CONST=1,F_INPUT,F_ADD,F_MUL,F_SUB,F_CLAMP };
+enum { F_CONST=1,F_INPUT,F_ADD,F_MUL,F_SUB,F_CLAMP,F_FN };
 typedef struct {uint16_t a,b,slot;uint32_t deps;uint8_t op;float value,lo,hi;} f_node;
 typedef struct {uint16_t v[4];uint8_t w,kind,index;} f_value; /* kind0 expression,1 UV,2 sampler */
 typedef struct {char name[32];f_value value;uint8_t storage,slot;} f_symbol;
@@ -17,6 +17,14 @@ static struct {const char *cursor;char token[32];char *log;int error,depth;uint1
 #define F_EXTRA_BASE GL2_SOFT_INPUTS
 static char f_extra_name[4][32];static unsigned f_extra_n,f_fold_lane;static int f_fold_j[4],f_fold_k[4];static float f_fold_c[4];  /* per colour lane constant folded into vDiffuse (1 = none) */
 static int f_tex_sampler=-1;  /* the one sampler texture2D uses */
+/* Multi-pass mode (gl2fmp.inc): every varying and uniform is a plain named input, texture2D takes any
+ * per-vertex UV expression (a "site"), builtins become exact F_FN nodes instead of approximations.
+ * f_lossy: the single-pass parse approximated something (so its plan is not exact). */
+#define F_MP_VARY 96u
+#define F_MP_SITE 128u
+#define F_MP_SITES 8u
+enum{FN_DIV=1,FN_MIN,FN_MAX,FN_ABS,FN_EXP,FN_SQRT,FN_RSQ,FN_FLOOR,FN_FRACT,FN_SIN,FN_COS,FN_SIGN,FN_STEP,FN_POW};   /* FN_POW: lookup tables only (no vertex form) */
+static int f_mp,f_lossy;static unsigned f_mp_nvary,f_mp_nsite;static char f_mp_vname[8][32],f_mp_uname[16][32];static uint8_t f_mp_vw[8],f_mp_uw[16],f_mp_site_sampler[F_MP_SITES];static uint16_t f_mp_site_uv[F_MP_SITES][2];
 static int f_fog_j=-1,f_fog_k;static uint8_t f_fog_mask;  /* fog factor folded per vertex (see gl2_fs_entry.fog_name) */
 /* t of a stripped mix(fog, colour, t) when it is one component of an extra varying: record it
  * as the fog fold (one varying component for all lanes) and report success. */
@@ -53,10 +61,11 @@ static uint16_t f_intern(unsigned op,unsigned a,unsigned b,float value){
  uint32_t hash=(op*0x9e3779b9u)^(a*0x85ebca6bu)^(b*0xc2b2ae35u)^f_bits(value);unsigned slot=hash&(F_TABLE-1);
  while(f.table[slot]){unsigned i=f.table[slot];f_node *n=&f.nodes[i];if(n->op==op&&n->a==a&&n->b==b&&f_bits(n->value)==f_bits(value))return(uint16_t)i;slot=(slot+1)&(F_TABLE-1);}
  if(f.n+1>=F_NODES){f_fail("fragment expression exceeds node limit");return 1;}
- unsigned i=++f.n;f_node *n=&f.nodes[i];n->op=(uint8_t)op;n->a=(uint16_t)a;n->b=(uint16_t)b;n->value=value;n->slot=(uint16_t)slot;n->deps=op==F_INPUT?(1u<<(a<8?a:8+(a-8)/4)):op==F_CONST?0:(f.nodes[a].deps|(op==F_CLAMP?0:f.nodes[b].deps));
+ unsigned i=++f.n;f_node *n=&f.nodes[i];n->op=(uint8_t)op;n->a=(uint16_t)a;n->b=(uint16_t)b;n->value=value;n->slot=(uint16_t)slot;n->deps=op==F_INPUT?(a<8?1u<<a:a<F_MP_VARY?1u<<(8+(a-8)/4):a>=F_MP_SITE?1u<<((a-F_MP_SITE)/4):0):op==F_CONST?0:(f.nodes[a].deps|(op==F_CLAMP?0:f.nodes[b].deps));
  if(op==F_CONST)n->lo=n->hi=value;
  else if(op==F_INPUT){n->lo=0;n->hi=1;}
  else if(op==F_CLAMP){n->lo=0;n->hi=1;}
+ else if(op==F_FN){n->lo=-1e30f;n->hi=1e30f;}
  else{f_node *x=&f.nodes[a],*y=&f.nodes[b];if(op==F_ADD){n->lo=x->lo+y->lo;n->hi=x->hi+y->hi;}else if(op==F_SUB){n->lo=x->lo-y->hi;n->hi=x->hi-y->lo;}else{float v[4]={x->lo*y->lo,x->lo*y->hi,x->hi*y->lo,x->hi*y->hi};n->lo=n->hi=v[0];for(unsigned k=1;k<4;++k){if(v[k]<n->lo)n->lo=v[k];if(v[k]>n->hi)n->hi=v[k];}}}
  f.table[slot]=(uint16_t)i;return(uint16_t)i;
 }
@@ -103,6 +112,32 @@ static float f_number(void){
  return v;
 }
 static f_value f_expr(void);
+static f_value f_mp_fn2(unsigned code,f_value a,f_value b){
+ f_value v=f_zero();if(a.kind||b.kind||(a.w!=b.w&&a.w!=1&&b.w!=1)){f_fail("fragment builtin argument mismatch");return v;}
+ v.w=a.w>b.w?a.w:b.w;for(unsigned k=0;k<v.w;++k)v.v[k]=f_intern(F_FN,a.v[a.w==1?0:k],b.v[b.w==1?0:k],(float)code);return v;
+}
+static f_value f_mp_fn1(unsigned code,f_value a){f_value v=a;if(a.kind){f_fail("fragment builtin argument mismatch");return f_zero();}for(unsigned k=0;k<v.w;++k)v.v[k]=f_intern(F_FN,a.v[k],0,(float)code);return v;}
+static f_value f_mp_dot(f_value a,f_value b){f_value d=f_zero();if(a.kind||b.kind||a.w!=b.w){f_fail("fragment dot argument mismatch");return d;}for(unsigned k=0;k<a.w;++k)d.v[0]=f_op(F_ADD,d.v[0],f_op(F_MUL,a.v[k],b.v[k]));return d;}
+static f_value f_mp_k(float x){f_value v=f_zero();v.v[0]=f_const(x);return v;}
+/* Exact builtins for multi-pass mode. Returns 1 when the name was handled (*out set, or an error raised). */
+static int f_mp_call(const char *name,const f_value *a,unsigned n,f_value *out){
+ static const char *const u1[]={"abs","exp","sqrt","inversesqrt","floor","fract","sin","cos","sign"};static const uint8_t c1[]={FN_ABS,FN_EXP,FN_SQRT,FN_RSQ,FN_FLOOR,FN_FRACT,FN_SIN,FN_COS,FN_SIGN};
+ for(unsigned i=0;i<9;++i)if(!scmp(name,u1[i])){if(n!=1){f_fail("fragment builtin argument mismatch");return 1;}*out=f_mp_fn1(c1[i],a[0]);return 1;}
+ if(!scmp(name,"min")||!scmp(name,"max")||!scmp(name,"step")){if(n!=2){f_fail("fragment builtin argument mismatch");return 1;}*out=f_mp_fn2(!scmp(name,"min")?FN_MIN:!scmp(name,"max")?FN_MAX:FN_STEP,a[0],a[1]);return 1;}
+ if(!scmp(name,"length")){if(n!=1){f_fail("fragment builtin argument mismatch");return 1;}*out=f_mp_fn1(FN_SQRT,f_mp_dot(a[0],a[0]));return 1;}
+ if(!scmp(name,"distance")){if(n!=2){f_fail("fragment builtin argument mismatch");return 1;}f_value d=f_binary(F_SUB,a[0],a[1]);*out=f_mp_fn1(FN_SQRT,f_mp_dot(d,d));return 1;}
+ if(!scmp(name,"normalize")){if(n!=1){f_fail("fragment builtin argument mismatch");return 1;}*out=f_binary(F_MUL,a[0],f_mp_fn1(FN_RSQ,f_mp_dot(a[0],a[0])));return 1;}
+ if(!scmp(name,"clamp")){if(n!=3){f_fail("fragment clamp argument mismatch");return 1;}
+  int unit=1;for(unsigned k=0;k<a[1].w;++k)if(!f_is(a[1].v[k],0))unit=0;for(unsigned k=0;k<a[2].w;++k)if(!f_is(a[2].v[k],1))unit=0;
+  if(unit)return 0;
+  *out=f_mp_fn2(FN_MIN,f_mp_fn2(FN_MAX,a[0],a[1]),a[2]);return 1;}
+ if(!scmp(name,"smoothstep")){if(n!=3){f_fail("fragment smoothstep argument mismatch");return 1;}
+  f_value t=f_mp_fn2(FN_DIV,f_binary(F_SUB,a[2],a[0]),f_binary(F_SUB,a[1],a[0]));if(f.error)return 1;for(unsigned k=0;k<t.w;++k)t.v[k]=f_intern(F_CLAMP,t.v[k],0,0);
+  *out=f_binary(F_MUL,f_binary(F_MUL,t,t),f_binary(F_SUB,f_mp_k(3),f_binary(F_MUL,f_mp_k(2),t)));return 1;}
+ if(!scmp(name,"pow")){if(n!=2){f_fail("fragment builtin argument mismatch");return 1;}*out=f_mp_fn2(FN_POW,a[0],a[1]);return 1;}
+ if(!scmp(name,"mod")){f_fail("fragment builtin has no exact GPU form");return 1;}
+ return 0;
+}
 static f_value f_primary(void){
  f_value v=f_zero();
  if(f_eq("(")){f_next();v=f_expr();f_eat(")");}
@@ -114,6 +149,10 @@ static f_value f_primary(void){
    * centre sample (unblurred) instead of the whole program failing to link. */
   if(!scmp(name,"texture2D")&&f_eq("(")){f_next();f_value s0=f_expr();f_eat(",");
    if(!f.error&&s0.kind!=2){f_fail("texture2D needs a sampler");return v;}
+   if(f_mp){f_value uv=f_expr();f_eat(")");if(f.error)return v;if(uv.kind||uv.w<2){f_fail("texture2D needs a vec2 coordinate");return v;}
+    unsigned si=0;for(;si<f_mp_nsite;++si)if(f_mp_site_sampler[si]==s0.index&&f_mp_site_uv[si][0]==uv.v[0]&&f_mp_site_uv[si][1]==uv.v[1])break;
+    if(si==f_mp_nsite){if(si>=F_MP_SITES){f_fail("too many texture lookups");return v;}f_mp_site_sampler[si]=s0.index;f_mp_site_uv[si][0]=uv.v[0];f_mp_site_uv[si][1]=uv.v[1];++f_mp_nsite;}
+    v.w=4;for(unsigned k=0;k<4;++k)v.v[k]=f_intern(F_INPUT,F_MP_SITE+4*si+k,0,0);goto postfix;}
    if(f_tex_sampler<0)f_tex_sampler=s0.index;else if(f_tex_sampler!=s0.index){f_fail("fragment compiler currently supports one sampler");return v;}
    /* A single identifier (optionally swizzled) parses as before: a UV varying or a local
     * holding one. Anything longer is an offset tap. */
@@ -121,25 +160,26 @@ static f_value f_primary(void){
     if(*c=='.'){++c;while((*c>='a'&&*c<='z')||(*c>='A'&&*c<='Z'))++c;while(*c==' '||*c=='\t'||*c=='\n'||*c=='\r')++c;}direct=*c==')';}
    if(direct){f_value uv=f_expr();if(f.error)return v;if(uv.kind!=1||uv.w!=2){f_fail("texture2D needs direct sampler and UV varying");return v;}if(uv.index!=3){f_fail("fragment lowering currently needs texture0/UV0");return v;}}
    else{int depth=1,uv0=0;while(!f.error&&f.token[0]){if(f_eq("("))++depth;else if(f_eq(")")&&--depth==0)break;{int si=f_find(f.token);if(si>=0&&f.symbols[si].storage==1&&f.symbols[si].slot==3)uv0=1;}f_next();}
-    if(!uv0){f_fail("texture2D needs a UV0 varying");return v;}f.out->e.uv_approx=1;}
+    if(!uv0){f_fail("texture2D needs a UV0 varying");return v;}f.out->e.uv_approx=1;f_lossy=1;}
    f_eat(")");v.w=4;for(unsigned k=0;k<4;++k)v.v[k]=f_intern(F_INPUT,4+k,0,0);goto postfix;}
   /* textureCube: the MBX path has no cube maps; the environment term is approximated by
    * white, so the result is the colour it is multiplied by (OpenLara crystals, Midas gold). */
-  if(!scmp(name,"textureCube")&&f_eq("(")){int depth=1;f_next();while(!f.error&&f.token[0]){if(f_eq("("))++depth;else if(f_eq(")")&&--depth==0)break;f_next();}
+  if(!scmp(name,"textureCube")&&f_eq("(")){if(f_mp){f_fail("no cube maps");return v;}f_lossy=1;int depth=1;f_next();while(!f.error&&f.token[0]){if(f_eq("("))++depth;else if(f_eq(")")&&--depth==0)break;f_next();}
    f_eat(")");f.out->e.uv_approx=1;v.w=4;for(unsigned k=0;k<4;++k)v.v[k]=f_const(1);goto postfix;}
   if(f_eq("(")){f_next();f_value args[8];unsigned count=0;if(!f_eq(")"))for(;;){if(count>=8){f_fail("too many fragment arguments");break;}args[count++]=f_expr();if(!f_eq(","))break;f_next();}f_eat(")");int width=f_width(name);
    if(width){v.w=(uint8_t)width;unsigned n=0;for(unsigned a=0;a<count;++a){if(args[a].kind){f_fail("sampler/UV fragment constructor unsupported");break;}for(unsigned k=0;k<args[a].w;++k)if(n<4)v.v[n++]=args[a].v[k];else++n;}
     if(count==1&&args[0].w==1){for(int k=0;k<width;++k)v.v[k]=args[0].v[0];}
     else if(n<(unsigned)width||(n>(unsigned)width&&count!=1))f_fail("fragment constructor width mismatch");
+   }else if(f_mp&&f_mp_call(name,args,count,&v)){
    }else if(!scmp(name,"texture2D")){if(count!=2||args[0].kind!=2||args[1].kind!=1||args[1].w!=2){f_fail("texture2D needs direct sampler and UV varying");return v;}if(args[0].index||args[1].index!=3){f_fail("fragment lowering currently needs texture0/UV0");return v;}v.w=4;for(unsigned k=0;k<4;++k)v.v[k]=f_intern(F_INPUT,4+k,0,0);}
    else if(!scmp(name,"reflect")){if(count!=2||args[0].kind||args[1].kind||args[0].w!=args[1].w){f_fail("fragment reflect argument mismatch");return v;}f_value d=f_zero();for(unsigned k=0;k<args[0].w;++k)d.v[0]=f_op(F_ADD,d.v[0],f_op(F_MUL,args[0].v[k],args[1].v[k]));v=args[0];for(unsigned k=0;k<v.w;++k)v.v[k]=f_op(F_SUB,args[0].v[k],f_op(F_MUL,f_op(F_MUL,f_const(2),d.v[0]),args[1].v[k]));}
    else if(!scmp(name,"dot")){if(count!=2||args[0].kind||args[1].kind||args[0].w!=args[1].w){f_fail("fragment dot argument mismatch");return v;}v=f_zero();for(unsigned k=0;k<args[0].w;++k)v.v[0]=f_op(F_ADD,v.v[0],f_op(F_MUL,args[0].v[k],args[1].v[k]));}
     else if(!scmp(name,"mix")){if(count!=3||args[0].w!=args[1].w||args[0].kind||args[1].kind||args[2].kind||(args[2].w!=1&&args[2].w!=args[0].w)){f_fail("fragment mix argument mismatch");return v;}f_value one=f_zero();one.v[0]=f_const(1);v=f_binary(F_ADD,f_binary(F_MUL,args[0],f_binary(F_SUB,one,args[2])),f_binary(F_MUL,args[1],args[2]));}
    else if(!scmp(name,"clamp")){if(count!=3||args[0].kind||args[1].kind||args[2].kind||(args[1].w!=1&&args[1].w!=args[0].w)||(args[2].w!=1&&args[2].w!=args[0].w)){f_fail("fragment clamp argument mismatch");return v;}v=args[0];for(unsigned k=0;k<v.w;++k){if(!f_is(args[1].v[args[1].w==1?0:k],0)||!f_is(args[2].v[args[2].w==1?0:k],1)){f_fail("fragment clamp needs0and1 limits");break;}v.v[k]=f_intern(F_CLAMP,v.v[k],0,0);}}
-   else if(!scmp(name,"normalize")){if(count!=1||args[0].kind){f_fail("fragment normalize argument mismatch");return v;}v=args[0];}
-   else if(!scmp(name,"length")||!scmp(name,"abs")||!scmp(name,"exp")){if(count!=1||args[0].kind){f_fail("fragment builtin argument mismatch");return v;}v=args[0];if(!scmp(name,"length"))v.w=1;}
-   else if(!scmp(name,"min")||!scmp(name,"max")||!scmp(name,"step")||!scmp(name,"pow")||!scmp(name,"reflect")){if(count!=2||args[0].kind||args[1].kind){f_fail("fragment builtin argument mismatch");return v;}v=args[0];}
-   else if(!scmp(name,"smoothstep")){if(count!=3||args[0].kind||args[1].kind||args[2].kind){f_fail("fragment smoothstep argument mismatch");return v;}v=args[2];}
+   else if(!scmp(name,"normalize")){f_lossy=1;if(count!=1||args[0].kind){f_fail("fragment normalize argument mismatch");return v;}v=args[0];}
+   else if(!scmp(name,"length")||!scmp(name,"abs")||!scmp(name,"exp")){f_lossy=1;if(count!=1||args[0].kind){f_fail("fragment builtin argument mismatch");return v;}v=args[0];if(!scmp(name,"length"))v.w=1;}
+   else if(!scmp(name,"min")||!scmp(name,"max")||!scmp(name,"step")||!scmp(name,"pow")||!scmp(name,"reflect")){f_lossy=1;if(count!=2||args[0].kind||args[1].kind){f_fail("fragment builtin argument mismatch");return v;}v=args[0];}
+   else if(!scmp(name,"smoothstep")){f_lossy=1;if(count!=3||args[0].kind||args[1].kind||args[2].kind){f_fail("fragment smoothstep argument mismatch");return v;}v=args[2];}
    else if(f_func_find(name)>=0)v=f_call_user(f_func_find(name),args,count);
    else f_fail("fragment builtin needs broader execution path");
   }else{
@@ -161,7 +201,9 @@ static f_value f_primary(void){
  return v;
 }
 static f_value f_unary(void){if(++f.depth>32){f_fail("fragment nesting exceeds32");--f.depth;return f_zero();}f_value v;if(f_eq("-")||f_eq("+")){int neg=f_eq("-");f_next();v=f_unary();if(neg){f_value zero=f_zero();v=f_binary(F_SUB,zero,v);}}else v=f_primary();--f.depth;return v;}
-static f_value f_product(void){f_value v=f_unary();while(!f.error&&(f_eq("*")||f_eq("/"))){int div=f_eq("/");f_next();f_value b=f_unary();if(div){if(v.kind==1&&b.kind==1){if(v.index==b.index&&v.index>=3&&v.index<=4)f.out->e.uv_divide|=(uint8_t)(1u<<(v.index-3));continue;}if(b.kind){f_fail("fragment division by sampler/UV");break;}for(unsigned k=0;k<b.w;++k){f_node *n=&f.nodes[b.v[k]];if(n->op!=F_CONST||!n->value){f_fail("fragment division needs nonzero constants");break;}b.v[k]=f_const(1/n->value);}}v=f_binary(F_MUL,v,b);}return v;}
+static f_value f_product(void){f_value v=f_unary();while(!f.error&&(f_eq("*")||f_eq("/"))){int div=f_eq("/");f_next();f_value b=f_unary();if(div){if(v.kind==1&&b.kind==1){if(v.index==b.index&&v.index>=3&&v.index<=4)f.out->e.uv_divide|=(uint8_t)(1u<<(v.index-3));continue;}if(b.kind){f_fail("fragment division by sampler/UV");break;}
+  if(f_mp){int cst=1;for(unsigned k=0;k<b.w;++k)if(f.nodes[b.v[k]].op!=F_CONST||!f.nodes[b.v[k]].value)cst=0;if(!cst){v=f_mp_fn2(FN_DIV,v,b);continue;}}
+  for(unsigned k=0;k<b.w;++k){f_node *n=&f.nodes[b.v[k]];if(n->op!=F_CONST||!n->value){f_fail("fragment division needs nonzero constants");break;}b.v[k]=f_const(1/n->value);}}v=f_binary(F_MUL,v,b);}return v;}
 static f_value f_expr(void){f_value v=f_product();while(!f.error&&(f_eq("+")||f_eq("-"))){unsigned op=f_eq("+")?F_ADD:F_SUB;f_next();v=f_binary(op,v,f_product());}return v;}
 static void f_precision(void){if(f_eq("lowp")||f_eq("mediump")||f_eq("highp"))f_next();}
 static void f_symbol_add(const char *name,f_value value,unsigned storage,unsigned slot){if(!f_valid_name(name)){f_fail("reserved fragment declaration name");return;}{int d=f_find(name);if(d>=0&&(unsigned)d>=f_scope){f_fail("duplicate fragment symbol");return;}}if(f.ns>=F_SYMBOLS){f_fail("too many fragment symbols");return;}f_symbol *s=&f.symbols[f.ns++];scpy(s->name,name,32);s->value=value;s->storage=(uint8_t)storage;s->slot=(uint8_t)slot;}
@@ -169,8 +211,8 @@ static void f_symbol_add(const char *name,f_value value,unsigned storage,unsigne
 static int f_statements(f_value *outp,unsigned *assignedp,f_value *ret){
  f_value output=*outp;unsigned assigned=*assignedp;
  while(!f.error&&!f_eq("}")&&f.token[0]){
-  if(f_eq("{")){f_next();int bd=1;while(!f.error&&bd>0&&f.token[0]){if(f_eq("{"))++bd;else if(f_eq("}"))--bd;f_next();}continue;}
-  else if(f_eq("if")){f_next();f_eat("(");int pd=1;while(!f.error&&pd>0&&f.token[0]){if(f_eq("("))++pd;else if(f_eq(")"))--pd;f_next();}if(f_eq("discard")){f_next();f_eat(";");}continue;}
+  if(f_eq("{")){if(f_mp){f_fail("nested block");break;}f_lossy=1;f_next();int bd=1;while(!f.error&&bd>0&&f.token[0]){if(f_eq("{"))++bd;else if(f_eq("}"))--bd;f_next();}continue;}
+  else if(f_eq("if")){f_next();f_eat("(");int pd=1;while(!f.error&&pd>0&&f.token[0]){if(f_eq("("))++pd;else if(f_eq(")"))--pd;f_next();}if(f_eq("discard")){f_next();f_eat(";");}else{f_lossy=1;if(f_mp){f_fail("conditional");break;}}continue;}
   if(f_eq("return")){if(!ret){f_fail("return outside a fragment function");break;}f_next();*ret=f_expr();f_eat(";");return 1;}
   if(f_eq("const"))f_next();
   f_precision();int width=f_width(f.token);char name[32];if(width)f_next();
@@ -192,6 +234,7 @@ static int f_statements(f_value *outp,unsigned *assignedp,f_value *ret){
    f_value *dst=&f.symbols[i].value;
    if(!nl){
     if(cop==99&&dst->kind==1&&v.kind==1){if(dst->index==v.index&&v.index>=3&&v.index<=4)f.out->e.uv_divide|=(uint8_t)(1u<<(v.index-3));continue;}
+    if(cop==99&&f_mp&&!v.kind&&!dst->kind&&(v.w==dst->w||v.w==1)){*dst=f_mp_fn2(FN_DIV,*dst,v);continue;}
     if(cop==99){f_fail("invalid fragment /= assignment");break;}
     if(cop){v=f_binary(cop,*dst,v);}
     if(v.w!=dst->w){f_fail("invalid fragment assignment");break;}
@@ -236,10 +279,12 @@ static f_value f_parse(const char *source){
    if(f_eq("{")&&f_nfuncs<F_FUNCS&&f_func_find(fname)<0){scpy(f_funcs[f_nfuncs].name,fname,32);f_funcs[f_nfuncs].params=params;f_funcs[f_nfuncs].body=f.cursor;++f_nfuncs;}
    f_eat("{");int bd=1;while(!f.error&&bd>0&&f.token[0]){if(f_eq("{"))++bd;else if(f_eq("}"))--bd;f_next();}continue;}f_fail("unsupported fragment global declaration");break;}
   unsigned storage=f_eq("uniform")?2:f_eq("varying")?1:0;if(!storage){f_fail("unsupported fragment global declaration");break;}f_next();f_precision();int ismat=(f_eq("mat4")||f_eq("mat3")||f_eq("mat2"));int sampler=f_eq("sampler2D")||f_eq("samplerCube"),width=f_width(f.token);f_next();char name[32];f_name(name);
-  if(f_eq("[")){while(!f.error&&!f_eq("]")&&f.token[0])f_next();f_eat("]");}
-  f_eat(";");if(storage==2&&ismat)continue;f_value v=f_zero();unsigned slot=0;
+  int isarr=0;if(f_eq("[")){isarr=1;while(!f.error&&!f_eq("]")&&f.token[0])f_next();f_eat("]");}
+  f_eat(";");if(storage==2&&ismat)continue;if(f_mp&&isarr)continue;f_value v=f_zero();unsigned slot=0;
+  if(f_mp&&storage==1){if(sampler||!width||f_mp_nvary>=8){f_fail("unsupported fragment varying type");break;}
+   unsigned j=f_mp_nvary++;scpy(f_mp_vname[j],name,32);f_mp_vw[j]=(uint8_t)width;v.w=(uint8_t)width;for(int k=0;k<width;++k)v.v[k]=f_intern(F_INPUT,F_MP_VARY+4*j+(unsigned)k,0,0);f_symbol_add(name,v,1,0);continue;}
   if(storage==2){if(sampler){if(f.nsampler>=4){f_fail("fragment sampler limit4");break;}v.kind=2;v.index=(uint8_t)f.nsampler++;}
-   else{if(!width){f_fail("unsupported fragment uniform type");break;}if(f.nuniform>=16){f_fail("fragment uniform limit16");break;}v.w=(uint8_t)width;v.index=(uint8_t)f.nuniform++;storage=3;for(int k=0;k<width;++k)v.v[k]=f_intern(F_INPUT,GL2_SOFT_UNIFORM_BASE+4*v.index+(unsigned)k,0,0);}
+   else{if(!width){f_fail("unsupported fragment uniform type");break;}if(f.nuniform>=16){f_fail("fragment uniform limit16");break;}v.w=(uint8_t)width;v.index=(uint8_t)f.nuniform++;storage=3;scpy(f_mp_uname[v.index],name,32);f_mp_uw[v.index]=(uint8_t)width;for(int k=0;k<width;++k)v.v[k]=f_intern(F_INPUT,GL2_SOFT_UNIFORM_BASE+4*v.index+(unsigned)k,0,0);}
   }
   else{if(sampler||!width){f_fail("unsupported fragment varying type");break;}v.w=(uint8_t)width;
    if((!scmp(name,"vColor")&&width!=4)||((!scmp(name,"vTexCoord")||!scmp(name,"vTexCoord1"))&&width!=2&&width!=4)){f_fail("reserved fragment varying type mismatch");}
@@ -347,7 +392,7 @@ static unsigned f_candidates(uint16_t root,unsigned channel,uint16_t *ids){
  }
  return count;
 }
-static int f_lower_two(f_value target,uint8_t plan[2][12],uint8_t alpha[2][12]){
+static int f_lower_two(f_value target,uint8_t (*plan)[12],uint8_t (*alpha)[12]){   /* two rows each */
  uint16_t ids[F_STAGE_CANDIDATES+1],aids[F_STAGE_CANDIDATES+2];
  unsigned count=f_candidates(target.v[0],0,ids),acount=f_candidates(target.v[3],3,aids);
  /* Pass-through is essential when only alpha requires two stages. */
@@ -373,24 +418,49 @@ static int f_lower_two(f_value target,uint8_t plan[2][12],uint8_t alpha[2][12]){
  }
  return -1;
 }
-/* DOT3 implements 4*sum((X-.5)*(Y-.5)); match that AST exactly.
- * Do not rewrite arbitrary dot/normalize into biased fixed-function maths. */
-#ifdef GL2_EXPERIMENTAL_DOT3
-static int f_lower_dot3(f_value target,uint8_t *plan,uint8_t *alpha){
+/* DOT3 (layer word 0 bit 13), measured on the device (hw-reports/run-dot3-1, -2):
+ *   colour = clamp(scale * sum_k (X1_k - .5) * (Y1_k - .5)), grey; the stage's result scale applies
+ *   (x4 gives GL's 4 * dot). X2 must be "one" (X2 = P gave per-channel garbage), drop product 2.
+ *   alpha  = clamp(sum ...) at x1 whatever the alpha half says.
+ *   The next stage reads the result as C (previous).
+ * So a DOT3 shader takes two stages: stage 1 the dot product, stage 2 the shader's colour as a
+ * function of C (C, C * T, C * P, ...) and its alpha. Matched forms (exact AST identity, with T the
+ * texture and P the vertex colour, or T with itself):
+ *   4 * dot(T - .5, P - .5)      dot(T * 2 - 1, P * 2 - 1)      and either under clamp(x, 0, 1). */
+#ifndef GL2_DOT3_SCALE
+#define GL2_DOT3_SCALE 2   /* result scale code: 2 = x4 */
+#endif
+#ifndef GL2_DOT3
+#define GL2_DOT3 1
+#endif
+#if GL2_DOT3
+static int f_reads_prev(const uint8_t *c){return c[0]==1||c[2]==1||(!c[9]&&(c[5]==1||c[6]==1));}
+static int f_lower_dot3(f_value target,uint8_t (*plan)[12],uint8_t (*alpha)[12]){
  unsigned mark=f.n;
- for(unsigned y=0;y<2;++y){
+ for(unsigned form=0;form<2&&!f.error;++form)for(unsigned y=0;y<2&&!f.error;++y){
   uint16_t d=f_const(0);
-  for(unsigned k=0;k<3;++k){uint16_t a=f_intern(F_INPUT,4+k,0,0),b=f_intern(F_INPUT,(y?0:4)+k,0,0);d=f_op(F_ADD,d,f_op(F_MUL,f_op(F_SUB,a,f_const(.5f)),f_op(F_SUB,b,f_const(.5f))));}
-  d=f_op(F_MUL,d,f_const(4));
-  int match=target.v[0]==d&&target.v[1]==d&&target.v[2]==d;
-  f_rollback(mark);if(f.error)return -1;
-  if(match){
-   /* Candidate texture X1 and primary/texture Y1 from decoded traces.
-    * Primary X1 is reserved until independently verified on hardware. */
-   for(unsigned i=0;i<12;++i)plan[i]=0;
-   plan[0]=2;plan[2]=y?0:2;plan[9]=1;
-   return f_lower(target,alpha,1,0);
+  for(unsigned k=0;k<3;++k){
+   uint16_t a=f_intern(F_INPUT,4+k,0,0),b=f_intern(F_INPUT,(y?0:4)+k,0,0),pa,pb;
+   if(!form){pa=f_op(F_SUB,a,f_const(.5f));pb=f_op(F_SUB,b,f_const(.5f));}
+   else{pa=f_op(F_SUB,f_op(F_MUL,a,f_const(2)),f_const(1));pb=f_op(F_SUB,f_op(F_MUL,b,f_const(2)),f_const(1));}
+   d=f_op(F_ADD,d,f_op(F_MUL,pa,pb));
   }
+  if(!form)d=f_op(F_MUL,d,f_const(4));
+  const uint16_t cd=f_intern(F_CLAMP,d,0,0);
+  for(unsigned pass=0;pass<2;++pass){
+   /* the stage output is clamp(d); plain d only where the shader outputs d itself in that channel (the final write clamps) */
+   for(unsigned k=0;k<4;++k)f_previous[k]=pass?d:cd;
+   if(f_lower(target,plan[1],0,1)||f_lower(target,alpha[1],1,1)){if(f.error)return -1;continue;}
+   int rc=f_reads_prev(plan[1]),ra=f_reads_prev(alpha[1]);
+   if(!rc&&!ra)continue;   /* stage 2 must read the dot */
+   if(pass&&((rc&&!(target.v[0]==d&&target.v[1]==d&&target.v[2]==d))||(ra&&target.v[3]!=d)))continue;
+   for(unsigned i=0;i<12;++i){plan[0][i]=0;alpha[0][i]=0;}
+   /* X1 T, Y1 P or T, X2 one, Y2 field 1 (RetailOS's DOT3_RGBA): clamp(4 * sum) in colour and alpha (run-dot3-1 case 9) */
+   plan[0][0]=2;plan[0][2]=y?0:2;plan[0][5]=3;plan[0][6]=1;plan[0][9]=1;plan[0][11]=0;
+   alpha[0][0]=3;alpha[0][5]=3;alpha[0][9]=1;   /* one * P: ignored by the hardware in DOT3 mode */
+   return 0;
+  }
+  f_rollback(mark>f.n?f.n:mark);
  }
  return -1;
 }
@@ -456,6 +526,7 @@ static uint16_t f_strip_mix(uint16_t id){
  return id;
 }
 static int compile_fragment(const char *source,gl2_fs_owned *out,char *log){
+ int strip_used=0;f_mp=0;f_lossy=0;
  f.cursor=0;f.n=f.ns=f.nvary=f.nsampler=f.nuniform=f.depth=f.error=0;f_tex_sampler=-1;f_nfuncs=0;f_call_depth=0;f_scope=0;f_extra_n=0;f_fold_lane=4;for(unsigned k=0;k<4;++k)f_fold_j[k]=-1;f.log=log;f.out=out;for(unsigned i=0;i<F_TABLE;++i)f.table[i]=0;
  for(unsigned i=0;i<sizeof *out;++i)((uint8_t *)out)[i]=0;
  f_const(0);f_const(1);f_value target=f_parse(source);if(f.error)return -1;
@@ -465,15 +536,12 @@ static int compile_fragment(const char *source,gl2_fs_owned *out,char *log){
  if(f_software(target,&out->software)){return -1;}out->e.software=&out->software;
  uint8_t alpha[2][12]={{0}};int gpu=0;for(unsigned k=0;k<4;++k)f_previous[k]=1;
  if((deps&0xffu)&&!(deps&~255u)){
-  /* Physical probe354 did not match DOT3 source arithmetic. Keep the
-   * candidate encoding diagnostic-only until operands/layout are resolved. */
-#ifdef GL2_EXPERIMENTAL_DOT3
-  if(!f_lower_dot3(target,out->e.plan[0],alpha[0])){gpu=1;out->e.has_alpha=2;}
-#else
-  if(0){gpu=1;}
-#endif
-  else if(!f_lower(target,out->e.plan[0],0,0)&&!f_lower(target,alpha[0],1,0))gpu=1;
+  if(!f_lower(target,out->e.plan[0],0,0)&&!f_lower(target,alpha[0],1,0))gpu=1;
   else if(!f.error&&!f_lower_two(target,out->e.plan,alpha))gpu=2;
+#if GL2_DOT3
+  /* last: only what the per-channel stages cannot express (run-dot3-2 measured the encoding) */
+  else if(!f.error){for(unsigned k=0;k<4;++k)f_previous[k]=1;if(!f_lower_dot3(target,out->e.plan,alpha)){gpu=2;out->e.has_alpha=2;}}
+#endif
  }
  if(!gpu&&(deps&~255u)){
   f_value st=target;f_fog_j=-1;f_fog_k=0;f_fog_mask=0;for(unsigned k=0;k<4;++k){f_fold_j[k]=-1;f_fold_k[k]=0;}for(unsigned k=0;k<4;++k){f_fold_c[k]=1;f_fold_lane=k;st.v[k]=f_strip_mix(target.v[k]);}f_fold_lane=4;
@@ -481,7 +549,7 @@ static int compile_fragment(const char *source,gl2_fs_owned *out,char *log){
   if((sdeps&0xffu)&&!(sdeps&~255u)){
    if(!f_lower(st,out->e.plan[0],0,0)&&!f_lower(st,alpha[0],1,0)){gpu=1;deps=sdeps;}
    else if(!f.error&&!f_lower_two(st,out->e.plan,alpha)){gpu=2;deps=sdeps;}
-   if(gpu){int j=-1;for(unsigned k=0;k<3;++k)if(f_fold_j[k]>=0){if(j<0)j=f_fold_j[k];if(f_fold_j[k]==j){out->e.fold_mask|=(uint8_t)(1u<<k);out->e.fold_comp[k]=(uint8_t)f_fold_k[k];}}
+   if(gpu){strip_used=1;int j=-1;for(unsigned k=0;k<3;++k)if(f_fold_j[k]>=0){if(j<0)j=f_fold_j[k];if(f_fold_j[k]==j){out->e.fold_mask|=(uint8_t)(1u<<k);out->e.fold_comp[k]=(uint8_t)f_fold_k[k];}}
     if(j>=0){scpy(out->fold_vary,f_extra_name[j],32);out->e.fold_name=out->fold_vary;}
     for(unsigned k=0;k<3;++k)if(f_fold_c[k]!=1)out->e.fold_const[k]=f_fold_c[k];
     if(f_fog_j!=-1&&f_fog_mask){
@@ -492,7 +560,7 @@ static int compile_fragment(const char *source,gl2_fs_owned *out,char *log){
   }
  }
  f.error=0;
- out->e.hash=gl2_hash(source);out->e.source=source;out->e.nsampler=(deps&0xf0u)?1:0;out->e.nplan=(uint8_t)gpu;out->e.has_alpha|=(uint8_t)(gpu!=0);
+ out->e.hash=gl2_hash(source);out->e.source=source;out->e.nsampler=(deps&0xf0u)?1:0;out->e.nplan=(uint8_t)gpu;out->e.approx=(uint8_t)(f_lossy||strip_used||out->e.uv_approx);out->e.has_alpha|=(uint8_t)(gpu!=0);
  for(unsigned stage=0;stage<(unsigned)gpu;++stage)out->e.alpha[stage]=f_alpha_word(alpha[stage]);
  for(unsigned i=0;i<f.ns;++i){f_symbol *s=&f.symbols[i];if(s->storage==2&&out->e.nsampler&&s->value.index==(uint8_t)(f_tex_sampler<0?0:f_tex_sampler)){scpy(out->samplers[0],s->name,32);out->e.sampler_names[0]=out->samplers[0];}
   else if(s->storage==1&&((s->slot==1&&(deps&15u))||(s->slot==3&&out->e.nsampler))){unsigned n=out->e.nvary;if(n>=3){f_fail("too many fragment varyings");return -1;}scpy(out->varyings[n],s->name,32);out->e.vary_names[n]=out->varyings[n];out->e.vary_slots[n]=s->slot;out->e.vary_widths[n]=s->value.w;++out->e.nvary;if(s->slot==1)out->e.needs_colour=1;}

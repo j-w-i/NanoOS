@@ -50,6 +50,10 @@ void glPixelStorei(GLenum p,GLint v){GL2STD_PUMP;gl2x_glPixelStorei(g_ctx,p,v);}
 GLenum glGetError(void){GL2STD_PUMP;return (GLenum)gl2x_glGetError(g_ctx);}
 unsigned gl2std_error_aux(void){return (unsigned)gl2_error_aux(g_ctx);}
 unsigned gl2std_error_site(void){return (unsigned)gl2_error_site(g_ctx);}
+void gl2std_fragment_passes(int mode){gl2_fragment_passes(g_ctx,mode);}
+int gl2std_program_passes(unsigned program){return gl2_program_passes(g_ctx,program);}
+int gl2std_program_passes_additive(unsigned program){return gl2_program_passes_additive(g_ctx,program);}
+const uint32_t *gl2std_lut_stats(void){return gl2_lut_stats(g_ctx);}
 const GLubyte *glGetString(GLenum n){return (const GLubyte *)gl2x_glGetString(g_ctx,n);}
 void glGetIntegerv(GLenum p,GLint *v){GL2STD_PUMP;gl2x_glGetIntegerv(g_ctx,p,v);}
 void glGetFloatv(GLenum p,GLfloat *v){GL2STD_PUMP;gl2x_glGetFloatv(g_ctx,p,v);}

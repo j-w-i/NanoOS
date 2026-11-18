@@ -211,6 +211,8 @@ typedef struct {                     /* precompiled fragment shader */
     /* Fog: mix(uniform fog colour, colour, t) with t a vertex varying. Colour lanes in fog_mask are
      * multiplied per vertex by fog_name.fog_comp (exact for black fog; coloured fog fades to black). */
     uint8_t fog_mask, fog_comp; const char *fog_name;
+    uint8_t approx; /* the single-pass plan approximates the source (dropped builtins, folded or stripped terms, offset taps) */
+    uint8_t mp;     /* nonzero: drawn as this many GPU passes (gl2fmp.inc) instead of the single-pass plan */
 } gl2_fs_entry;
 #if !defined(GL2_WAIT_SCALE) && (defined(NANO_EMU) || defined(NANO_EMU_FILES_ADDR))
 #define GL2_WAIT_SCALE 100u   /* NanoEmu build (see below) */
@@ -236,11 +238,26 @@ typedef struct {                     /* precompiled fragment shader */
 #ifndef GL2_SPEC
 #define GL2_SPEC 1         /* zero-uniform specialisation on/off */
 #endif
+/* Lookup table of a multi-pass program (gl2fmp.inc): a per-pixel function of one normalised varying,
+ * baked by the CPU into a sphere-map texture whenever the uniforms it reads change. */
+#define GL2_MP_LUT_INS 96
+#ifndef GL2_MP_LUT_SIZE
+#define GL2_MP_LUT_SIZE 32   /* texels per side (power of two, 8..64): a repaint costs about 1.9 ms at 32 on the device */
+#endif
+#define GL2_MP_LUT_RING 8   /* tables alive at once: four that change every frame */
+typedef struct { uint8_t op, fn; uint16_t a, b; float value; } gl2_mp_lut_insn; /* SSA; F_INPUT: a = 0..2 direction lane, 16 + 4*uniform + lane */
+typedef struct { uint16_t n, out[3]; uint8_t on, usrc[16]; uint32_t serial; gl2_mp_lut_insn code[GL2_MP_LUT_INS]; } gl2_mp_lut; /* usrc as mp_usrc; serial: unique per link (table cache key) */
 typedef struct {gl2_fs_entry e;char samplers[2][32],varyings[3][32],uniforms[16][32],fold_vary[32],fog_vary[32];gl2_soft_program software;} gl2_fs_owned;
 typedef struct { uint32_t type, src_hash, ok, used, attachments, delete_pending, source_length; char log[64]; const char *src; vsc_result *vs; const gl2_fs_entry *fs; } gl2_shader;
 typedef struct { uint32_t used, ok, vsh, fsh, delete_pending, executable, validate_status; gl2_program prog; vsc_result vs; const gl2_fs_entry *fs; gl2_fs_owned fs_owned; uint8_t sampler_unit[2],fragment_vertex_alias[16];float fragment_values[16][4]; uint8_t attr_bind[5], nbind; char bind_name[8][32]; uint8_t bind_loc[8]; uint32_t blob[1]; char log[64]; uint32_t gpu_code[VSC_MAX_INSTR][2]; /* vs.code pruned to what the native TSP reads */ uint32_t gpu_nlit; uint16_t gpu_lit_idx[VSC_MAX_LIT]; float gpu_lit_val[VSC_MAX_LIT][4]; uint8_t full_normal_input, full_uv1_input, full_omit_colour; /* input layout of the unpruned code (software path) */
     /* zero-uniform specialisation (gl2api.c spec_select): candidate constant rows, cached variants */
-    uint32_t base_nstage; uint8_t nspec, spec_row[GL2_SPEC_ROWS], spec_lru; uint32_t spec_key[GL2_SPEC_SLOTS]; uint32_t spec_n[GL2_SPEC_SLOTS]; uint32_t spec_code[GL2_SPEC_SLOTS][GL2_SPEC_MAX_INSTR][2]; } gl2_prog_obj;
+    uint32_t base_nstage; uint8_t nspec, spec_row[GL2_SPEC_ROWS], spec_lru; uint32_t spec_key[GL2_SPEC_SLOTS]; uint32_t spec_n[GL2_SPEC_SLOTS]; uint32_t spec_code[GL2_SPEC_SLOTS][GL2_SPEC_MAX_INSTR][2];
+    /* multi-pass fragment programs (gl2fmp.inc): the passes are hidden programs in the same pool */
+    uint8_t mp_n, mp_blend_ok, mp_hidden, mp_q[6], mp_op[6], mp_sampler[6]; /* per pass: program slot, combine op, parent sampler index (0xff none) */
+    uint8_t mp_acc_n, mp_acc_q[16], mp_acc_op[16], mp_acc_sampler[16];          /* the same for additive (ONE/ONE) draws: product through destination alpha */
+    gl2_mp_lut mp_lut;            /* sampler index 0xfe in mp_sampler: this table */
+    uint8_t mp_usrc[GL2_MAX_UNI]; /* in a pass program: where uniform u comes from (0 none, j+1 parent vertex uniform, 0x80|i parent fragment uniform, 0xff blend flag) */
+} gl2_prog_obj;
 typedef int (*gl2_submit_fn)(const uint32_t *seg, uint32_t words, void *user); /* nonzero return fails draw */
 typedef struct {
     uint32_t name, reserved, used, size, usage, gen; /* gen: bumped by every upload (derived-data caches) */
@@ -295,6 +312,10 @@ typedef struct gl2_ctx {
     /* optional: like submit_parts, but the vertex span may still be read (DMA) after return; used when parts_stable is set (converted-vertex cache) */
     int (*submit_parts_async)(const uint32_t *header,uint32_t header_words,const void *vertices,uint32_t vertex_words,void *user); void (*submit_sync)(void *user); void (*submit_pump)(void *user); uint8_t parts_stable;
     uint8_t state_cache_enabled, cached_hdr_valid;
+    uint32_t mp_lut_tex[GL2_MP_LUT_RING], mp_lut_key[GL2_MP_LUT_RING], mp_lut_used[GL2_MP_LUT_RING], mp_lut_serial; uint8_t mp_lut_next, mp_lut_short; /* mp_lut_short: ring slots lost because the texture pool (GL2_MAX_TEXTURES) was full */
+    uint32_t mp_lut_stat[4]; /* tables reused, repainted, no free slot, last upload error << 16 | line */
+    uint32_t scene_serial; /* bumped by the backend at every scene begin: a texture last sampled in scene s is safe to rewrite from scene s + 2 (the queue is one deep) */ /* lookup-table textures in use (a ring: a texture a queued frame still samples cannot be rewritten) */
+    uint8_t mp_mode, mp_later; /* multi-pass fragment shaders: see gl2_fragment_passes; mp_later: drawing pass 2+ */
     uint32_t buffer_gen;
     uint32_t cached_hdr_words, cached_hdr[GL2_MAX_HEADER_WORDS];
     gl2_framebuffer framebuffers[GL2_MAX_FRAMEBUFFERS]; gl2_renderbuffer renderbuffers[GL2_MAX_RENDERBUFFERS];
@@ -334,6 +355,19 @@ int gl2_program_needs_software(const gl2_ctx *,const gl2_prog_obj *); /* interna
 uint32_t gl2_hash(const char *s);
 void gl2_init(gl2_ctx *c, gl2_prog_obj *progs /* array of 4 */, uint32_t *segbuf, uint32_t seg_cap, gl2_submit_fn fn, void *user);
 void gl2_set_fs_cache(gl2_ctx *c, const gl2_fs_entry *e, uint32_t n);
+/* Multi-pass fragment shaders: a shader that does not fit one combiner pass is drawn as several
+ * blended GPU passes (each pass redraws the geometry). mode 0 (default): off, so applications that
+ * choose a simpler shader when one fails to compile behave as before. 1: shaders with no
+ * single-pass plan at all, which otherwise fail to compile. 2: also shaders whose single-pass plan
+ * is an approximation (exact result, more passes), and on software targets. Applies to shaders
+ * compiled afterwards. */
+void gl2_fragment_passes(gl2_ctx *c, int mode);
+int gl2_program_passes(gl2_ctx *c, uint32_t program);
+int gl2_program_passes_additive(gl2_ctx *c, uint32_t program); /* passes of a GL_ONE / GL_ONE blended draw through destination alpha, 0 when it has no such list */
+const uint32_t *gl2_lut_stats(gl2_ctx *c); /* [4]: lookup tables reused, repainted, refused for lack of a free slot, last upload error << 16 | source line */ /* GPU passes one draw of this linked program takes (0: not linked) */
+#ifndef GL2_MP_MODE
+#define GL2_MP_MODE 0
+#endif
 uint32_t glGetError(gl2_ctx *c);
 uint32_t gl2_error_aux(gl2_ctx *c); /* extra diagnostic word captured with the error site */
 uint32_t gl2_error_site(gl2_ctx *c); /* source line (0x10000|line in gl2tex.c) that raised the most recent error */

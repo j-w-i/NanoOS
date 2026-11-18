@@ -2,6 +2,8 @@
 uint32_t gl2_isp_or;   /* test knob: OR-ed into every draw's ISP word (bit 24: vertex fog) */
 uint32_t gl2_ctl_or;   /* test knob: OR-ed into every draw's VGP control word */
 uint32_t gl2_w3_or;    /* test knob: OR-ed into the word after the ISP word (0xe0000000) */
+uint32_t gl2_l0_or[2];  /* test knob: OR-ed into layer word 0 of texture layer u */
+uint32_t gl2_w2_set[2]; /* test knob: nonzero replaces layer word 2 of texture layer u */
 static uint32_t f2u(float f) { union { float f; uint32_t u; } c; c.f = f; return c.u; }
 static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static float rdf(const uint8_t *p) { union { uint32_t u; float f; } c; c.u = rd32(p); return c.f; }
@@ -218,7 +220,8 @@ static int build_header_i(const gl2_program *p,const gl2_state *st,int mode,
         /* Trilinear (0xce/0x4e) faulted every frame on hardware (run545, OpenLara filter MEDIUM):
          * GL2_TRILINEAR 0 samples the nearest mip level instead (0xb2/0x32). */
         else if(tex[u].storage&GL2_TEX_MIP_LINEAR)filt=GL2_TRILINEAR?((tex[u].storage&GL2_TEX_LINEAR)?0xceu:0x4eu):((tex[u].storage&GL2_TEX_LINEAR)?0xb2u:0x32u);
-        out[k++] = (lw << 24) | (lh << 20) | (fmt<<12) | 0x600u | cm | ((p->dot3_mask&(1u<<u))?1u<<13:0); out[k++] = (filt<<24) | (tex[u].va >> 7); out[k++] = (w2_of(p->plan + 12 * u)&~0x7fffu)|(p->custom_alpha?p->alpha[u]:0x4610u);
+        out[k++] = (lw << 24) | (lh << 20) | (fmt<<12) | 0x600u | cm | ((p->dot3_mask&(1u<<u))?1u<<13:0) | gl2_l0_or[u]; out[k++] = (filt<<24) | (tex[u].va >> 7);
+        out[k++] = gl2_w2_set[u] ? gl2_w2_set[u] : (w2_of(p->plan + 12 * u)&~0x7fffu)|(p->custom_alpha?p->alpha[u]:0x4610u);
     }
     out[k++] = 0x2003801au; out[k++] = (p->pack_pos ? 8u : 4u) | p->normal_input << 4 | (p->omit_colour ? 0 : 5u << 8) | GL2_UV0W(p) << 12 | ((p->pack_uv1 ? 5u : p->uv1_input) << 16); out[k++] = 0;
     {   /* viewport: panel x = ox + sx * ndc, panel y (rows from the top) = oy + sy * ndc. vp_w / vp_h

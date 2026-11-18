@@ -247,7 +247,7 @@ static int begin_target(gl2_nano *b,uint32_t *target,uint32_t w,uint32_t h,uint3
     if(use_software&&b->software_colour&&b->software_colour_bytes<w*h*4)return GL2_NANO_TARGET;
     if(b->retired_target&&overlaps((uintptr_t)target,bytes,(uintptr_t)b->retired_target,b->retired_stride*b->retired_height*4u))b->retired_target=0;
     b->target=target;b->width=w;b->height=h;b->stride=stride;b->ctx->target_w=lw;b->ctx->target_h=lh;b->completed=0;b->frame_draws=0;
-    b->ctx->soft_target=0;b->ctx->soft_depth=0;b->ctx->diagnostic_gpu=b->force_gpu;
+    b->ctx->soft_target=0;b->ctx->soft_depth=0;b->ctx->diagnostic_gpu=b->force_gpu;++b->ctx->scene_serial;
     gl2_set_state_cache(b->ctx,0);
     b->software_frame=use_software;
     if(b->software_frame){b->software_draw_start=b->ctx->soft_draws;b->ctx->soft_target=b->software_colour?b->software_colour:target;b->ctx->soft_depth=software_depth;b->ctx->soft_width=w;b->ctx->soft_height=h;b->ctx->soft_stride=b->software_colour?w:stride;

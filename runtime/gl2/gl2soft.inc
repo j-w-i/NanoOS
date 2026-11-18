@@ -26,6 +26,8 @@ int gl2_soft_is_texture_cube(const gl2_soft_program *p){
 int gl2_program_needs_software(const gl2_ctx *c,const gl2_prog_obj *p){
  /* a partial scissor needing at most two clip edges runs natively on the VGP clip planes (sync_prog_target) */
  if((GL2_DRAW_SCISSOR_BLOCKS(c)&&clip_edge_count(c)>2u)||c->color_mask!=0xfu)return 1;
+ /* a multi-pass program draws through its pass programs: native when each of them is */
+ if(p&&p->mp_n){for(unsigned i=0;i<p->mp_n;++i)if(gl2_program_needs_software(c,&c->pr[p->mp_q[i]]))return 1;for(unsigned i=0;i<p->mp_acc_n;++i)if(gl2_program_needs_software(c,&c->pr[p->mp_acc_q[i]]))return 1;return 0;}
  const gl2_soft_program *s=p&&p->fs?p->fs->software:0;if(!s)return 0;
  if(p->fs->nplan&&p->sampler_unit[0]<2)return 0; /* a lowered combiner plan on texture unit 0/1 runs natively (OpenLara checked against the ANGLE reference) */
  /* A compiled combiner plan is an exact fixed-function lowering of the
@@ -78,7 +80,8 @@ static int s_vertex_execute(const gl2_prog_obj *p,const float in[5][4],const flo
   for(unsigned q=0;q<3;++q){unsigned kind=b>>(16+2*q)&3,index=b>>(4*q)&15,sw=a>>(8+8*q)&255;const float *v=0;if(!kind){if(index>=5)return -1;v=in[index];}else if(kind==1){unsigned ci=((b>>12&15)<<4)|index;if(ci>=128)return -1;v=constants[ci];}else if(kind==2)v=temp[index];for(unsigned k=0;k<4;++k){s[q][k]=v?v[sw>>(2*k)&3]:0;if(a&(1u<<(5+q)))s[q][k]=-s[q][k];}}
   if(op==7||op==8){float dot=0;for(unsigned k=0;k<(op==7?3u:4u);++k)dot+=s[0][k]*s[1][k];for(unsigned k=0;k<4;++k)r[k]=dot;}
   else for(unsigned k=0;k<4;++k)switch(op){case 1:r[k]=s[0][k];break;case 2:r[k]=s[0][k]+s[1][k];break;case 3:r[k]=s[0][k]*s[1][k]+s[2][k];break;case 4:r[k]=s[0][k]*s[1][k];break;case 5:r[k]=1/s[0][3];break;case 6:r[k]=s_rsqrt(s[0][3]);break;case 9:r[k]=s[0][k]<s[1][k]?s[0][k]:s[1][k];break;case 10:r[k]=s[0][k]>s[1][k]?s[0][k]:s[1][k];break;case 12:r[k]=s[0][k]>=s[1][k]?1:0;break;case 19:r[k]=s_exp2(s[0][3]);break;default:return -1;}
-  float *d=dst>=16&&dst<32?temp[dst-16]:dst<5?out->v[dst]:dst==5?clip_distances:0;if(!d)return -1;for(unsigned k=0;k<4;++k)if(mask&(1u<<k))d[k]=r[k];
+  float spare[4];   /* outputs 6..15: varyings the fragment stage of this rasteriser never reads */
+  float *d=dst>=16&&dst<32?temp[dst-16]:dst<5?out->v[dst]:dst==5?clip_distances:dst<16?spare:0;if(!d)return -1;for(unsigned k=0;k<4;++k)if(mask&(1u<<k))d[k]=r[k];
  }
  /* VGP colour output is BGRA; preserve its float values, without RGBA8 packing. */
  float red=out->v[1][2];out->v[1][2]=out->v[1][0];out->v[1][0]=red;

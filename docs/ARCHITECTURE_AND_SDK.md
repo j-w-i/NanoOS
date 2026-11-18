@@ -200,7 +200,8 @@ make -C NanoOS chainloader NANOAPPS=/path/to/nano7kit/nanoapps
 ## 9. Verified vs Experimental / Limitations
 
 - **Verified on physical Nano 7:** Kernel + `NGAME` ABI `v23`, EGL window surface + vsync presentation, VGP vertex compilation, single-pass TSP combiners (`C/P/T/T*C/T*P`), `ARGB8888`/`RGB565`/`ARGB4444`/`PVRTC4` (`0x38000`) + mipmaps, SFTL/HFS+ read-only mount & streaming, touch + `NGAME_HOME` exit.
-- **Limitations:** Multi-pass arbitrary fragment shaders fall back to software or are rejected (`kUberVsMbx`/`kUberFsMbx` lowers per-vertex lighting); `NanoOS` app SDK filesystem is read-only by default (persistent saves require preallocated 32 KiB save files via `sdk/src/storage/save.c`); `test_gl2api.py` requires the parent `gles2shim`/`glsl2vgp` models.
+- **Multi-pass fragment shaders:** shaders that are sums of per-vertex terms times texture samples (several textures, offset taps, exact mix/fog, per-vertex builtins) draw as 2 to 6 blended GPU passes; see `MBX_GPU.md` ("Multi-pass fragment shaders") and `gl2_fragment_passes`.
+- **Limitations:** Fragment shaders outside that form fall back to software or are rejected (`kUberVsMbx`/`kUberFsMbx` lowers per-vertex lighting); `NanoOS` app SDK filesystem is read-only by default (persistent saves require preallocated 32 KiB save files via `sdk/src/storage/save.c`); `test_gl2api.py` requires the parent `gles2shim`/`glsl2vgp` models.
 
 ## 10. Regression Testing
 

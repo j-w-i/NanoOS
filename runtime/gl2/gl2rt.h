@@ -49,6 +49,8 @@ typedef struct { uint32_t blend, src, dst, depth_test, depth_func, depth_write; 
 extern uint32_t gl2_isp_or;    /* test knobs (fog probe): ISP word bits OR-ed into every draw */
 extern uint32_t gl2_ctl_or;    /* VGP control word bits OR-ed into every draw */
 extern uint32_t gl2_w3_or;     /* bits OR-ed into the word after the ISP word */
+extern uint32_t gl2_l0_or[2];  /* test knobs (DOT3 probe): bits OR-ed into layer word 0 of texture layer u (bit 13: DOT3) */
+extern uint32_t gl2_w2_set[2]; /* nonzero: replaces layer word 2 (the combiner) of texture layer u */
 extern uint32_t gl2_live_or;   /* VGP outputs kept live at link in addition to what the plan reads */
 /* Zero preserves the legacy ARGB8888 descriptor. Other values are the measured
  * MBX texture-format field, not public GL transfer enums. */
