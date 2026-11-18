@@ -21,7 +21,7 @@
 #define GL2_STRIP_SLOTS 1024u
 #define GL2_STRIP_EDGE_SLOTS 16384u      /* power of two, > 3 * GL2_STRIP_MAX_TRIS */
 #if GL2_STRIP_POOL_WORDS
-typedef struct { const gl2_ctx *ctx; uint32_t name, gen, off, count, type, start, nprim, nidx; uint32_t vc_off, vc_sig, vc_epoch; } gl2_strip_entry;
+typedef struct { const gl2_ctx *ctx; uint32_t name, gen, off, count, type, start, nprim, nidx; uint32_t vc_off[2], vc_sig[2], vc_epoch[2]; uint8_t vc_next; } gl2_strip_entry;   /* two cached streams: multipass engines draw one mesh with two programs (e.g. shadow casters) */
 static gl2_strip_entry strip_cache[GL2_STRIP_SLOTS];
 static uint16_t strip_pool[GL2_STRIP_POOL_WORDS];
 static uint32_t strip_used, strip_entries;
@@ -158,7 +158,7 @@ static const uint16_t *strip_lookup(gl2_ctx *c, const gl2_buffer *b, uint32_t of
     if (!found) {
         uint32_t start = 0, ni = 0, np = stripify(src, type, count, &start, &ni);
         e->ctx = c; e->name = b->name; e->gen = b->gen; e->off = off; e->count = count; e->type = type;
-        e->start = start; e->nprim = np; e->nidx = ni; e->vc_epoch = 0; ++strip_entries;
+        e->start = start; e->nprim = np; e->nidx = ni; e->vc_epoch[0] = e->vc_epoch[1] = 0; e->vc_next = 0; ++strip_entries;
     }
     *entry = e;                         /* list draws keep the entry for the vertex cache */
     if (!e->nprim) return 0;

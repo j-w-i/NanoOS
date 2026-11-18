@@ -2,11 +2,14 @@
 #include "nano_app.h"
 #include "EGL/egl.h"
 #include "GLES2/gl2.h"
-#if defined(HELLO_VIEWPORT_CLIP) || defined(HELLO_FOGPROBE)
+#if defined(HELLO_VIEWPORT_CLIP) || defined(HELLO_FOGPROBE) || defined(HELLO_SHADOWPROBE)
 #define HELLO_BENCH 1
 #endif
 #ifdef HELLO_FOGPROBE
 #include "gl2rt.h"
+#endif
+#ifndef SPN
+#define SPN 64
 #endif
 #ifdef HELLO_BENCH
 #include "report.h"
@@ -32,6 +35,9 @@ static GLuint compile_shader(GLenum type, const char *src) {
 
 int nano_example_main(const struct nanoos_api *api) {
     if (nano_app_init(api) != 0) return 1;
+#ifdef SP_LAND
+    nano_app_set_orientation(NANO_ORIENT_LANDSCAPE);
+#endif
 
     EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (!eglInitialize(dpy, 0, 0)) return 2;
@@ -103,6 +109,144 @@ int nano_example_main(const struct nanoos_api *api) {
         rtext("FOGPROBE frames/sw/fault "); rword(fr); rword(sw); rword(fault); rtext("\n");
         rtext(fault == 0u ? "HELLO PASS\n" : "HELLO FAIL\n");
     fog_out:
+        report[rused] = 0;
+        rpt_mirror_write(report, rused, rpt_sum(report, rused));
+        nano_app_dcache_clean();
+        eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        return 0;
+    }
+#endif
+#ifdef HELLO_SHADOWPROBE
+    {
+        /* Shadow-map depth compare on the MBX combiner. A 64x64 RGBA texture holds a depth ramp
+         * D(u) = u (rendered through an FBO, or uploaded: case column "src"). A full-screen receiver
+         * quad over a grey 0.8 scene samples it with u = 0..1 across x and compares against a
+         * receiver depth R in the vertex colour:
+         *   A: s = clamp(4(T + 1 - R - 0.5)); out = s*K + (1-K)   (two stages, K = 1-darkness in .w)
+         *   B: s = clamp(4(T + 1 - R - 0.5)); out = clamp(4(s - 0.5))  (two stages, x16 slope)
+         *   C: out = clamp(4(T + 1 - R - 0.5))                     (one stage, bias + x4)
+         * blended onto the scene with DST_COLOR x src (blend column) or written directly.
+         * Five pixels per case; expected values from the same formulas in float. */
+        static const char *rvs = "attribute vec4 aPos;\nattribute vec2 aUV;\nuniform vec4 uP;\nvarying vec4 vColor;\nvarying vec2 vTexCoord;\nvoid main(){ vColor = uP; vTexCoord = aUV; gl_Position = aPos; }\n";
+        static const char *fsA = "precision lowp float;\nuniform sampler2D sShadow;\nvarying vec4 vColor;\nvarying vec2 vTexCoord;\nvoid main(){ vec4 t = texture2D(sShadow, vTexCoord);\n vec3 s = clamp(((t.xyz + (1.0 - vColor.xyz)) - 0.5) * 4.0, 0.0, 1.0);\n gl_FragColor = vec4(s * vColor.www + (1.0 - vColor.www), 1.0); }\n";
+        static const char *fsB = "precision lowp float;\nuniform sampler2D sShadow;\nvarying vec4 vColor;\nvarying vec2 vTexCoord;\nvoid main(){ vec4 t = texture2D(sShadow, vTexCoord);\n vec3 s = clamp(((t.xyz + (1.0 - vColor.xyz)) - 0.5) * 4.0, 0.0, 1.0);\n gl_FragColor = vec4(clamp((s - 0.5) * 4.0, 0.0, 1.0), 1.0); }\n";
+        static const char *fsC = "precision lowp float;\nuniform sampler2D sShadow;\nvarying vec4 vColor;\nvarying vec2 vTexCoord;\nvoid main(){ vec4 t = texture2D(sShadow, vTexCoord);\n gl_FragColor = vec4(clamp(((t.xyz + (1.0 - vColor.xyz)) - 0.5) * 4.0, 0.0, 1.0), 1.0); }\n";
+        static const char *cvs = "attribute vec4 aPos;\nattribute vec4 aCol;\nvarying vec4 vColor;\nvoid main(){ vColor = aCol; gl_Position = aPos; }\n";
+        static const char *cfs = "precision lowp float;\nvarying vec4 vColor;\nvoid main(){ gl_FragColor = vColor; }\n";
+        static const float q[24] = { -1,-1,0,1, 1,-1,0,1, -1,1,0,1,  1,-1,0,1, 1,1,0,1, -1,1,0,1 };
+        static const float quv[12] = { 0,0, 1,0, 0,1,  1,0, 1,1, 0,1 };
+        static const float qramp[24] = { 0,0,0,1, 1,1,1,1, 0,0,0,1,  1,1,1,1, 1,1,1,1, 0,0,0,1 };
+        rtext("NANOOS GL2 GAME build " __DATE__ " " __TIME__ "\nSHADOWPROBE\n");
+        GLuint progs[3]; const char *fss[3] = { fsA, fsB, fsC }; GLint lpos[3], luv[3], lP[3], lS[3];
+        GLuint rv = compile_shader(GL_VERTEX_SHADER, rvs);
+        for (unsigned i = 0; i < 3; ++i) {
+            GLuint f = compile_shader(GL_FRAGMENT_SHADER, fss[i]); GLint lk = 0;
+            progs[i] = glCreateProgram(); glAttachShader(progs[i], rv); if (f) glAttachShader(progs[i], f); glLinkProgram(progs[i]);
+            glGetProgramiv(progs[i], GL_LINK_STATUS, &lk);
+            lpos[i] = glGetAttribLocation(progs[i], "aPos"); luv[i] = glGetAttribLocation(progs[i], "aUV");
+            lP[i] = glGetUniformLocation(progs[i], "uP"); lS[i] = glGetUniformLocation(progs[i], "sShadow");
+            rtext("prog "); rword(i); rtext("fs "); rword(f != 0); rtext("linked "); rword((uint32_t)lk); rtext("\n");
+        }
+        GLuint cv = compile_shader(GL_VERTEX_SHADER, cvs), cf = compile_shader(GL_FRAGMENT_SHADER, cfs);
+        GLuint cp = glCreateProgram(); glAttachShader(cp, cv); glAttachShader(cp, cf); glLinkProgram(cp);
+        GLint cpos = glGetAttribLocation(cp, "aPos"), ccol = glGetAttribLocation(cp, "aCol");
+        /* texture 0: ramp uploaded; texture 1: ramp rendered through an FBO */
+        GLuint tex[2]; glGenTextures(2, tex);
+        static uint8_t ramp[SPN * SPN * 4];
+        for (unsigned y = 0; y < SPN; ++y) for (unsigned x = 0; x < SPN; ++x) { uint8_t v = (uint8_t)((x * 255u + (SPN-1)/2) / (SPN-1)); uint8_t *p = ramp + 4 * (y * SPN + x); p[0] = p[1] = p[2] = v; p[3] = 255; }
+        for (unsigned i = 0; i < 2; ++i) {
+            glBindTexture(GL_TEXTURE_2D, tex[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SPN, SPN, 0, GL_RGBA, GL_UNSIGNED_BYTE, i ? 0 : ramp); rtext("teximage "); rword(i); rword(glGetError()); rtext("\n");
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+        GLuint fbo = 0; glGenFramebuffers(1, &fbo); glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[1], 0);
+        uint32_t fbst = (uint32_t)glCheckFramebufferStatus(GL_FRAMEBUFFER); rtext("fbo setup err "); rword(glGetError()); rtext("\n");
+        glViewport(0, 0, SPN, SPN); glClearColor(1, 1, 1, 1); glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(cp); for (unsigned a = 0; a < 5; ++a) glDisableVertexAttribArray(a);
+        glVertexAttribPointer((GLuint)cpos, 4, GL_FLOAT, GL_FALSE, 0, q); glEnableVertexAttribArray((GLuint)cpos);
+        glVertexAttribPointer((GLuint)ccol, 4, GL_FLOAT, GL_FALSE, 0, qramp); glEnableVertexAttribArray((GLuint)ccol);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        uint8_t fb0[4] = {0}, fb1[4] = {0}, fb2[4] = {0};
+        uint32_t fe0 = glGetError(); glReadPixels(SPN/8, SPN/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, fb0); glReadPixels(SPN/2, SPN/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, fb1); glReadPixels(SPN*7/8, SPN/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, fb2); rtext("fbo draw err "); rword(fe0); rword(glGetError()); rtext("\n");
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        rtext("FBO status "); rword(fbst); rtext("ramp u.125/.5/.875 "); rword(fb0[0]); rword(fb1[0]); rword(fb2[0]); rtext("\n");
+        /* cases: program, texture, blend, R, K */
+        static const struct { unsigned prog, src, blend; float r, k; } cs[] = {
+            { 2, 0, 0, 0.75f, 1.0f }, { 2, 0, 0, 0.50f, 1.0f }, { 2, 0, 1, 0.75f, 1.0f },
+            { 0, 0, 1, 0.75f, 0.5f }, { 0, 0, 1, 0.60f, 0.3f }, { 0, 0, 0, 0.75f, 0.5f },
+            { 1, 0, 1, 0.75f, 1.0f }, { 1, 0, 0, 0.75f, 1.0f },
+            { 2, 1, 0, 0.75f, 1.0f }, { 0, 1, 1, 0.75f, 0.5f }, { 1, 1, 1, 0.75f, 1.0f },
+        };
+        static const float us[5] = { 0.1f, 0.3f, 0.5f, 0.7f, 0.9f };
+        unsigned nbad = 0, ncase = sizeof cs / sizeof cs[0];
+        for (unsigned c = 0; c < ncase; ++c) {
+            unsigned pi = cs[c].prog; uint8_t px[5][4];
+            for (unsigned f = 0; f < 2; ++f) {
+                glViewport(0, 0, 240, 432); glDisable(GL_BLEND);
+                glClearColor(0.8f, 0.8f, 0.8f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+                glUseProgram(progs[pi]); for (unsigned a = 0; a < 5; ++a) glDisableVertexAttribArray(a);
+                glVertexAttribPointer((GLuint)lpos[pi], 4, GL_FLOAT, GL_FALSE, 0, q); glEnableVertexAttribArray((GLuint)lpos[pi]);
+                glVertexAttribPointer((GLuint)luv[pi], 2, GL_FLOAT, GL_FALSE, 0, quv); glEnableVertexAttribArray((GLuint)luv[pi]);
+                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex[cs[c].src]); glUniform1i(lS[pi], 0);
+                glUniform4f(lP[pi], cs[c].r, cs[c].r, cs[c].r, cs[c].k);
+                if (cs[c].blend) { glEnable(GL_BLEND); glBlendFunc(GL_DST_COLOR, GL_ZERO); }
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                glDisable(GL_BLEND);
+                if (f == 1u) for (unsigned k = 0; k < 5; ++k) glReadPixels((GLint)(us[k] * 240.0f), 216, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px[k]);
+                eglSwapBuffers(dpy, sfc);
+            }
+            rtext("C "); rword(c); rword(glGetError());
+            unsigned bad = 0;
+            for (unsigned k = 0; k < 5; ++k) {
+                float t = us[k], s = 4.0f * (t + 1.0f - cs[c].r - 0.5f); s = s < 0 ? 0 : s > 1 ? 1 : s;
+                float o = pi == 0 ? s * cs[c].k + (1.0f - cs[c].k) : pi == 1 ? 4.0f * (s - 0.5f) : s; o = o < 0 ? 0 : o > 1 ? 1 : o;
+                if (cs[c].blend) o *= 0.8f;
+                int want = (int)(o * 255.0f + 0.5f), got = px[k][0], d = got - want; if (d < 0) d = -d;
+                if (d > (pi == 1 ? 40 : 14)) ++bad;
+                rword((uint32_t)got << 16 | (uint32_t)want);
+            }
+            rtext(bad ? "BAD\n" : "ok\n"); nbad += bad != 0;
+        }
+        /* OpenLara's per-frame pattern: queued window frame, then render-to-texture (with a depth
+         * renderbuffer, like OpenLara's bindTarget), then the window frame sampling it. */
+        {
+            GLuint rb = 0; glGenRenderbuffers(1, &rb); glBindRenderbuffer(GL_RENDERBUFFER, rb);
+            glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, SPN, SPN); glBindRenderbuffer(GL_RENDERBUFFER, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo); glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
+            rtext("loop fbo status "); rword((uint32_t)glCheckFramebufferStatus(GL_FRAMEBUFFER)); rword(glGetError()); rtext("\n");
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            extern unsigned gl2std_error_site(void);
+            for (unsigned it = 0; it < 6; ++it) {
+                uint32_t t0 = nano_app_usec(), e[4], st[4];
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo); glViewport(0, 0, SPN, SPN);
+                glClearColor(1, 1, 1, 1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                glUseProgram(cp); for (unsigned a = 0; a < 5; ++a) glDisableVertexAttribArray(a);
+                glVertexAttribPointer((GLuint)cpos, 4, GL_FLOAT, GL_FALSE, 0, q); glEnableVertexAttribArray((GLuint)cpos);
+                glVertexAttribPointer((GLuint)ccol, 4, GL_FLOAT, GL_FALSE, 0, qramp); glEnableVertexAttribArray((GLuint)ccol);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                e[0] = glGetError(); st[0] = gl2std_error_site(); uint32_t t1 = nano_app_usec();
+                glBindFramebuffer(GL_FRAMEBUFFER, 0); glViewport(0, 0, 240, 432);
+                glClearColor(0.8f, 0.8f, 0.8f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
+                e[1] = glGetError(); st[1] = gl2std_error_site(); uint32_t t2 = nano_app_usec();
+                glUseProgram(progs[0]); for (unsigned a = 0; a < 5; ++a) glDisableVertexAttribArray(a);
+                glVertexAttribPointer((GLuint)lpos[0], 4, GL_FLOAT, GL_FALSE, 0, q); glEnableVertexAttribArray((GLuint)lpos[0]);
+                glVertexAttribPointer((GLuint)luv[0], 2, GL_FLOAT, GL_FALSE, 0, quv); glEnableVertexAttribArray((GLuint)luv[0]);
+                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex[1]); glUniform1i(lS[0], 0);
+                glUniform4f(lP[0], 0.75f, 0.75f, 0.75f, 0.5f);
+                glEnable(GL_BLEND); glBlendFunc(GL_DST_COLOR, GL_ZERO); glDrawArrays(GL_TRIANGLES, 0, 6); glDisable(GL_BLEND);
+                e[2] = glGetError(); st[2] = gl2std_error_site(); uint32_t t3 = nano_app_usec();
+                eglSwapBuffers(dpy, sfc);
+                e[3] = glGetError(); st[3] = gl2std_error_site(); uint32_t t4 = nano_app_usec();
+                uint32_t f0 = 0, f1 = 0, f2 = 0; nano_app_gfx_stats(&f0, &f1, &f2);
+                rtext("L "); rword(it); rword(t1 - t0); rword(t2 - t1); rword(t3 - t2); rword(t4 - t3);
+                for (unsigned k = 0; k < 4; ++k) { rword(e[k]); rword(st[k]); } rword(f0); rword(f2); rtext("\n");
+            }
+        }
+        uint32_t fr = 0, sw = 0, fault = 0; nano_app_gfx_stats(&fr, &sw, &fault);
+        rtext("SHADOWPROBE frames/sw/fault "); rword(fr); rword(sw); rword(fault); rtext("cases bad "); rword(nbad); rtext("\n");
+        rtext(nbad == 0u && sw == 0u && fault == 0u ? "HELLO PASS\n" : "HELLO FAIL\n");
         report[rused] = 0;
         rpt_mirror_write(report, rused, rpt_sum(report, rused));
         nano_app_dcache_clean();

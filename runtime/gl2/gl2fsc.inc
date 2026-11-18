@@ -355,13 +355,16 @@ static int f_lower_two(f_value target,uint8_t plan[2][12],uint8_t alpha[2][12]){
  for(unsigned i=0;i<count&&!f.error;++i){
   unsigned mark=f.n;f_value first=f_zero();first.w=4;int mapped=1;
   for(unsigned k=0;k<4;++k){first.v[k]=f_lane(ids[i],k);if(!first.v[k])mapped=0;}
-  if(mapped&&!f_lower(first,plan[0],0,0)){
+  /* An explicit clamp on the intermediate is the stage's own output saturation: match its
+   * operand (stage 2 still reads the clamped node as "previous"). */
+  f_value body=first;if(mapped)for(unsigned k=0;k<4;++k)if(f.nodes[first.v[k]].op==F_CLAMP)body.v[k]=f.nodes[first.v[k]].a;
+  if(mapped&&!f_lower(body,plan[0],0,0)){
    /* Add the corresponding alpha shape as the first choice for backward
     * precision stability; then independently enumerate alpha source DAGs. */
    uint16_t shared=first.v[3];
    for(unsigned mode=0;mode<=acount;++mode){
-    first.v[3]=mode?aids[mode-1]:shared;
-    if(f_lower(first,alpha[0],1,0))continue;
+    first.v[3]=mode?aids[mode-1]:shared;body.v[3]=f.nodes[first.v[3]].op==F_CLAMP?f.nodes[first.v[3]].a:first.v[3];
+    if(f_lower(body,alpha[0],1,0))continue;
     for(unsigned k=0;k<4;++k)f_previous[k]=first.v[k];
     if(!f_lower(target,plan[1],0,1)&&!f_lower(target,alpha[1],1,1))return 0;
    }

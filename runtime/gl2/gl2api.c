@@ -997,6 +997,7 @@ static uint32_t draw_index(const uint8_t *src,uint32_t type,uint32_t first,uint3
 #endif
 /* Native vertex words for indices[i0..i1) from typed attribute arrays (the
  * fused path's converter). o receives (i1-i0) vertices; returns the end. */
+static int prog_reads_uv0(const gl2_prog_obj *P){for(uint32_t i=0;i<P->vs.nattr;++i)if(P->vs.attr_slot[i]==3u)return 1;return 0;}
 static uint32_t *gl2_vertex_convert(const gl2_attribute *const at[5],const uint8_t *const bp[5],unsigned nin,unsigned withcol,unsigned uv0w,unsigned uv1w,unsigned pk,const uint32_t *indices,int i0,int i1,uint32_t *o){
             const unsigned two=uv1w>0;
 #define LD_COMP(a,q,k,val) do{ if((k)>=(a)->size)(val)=((k)==3)?1.0f:0.0f; else if((a)->type==GL_UNSIGNED_BYTE)(val)=(float)(q)[k]/255.0f; else if((a)->type==GL_FLOAT)(val)=load_float((q)+4u*(k)); else {uint32_t u_=(uint32_t)(q)[2u*(k)]|(uint32_t)(q)[2u*(k)+1]<<8;int v_=(int)u_;if(u_&0x8000u)v_-=0x10000;(val)=(a)->normalized?(2.0f*(float)v_+1.0f)/65535.0f:(float)v_;} }while(0)
@@ -1006,7 +1007,7 @@ static uint32_t *gl2_vertex_convert(const gl2_attribute *const at[5],const uint8
              * multiply (within 1 ulp of the exact division) replace the
              * per-component branching and divides of the generic loop. */
             int fast=at[0]->type==GL_SHORT&&!at[0]->normalized&&at[0]->size>=4&&!(((uintptr_t)bp[0]|at[0]->stride)&1u)
-                &&at[3]->type==GL_SHORT&&at[3]->normalized&&at[3]->size>=2&&!(((uintptr_t)bp[3]|at[3]->stride)&1u)&&(!two||(at[4]->type==GL_UNSIGNED_BYTE&&at[4]->normalized&&uv1w<=at[4]->size))
+                &&bp[3]&&at[3]->type==GL_SHORT&&at[3]->normalized&&at[3]->size>=2&&!(((uintptr_t)bp[3]|at[3]->stride)&1u)&&(!two||(at[4]->type==GL_UNSIGNED_BYTE&&at[4]->normalized&&uv1w<=at[4]->size))
                 &&(!nin||(at[1]->type==GL_SHORT&&at[1]->normalized&&at[1]->size>=nin&&!(((uintptr_t)bp[1]|at[1]->stride)&1u)));
             if(fast){
                 const float rcp=1.0f/65535.0f;static float lut255[256];static int lut_ready;if(!lut_ready){for(unsigned v_=0;v_<256;++v_)lut255[v_]=(float)v_/255.0f;lut_ready=1;}
@@ -1035,7 +1036,8 @@ static uint32_t *gl2_vertex_convert(const gl2_attribute *const at[5],const uint8
                 else for(unsigned k=0;k<4;++k){LD_COMP(at[0],q,k,v);*o++=F2U(v);}
                 if(nin){q=bp[1]+(uintptr_t)ix*at[1]->stride;for(unsigned k=0;k<nin;++k){LD_COMP(at[1],q,k,v);*o++=F2U(v);}}
                 if(withcol){q=bp[2]+(uintptr_t)ix*at[2]->stride;*o++=(uint32_t)q[0]|(uint32_t)q[1]<<8|(uint32_t)q[2]<<16|(uint32_t)q[3]<<24;}
-                q=bp[3]+(uintptr_t)ix*at[3]->stride;for(unsigned k=0;k<uv0w;++k){LD_COMP(at[3],q,k,v);*o++=F2U(v);}
+                if(bp[3]){q=bp[3]+(uintptr_t)ix*at[3]->stride;for(unsigned k=0;k<uv0w;++k){LD_COMP(at[3],q,k,v);*o++=F2U(v);}}
+                else for(unsigned k=0;k<uv0w;++k)*o++=0u;   /* the program reads no UV0 (UVs computed in the shader) */
                 if(two&&(pk&2u)){q=bp[4]+(uintptr_t)ix*at[4]->stride;*o++=(uint32_t)q[0]|(uint32_t)q[1]<<8|(uint32_t)q[2]<<16|(uint32_t)q[3]<<24;}
                 else if(two){q=bp[4]+(uintptr_t)ix*at[4]->stride;for(unsigned k=0;k<uv1w;++k){LD_COMP(at[4],q,k,v);*o++=F2U(v);}}
             }
@@ -1062,7 +1064,7 @@ static void pack_choose(const gl2_ctx *c,gl2_prog_obj *P,uint8_t *pos,uint8_t *u
 static int vc_signature(gl2_ctx *c,const gl2_prog_obj *P,uint32_t *out){
     const unsigned nin=P->prog.normal_input,withcol=!P->prog.omit_colour,uv1w=P->prog.uv1_input;
     uint8_t pp=0,pu=0;pack_choose(c,(gl2_prog_obj *)P,&pp,&pu);
-    const unsigned vw=(pp?2u:4u)+nin+(withcol?1u:0u)+GL2_UV0W(&P->prog)+(pu?1u:uv1w),need[5]={1,nin?1u:0u,withcol?1u:0u,1,uv1w?1u:0u};
+    const unsigned vw=(pp?2u:4u)+nin+(withcol?1u:0u)+GL2_UV0W(&P->prog)+(pu?1u:uv1w),need[5]={1,nin?1u:0u,withcol?1u:0u,prog_reads_uv0(P)?1u:0u,uv1w?1u:0u};
     uint32_t sig=2166136261u;
 #define SIGW(x) do{sig=(sig^(uint32_t)(x))*16777619u;}while(0)
     SIGW(vw);SIGW(nin);SIGW(withcol);SIGW(uv1w);SIGW(pp|pu<<1);SIGW(P->attr_bind[0]|P->attr_bind[1]<<4|P->attr_bind[2]<<8|P->attr_bind[3]<<12|P->attr_bind[4]<<16);
@@ -1102,6 +1104,12 @@ static const uint16_t *prim_len;static uint32_t prim_count;static void *prim_ent
 #endif
 #if GL2_VCACHE_WORDS
 static uint32_t vcache[GL2_VCACHE_WORDS];static uint32_t vcache_used,vcache_epoch=1;
+#endif
+#if GL2_VCACHE_WORDS && GL2_STRIP_POOL_WORDS
+static int vc_slot(const gl2_strip_entry *se,uint32_t sig){   /* the entry's cached stream for this signature, or -1 */
+    for(int k=0;k<2;++k)if(se->vc_epoch[k]==vcache_epoch&&se->vc_sig[k]==sig)return k;
+    return -1;
+}
 #endif
 static int draw_gather(gl2_ctx *c, gl2_prog_obj *P, uint32_t mode, int count, const uint32_t *indices) {
     P->prog.pack_pos=P->prog.pack_uv1=0; /* only the fused converter packs */
@@ -1148,7 +1156,7 @@ static int draw_gather(gl2_ctx *c, gl2_prog_obj *P, uint32_t mode, int count, co
         const unsigned uv0w=GL2_UV0W(&P->prog),vw=GL2_VW(&P->prog);
         const gl2_attribute *at[5]={&c->attr[P->attr_bind[0]],&c->attr[P->attr_bind[1]],&c->attr[P->attr_bind[2]],&c->attr[P->attr_bind[3]],&c->attr[P->attr_bind[4]]};
         const uint8_t *bp[5]={0,0,0,0,0};int ok=1;
-        const unsigned need[5]={1,nin?1u:0u,withcol?1u:0u,1,two?1u:0u};
+        const unsigned need[5]={1,nin?1u:0u,withcol?1u:0u,prog_reads_uv0(P)?1u:0u,two?1u:0u};
         for(unsigned k=0;k<5&&ok;++k){
             if(!need[k])continue;
             const gl2_attribute *a=at[k];
@@ -1179,14 +1187,16 @@ static int draw_gather(gl2_ctx *c, gl2_prog_obj *P, uint32_t mode, int count, co
                 uint32_t sig=0;const int cacheable=vc_signature(c,P,&sig);
                 gl2_strip_entry *se=(gl2_strip_entry *)prim_entry;
                 uint32_t words=(uint32_t)count*vw;
-                if(cacheable&&!(se->vc_epoch==vcache_epoch&&se->vc_sig==sig)&&words<=GL2_VCACHE_WORDS){
+                int slot=cacheable?vc_slot(se,sig):-1;
+                if(cacheable&&slot<0&&words<=GL2_VCACHE_WORDS){
                     if(vcache_used+words>GL2_VCACHE_WORDS){if(c->submit_sync)c->submit_sync(c->submit_user);vcache_used=0;++vcache_epoch;}   /* no DMA may still read the old spans */
                     uint32_t *o=vcache+vcache_used;
                     gl2_vertex_convert(at,bp,nin,withcol,uv0w,uv1w,(unsigned)(P->prog.pack_pos|P->prog.pack_uv1<<1),indices,0,count,o);
-                    se->vc_off=vcache_used;se->vc_sig=sig;se->vc_epoch=vcache_epoch;vcache_used+=words;
+                    slot=se->vc_next;se->vc_next^=1u;
+                    se->vc_off[slot]=vcache_used;se->vc_sig[slot]=sig;se->vc_epoch[slot]=vcache_epoch;vcache_used+=words;
                 }
-                if(cacheable&&se->vc_epoch==vcache_epoch&&se->vc_sig==sig){
-                    if(vc_submit(c,P,(uint32_t)header,vcache+se->vc_off,prim_len,prim_count,(uint32_t)count)){err(c,GL_INVALID_OPERATION);return -1;}
+                if(slot>=0){
+                    if(vc_submit(c,P,(uint32_t)header,vcache+se->vc_off[slot],prim_len,prim_count,(uint32_t)count)){err(c,GL_INVALID_OPERATION);return -1;}
                     return 0;
                 }
             }
@@ -1326,12 +1336,13 @@ static int draw_prims(gl2_ctx *c,gl2_prog_obj *p,const uint16_t *lens,uint32_t n
     PT(t);
 #if GL2_VCACHE_WORDS
     {uint32_t sig=0;
-     PT(tsg);int sgok=c->submit_parts&&c->state_cache_enabled&&se->vc_epoch==vcache_epoch&&vc_signature(c,p,&sig);if(gl2_prof_clock)gl2_prof2[2]+=gl2_prof_clock()-tsg;
-     if(sgok&&se->vc_sig==sig&&p->fs->nplan&&(c->diagnostic_gpu||!gl2_program_needs_software(c,p))){
+     PT(tsg);int sgok=c->submit_parts&&c->state_cache_enabled&&(se->vc_epoch[0]==vcache_epoch||se->vc_epoch[1]==vcache_epoch)&&vc_signature(c,p,&sig);if(gl2_prof_clock)gl2_prof2[2]+=gl2_prof_clock()-tsg;
+     int slot=sgok?vc_slot(se,sig):-1;
+     if(slot>=0&&p->fs->nplan&&(c->diagnostic_gpu||!gl2_program_needs_software(c,p))){
         if(gl2_resolve_texture_units(c,p->prog.nplan?p->prog.nplan:1,p->fs->nsampler,p->sampler_unit))return 0;
         pack_choose(c,p,&p->prog.pack_pos,&p->prog.pack_uv1);
         int header=gl2_build_draw_header_mask(&p->prog,&c->st,lens?GL_TRIANGLE_STRIP:GL_TRIANGLES,c->tex,c->vp_w,c->vp_h,c->seg,c->seg_cap,c->color_mask);
-        if(header<2||vc_submit(c,p,(uint32_t)header,vcache+se->vc_off,lens,nprim,nidx))err(c,GL_INVALID_OPERATION);
+        if(header<2||vc_submit(c,p,(uint32_t)header,vcache+se->vc_off[slot],lens,nprim,nidx))err(c,GL_INVALID_OPERATION);
         PA(3,t);gl2_prof[4]++;gl2_prof[5]+=nidx;
         return 0;
      }}

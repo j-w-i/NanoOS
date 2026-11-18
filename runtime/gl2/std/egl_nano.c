@@ -87,7 +87,15 @@ static void ensure_frame(void){
  if(b.fault&&recover())return;
  if(b.frame_open){if(queued&&window_surface)service_display();return;}
  int rc;
- if(c.fbo_active){uint32_t ft=0,fw=0,fh=0;rc=gl2_fbo_target(&c,&ft,&fw,&fh)?0:gl2_nano_begin_fbo(&b,target,fw,0);}
+ if(c.fbo_active){uint32_t ft=0,fw=0,fh=0;
+  /* An FBO frame needs the GPU idle (gl2_nano_begin_fbo): retire a queued window frame first.
+   * Without this, render-to-texture mid-frame (shadow maps, environment maps) after a queued
+   * eglSwapBuffers failed begin_fbo, faulted, and stalled in the 100 ms recovery path. */
+  rc=0;
+  if(!gl2_fbo_target(&c,&ft,&fw,&fh)){
+   if(b.pending_valid){uint32_t *done=0;rc=gl2_nano_finish(&b,&done);if(!rc&&done&&queued&&window_surface)rc=present_q(done);}
+   if(!rc)rc=gl2_nano_begin_fbo(&b,target,fw,0);
+  }}
  else if(window_surface&&queued){
   uint32_t *buf=qbuf(qi);uint32_t start=g_api->usec();
   rc=wait_source(buf);

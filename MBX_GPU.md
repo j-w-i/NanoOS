@@ -139,3 +139,15 @@ proves is 0.0 (`VSC_ZERO_OPERAND 0`). File 3 is still used only for writes to
 outputs the fragment plan does not read, where the value is irrelevant. The exact value is not
 measured: the brightening fits ~1.0, which NanoEmu (`NANO7_MBXR_FILE3`, default 1.0)
 and vs_opt_check.c now model, so code that depends on file 3 reading zero fails in both.
+
+## Shadow maps on the fixed combiner (2026-11-18)
+
+No depth textures or per-pixel compare exist, but the combiner's bias (-0.5), complement and x4
+scale give one: casters write linear light depth as a colour into an RGBA render target; a receiver
+pass computes s = clamp(4(T + 1 - R - 0.5)) with R (receiver depth + offset) in the vertex colour,
+then s*K + (1-K) in a second stage, multiply-blended. `hello_gles2 -DHELLO_SHADOWPROBE` checks it on
+hardware (11 cases incl. FBO-rendered ramps, all within 3/255; the bias bit's first hardware use).
+OpenLara uses it as an opt-in (Options > Detail > Shadows MEDIUM): walk 38.7 ms vs 20.7 ms, because
+each map update is a GPU sync point (one-deep queue), plus a 5 ms copy out of uncached memory and a
+receiver redraw. Known issue: a render-to-texture store is sometimes refused (GL_INVALID_OPERATION,
+gl2tex.c tex_write_blocked) although the map updates each frame.
